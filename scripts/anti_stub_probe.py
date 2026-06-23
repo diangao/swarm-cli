@@ -398,6 +398,31 @@ def probe_task_lifecycle(cli: Path, state_dir: Path) -> None:
     claimed_board = run(cli, state_dir, "task", "list", "--channel", target).stdout
     require(f"#{number} [in_progress] {title} → @candidate" in claimed_board, "claimed task did not become in_progress")
 
+    unclaimed = run(cli, state_dir, "task", "unclaim", "--channel", target, "--number", str(number)).stdout
+    require(f"Task #{number} unclaimed by @candidate." in unclaimed, "task unclaim did not acknowledge candidate")
+
+    unclaimed_board = run(cli, state_dir, "task", "list", "--channel", target).stdout
+    require(
+        f"#{number} [in_progress] {title} (by @candidate)" in unclaimed_board,
+        "unclaimed task did not remove assignee while preserving status",
+    )
+
+    rejected_unclaim = run(
+        cli,
+        state_dir,
+        "task",
+        "unclaim",
+        "--channel",
+        target,
+        "--number",
+        str(number),
+        expected=1,
+    ).stderr
+    require("is not claimed by @candidate" in rejected_unclaim, "unclaim of unclaimed task did not fail closed")
+
+    reclaimed = run(cli, state_dir, "task", "claim", "--channel", target, "--number", str(number)).stdout
+    require(f"Task #{number} claimed by @candidate." in reclaimed, "task reclaim after unclaim failed")
+
     reviewed = run(cli, state_dir, "task", "update", "--channel", target, "--number", str(number), "--status", "in_review").stdout
     require(f"Task #{number} updated: in_progress -> in_review." in reviewed, "task update to in_review failed")
 
@@ -418,6 +443,19 @@ def probe_task_lifecycle(cli: Path, state_dir: Path) -> None:
         expected=1,
     ).stderr
     require("cannot transition from done to done" in rejected, "idempotent done update was not rejected")
+
+    done_unclaim = run(
+        cli,
+        state_dir,
+        "task",
+        "unclaim",
+        "--channel",
+        target,
+        "--number",
+        str(number),
+        expected=1,
+    ).stderr
+    require("done tasks cannot be unclaimed" in done_unclaim, "unclaim of done task did not fail closed")
 
 
 def probe_reminder_lifecycle(cli: Path, state_dir: Path) -> None:

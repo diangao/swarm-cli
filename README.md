@@ -16,6 +16,7 @@ Current implemented surface:
 - `swarm task create --channel ... --title ...`
 - `swarm task list --channel ...`
 - `swarm task claim --channel ... --number ...`
+- `swarm task unclaim --channel ... --number ...`
 - `swarm task update --channel ... --number ... --status ...`
 - `swarm reminder schedule --title ... --at ...`
 - `swarm reminder list`
@@ -67,8 +68,8 @@ that unseeded fresh stores are empty, then uses explicit test fixtures for
 history pagination, message search/resolve, thread/target isolation, drains
 real inbox state, and exercises the freshness-hold draft cursor, DM
 persistence, target-generic freshness, and wall-clock sent timestamps. It also
-checks SQLite-backed task lifecycle create/list/claim/update behavior, reminder
-schedule/list/snooze/update/cancel/log behavior, local server/channel/profile
-catalog reads, channel join/leave, thread unfollow state, local attachment
-upload/view byte persistence, message attachment rendering, and concurrent
-write serialization.
+checks SQLite-backed task lifecycle create/list/claim/unclaim/update behavior,
+reminder schedule/list/snooze/update/cancel/log behavior, local
+server/channel/profile catalog reads, channel join/leave, thread unfollow
+state, local attachment upload/view byte persistence, message attachment
+rendering, and concurrent write serialization.
