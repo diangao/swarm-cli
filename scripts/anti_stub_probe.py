@@ -192,6 +192,33 @@ def probe_send_read_and_routes(cli: Path, state_dir: Path) -> None:
     require(dm_body not in alpha_history, "DM message leaked into channel history")
 
 
+def probe_read_pagination(cli: Path, state_dir: Path) -> None:
+    target = f"#page-{uuid.uuid4().hex[:8]}"
+    bodies = [f"paged body {idx} {uuid.uuid4()}" for idx in range(4)]
+    sent_ids = []
+    for body in bodies:
+        sent_ids.append(parse_message_id(run(cli, state_dir, "message", "send", "--target", target, stdin=body).stdout))
+
+    full = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    for body in bodies:
+        require(body in full, f"full paged read missing body: {body}")
+
+    before = run(cli, state_dir, "message", "read", "--channel", target, "--before", sent_ids[2][:8]).stdout
+    require(bodies[0] in before and bodies[1] in before, "--before short id did not show earlier records")
+    require(bodies[2] not in before and bodies[3] not in before, "--before included anchor or later records")
+
+    after = run(cli, state_dir, "message", "read", "--channel", target, "--after", sent_ids[1]).stdout
+    require(bodies[2] in after and bodies[3] in after, "--after full id did not show later records")
+    require(bodies[0] not in after and bodies[1] not in after, "--after included anchor or earlier records")
+
+    around = run(cli, state_dir, "message", "read", "--channel", target, "--around", sent_ids[2]).stdout
+    require(bodies[2] in around, "--around did not include anchor record")
+    require("---" in around, "--around missing read footer")
+
+    missing = run(cli, state_dir, "message", "read", "--channel", target, "--around", "does-not-exist", expected=1).stderr
+    require("anchor not found" in missing, "missing read anchor did not fail closed")
+
+
 def probe_freshness_cursor(cli: Path, state_dir: Path) -> None:
     held_body = f"held draft body {uuid.uuid4()}"
     hold = run(cli, state_dir, "message", "send", "--target", "#general", stdin=held_body).stdout
@@ -445,6 +472,7 @@ def main() -> int:
         state_dir = Path(tmp)
         probe_inbox(cli, state_dir)
         probe_send_read_and_routes(cli, state_dir)
+        probe_read_pagination(cli, state_dir)
         probe_freshness_cursor(cli, state_dir)
         probe_wall_clock_timestamps(cli, state_dir)
         probe_cross_process_locking(cli, state_dir)
@@ -453,7 +481,7 @@ def main() -> int:
         probe_navigation_surfaces(cli, state_dir)
         probe_membership_attention(cli, state_dir)
 
-    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, and membership")
+    print("anti-stub probe ok: dynamic inbox, send/read, pagination, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, and membership")
     return 0
 
 
