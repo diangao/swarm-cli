@@ -679,16 +679,51 @@ def probe_navigation_surfaces(cli: Path, state_dir: Path) -> None:
     require(f"description: {description}" in shown, "profile show did not render updated description")
     server_after_profile = run(cli, state_dir, "server", "info").stdout
     require(f"@candidate ({display_name})" in server_after_profile, "server info did not use updated display name")
+
+    avatar_url = f"pixel:random:{uuid.uuid4().hex[:8]}"
+    avatar_updated = run(cli, state_dir, "profile", "update", "--avatar-url", avatar_url).stdout
+    require(avatar_updated == "Profile updated.\n", "profile avatar-url update did not acknowledge write")
+    shown_avatar_url = run(cli, state_dir, "profile", "show").stdout
+    require(f"avatar_url: {avatar_url}" in shown_avatar_url, "profile show did not render avatar URL")
+
+    avatar_payload = f"avatar bytes {uuid.uuid4()}".encode("utf-8")
+    avatar_source = state_dir / "avatar.txt"
+    avatar_source.write_bytes(avatar_payload)
+    avatar_file_updated = run(
+        cli,
+        state_dir,
+        "profile",
+        "update",
+        "--avatar-file",
+        str(avatar_source),
+    ).stdout
+    require(avatar_file_updated == "Profile updated.\n", "profile avatar-file update did not acknowledge write")
+    shown_avatar_file = run(cli, state_dir, "profile", "show").stdout
+    require("avatar_file: profile-avatars/" in shown_avatar_file, "profile show did not render stored avatar file")
+    require("avatar_url:" not in shown_avatar_file, "avatar-file update did not clear avatar URL")
     conn = connect_state(state_dir)
     try:
         row = conn.execute(
-            "SELECT display_name, description FROM profiles WHERE name = 'candidate'"
+            "SELECT display_name, description, avatar_url, avatar_file FROM profiles WHERE name = 'candidate'"
         ).fetchone()
         require(row is not None, "updated profile row missing from SQLite")
         require(row["display_name"] == display_name, "profile display name not persisted")
         require(row["description"] == description, "profile description not persisted")
+        require(row["avatar_url"] is None, "avatar-file update did not clear persisted avatar URL")
+        require(row["avatar_file"], "avatar file path not persisted")
+        require((state_dir / row["avatar_file"]).read_bytes() == avatar_payload, "stored avatar bytes mismatch")
     finally:
         conn.close()
+    missing_avatar = run(
+        cli,
+        state_dir,
+        "profile",
+        "update",
+        "--avatar-file",
+        str(state_dir / "missing-avatar.png"),
+        expected=1,
+    ).stderr
+    require("Avatar file not found" in missing_avatar, "missing profile avatar file did not fail closed")
 
     dynamic_channel = f"#catalog-{uuid.uuid4().hex[:8]}"
     dynamic_body = f"catalog body {uuid.uuid4()}"
@@ -864,7 +899,7 @@ def main() -> int:
         probe_membership_attention(cli, state_dir)
         probe_attachments(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, membership, and attachments")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, profile avatars, membership, and attachments")
     return 0
 
 
