@@ -7,6 +7,7 @@ import os
 import sqlite3
 import sys
 import uuid
+from html import escape
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -869,6 +870,13 @@ def format_history_row(record: dict[str, Any]) -> str:
     )
 
 
+def format_canonical_message(record: dict[str, Any]) -> str:
+    return (
+        f"[target={record['target']} msg={short_id(str(record['id']))} time={record['time']} "
+        f"type={record['type']}] @{record['author']}: {record['body']}"
+    )
+
+
 def format_inbox_row(record: dict[str, Any]) -> str:
     msg = record.get("msg") or short_id(str(record["message_id"]))
     return (
@@ -915,6 +923,17 @@ def channel_for_target(target: str) -> str:
         return target
     if ":" in target:
         return target.rsplit(":", 1)[0]
+    return target
+
+
+def source_label(target: str) -> str:
+    if target.startswith("dm:@"):
+        return target
+    if target.startswith("#"):
+        body = target[1:]
+        if ":" in body:
+            return f"thread:{body}"
+        return f"channel:{body}"
     return target
 
 
@@ -1297,6 +1316,156 @@ def command_message_read(argv: list[str]) -> int:
         )
 
     return with_mutable_state(action)
+
+
+def message_by_id(state: dict[str, Any], msg_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    matches = []
+    for record in state.get("messages", []):
+        full_id = str(record["id"])
+        if full_id == msg_id or short_id(full_id) == msg_id:
+            matches.append(record)
+    if not matches:
+        return None, "not_found"
+    if len(matches) > 1:
+        return None, "ambiguous"
+    return matches[0], None
+
+
+def parse_limit(argv: list[str], default: int = 10) -> int:
+    raw = arg_value(argv, "--limit")
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1, min(value, 50))
+
+
+def sender_matches(record: dict[str, Any], sender: str | None) -> bool:
+    if sender is None:
+        return True
+    expected = sender.removeprefix("@").lower()
+    return str(record["author"]).lower() == expected
+
+
+def time_matches(record: dict[str, Any], before: str | None, after: str | None) -> bool:
+    timestamp = str(record["time"])
+    if before is not None and timestamp >= normalize_datetime_text(before):
+        return False
+    if after is not None and timestamp <= normalize_datetime_text(after):
+        return False
+    return True
+
+
+def search_score(record: dict[str, Any], query: str) -> int:
+    haystack = f"{record['target']} {record['author']} {record['body']}".lower()
+    terms = [term for term in query.lower().split() if term]
+    if not terms:
+        return 0
+    return sum(haystack.count(term) for term in terms)
+
+
+def highlighted_preview(body: str, query: str, radius: int = 82) -> str:
+    escaped = escape(body)
+    lowered = body.lower()
+    terms = [term for term in query.lower().split() if term]
+    hit_start = -1
+    hit_term = ""
+    for term in terms:
+        pos = lowered.find(term)
+        if pos != -1 and (hit_start == -1 or pos < hit_start):
+            hit_start = pos
+            hit_term = body[pos : pos + len(term)]
+    if hit_start == -1:
+        snippet = escaped[: radius * 2]
+        return f"{snippet}<omit />" if len(escaped) > len(snippet) else snippet
+
+    start = max(0, hit_start - radius)
+    end = min(len(body), hit_start + len(hit_term) + radius)
+    prefix = "<omit />" if start > 0 else ""
+    suffix = "<omit />" if end < len(body) else ""
+    before = escape(body[start:hit_start])
+    match = escape(body[hit_start : hit_start + len(hit_term)])
+    after = escape(body[hit_start + len(hit_term) : end])
+    return f"{prefix}{before}<match>{match}</match>{after}{suffix}"
+
+
+def render_search_result(record: dict[str, Any], query: str) -> str:
+    return (
+        f'<result ref="msg:{record["id"]}">\n'
+        f"Source: {source_label(str(record['target']))}\n"
+        f"Sender: {record['author']} ({record['type']})\n"
+        f"Time: {record['time']}\n\n"
+        "<preview>\n"
+        f"{highlighted_preview(str(record['body']), query)}\n"
+        "</preview>\n"
+        "</result>"
+    )
+
+
+def command_message_search(argv: list[str]) -> int:
+    query = arg_value(argv, "--query")
+    if query is None or not query.strip():
+        return write_stderr("Error: --query is required\nCode: INVALID_ARG\n")
+    channel = arg_value(argv, "--channel")
+    sender = arg_value(argv, "--sender")
+    sort_mode = arg_value(argv, "--sort") or "relevance"
+    before = arg_value(argv, "--before")
+    after = arg_value(argv, "--after")
+    limit = parse_limit(argv)
+
+    def action(state: dict[str, Any]) -> int:
+        if channel is not None and not known_surface(state, channel):
+            return write_stderr(f"Error: Channel not found: {channel}\nCode: NOT_FOUND\n")
+
+        records = state.get("messages", [])
+        if channel is not None:
+            records = records_for_surface(state, channel)
+        candidates = [
+            record
+            for record in records
+            if sender_matches(record, sender)
+            and time_matches(record, before, after)
+            and search_score(record, query) > 0
+        ]
+        if sort_mode == "recent":
+            ordered = sorted(candidates, key=lambda row: int(row["seq"]), reverse=True)
+        else:
+            ordered = sorted(
+                candidates,
+                key=lambda row: (search_score(row, query), int(row["seq"])),
+                reverse=True,
+            )
+        selected = ordered[:limit]
+        if not selected:
+            return write_stdout(f"Search results for: \"{query}\" (0 results)\n")
+
+        rendered = "\n\n".join(render_search_result(record, query) for record in selected)
+        footer = (
+            "\n\nIf a result may be relevant but its preview is not enough, "
+            "read the surrounding context for that result before answering.\n"
+        )
+        return write_stdout(f"Search results for: \"{query}\" ({len(selected)} results)\n\n{rendered}{footer}")
+
+    return with_read_state(action)
+
+
+def command_message_resolve(argv: list[str]) -> int:
+    ids = [value for value in argv if not value.startswith("-")]
+    if not ids:
+        return write_stderr("Error: message id is required\nCode: INVALID_ARG\n")
+    msg_id = ids[0]
+
+    def action(state: dict[str, Any]) -> int:
+        record, error = message_by_id(state, msg_id)
+        if error == "ambiguous":
+            return write_stderr(f"Error: ambiguous message id: {msg_id}\nCode: AMBIGUOUS_ID\n")
+        if record is None:
+            return write_stderr(f"Error: message not found: {msg_id}\nCode: NOT_FOUND\n")
+        return write_stdout(f"{format_canonical_message(record)}\n")
+
+    return with_read_state(action)
 
 
 def freshness_blockers(state: dict[str, Any], target: str) -> list[dict[str, Any]]:
@@ -1953,6 +2122,10 @@ def command_message(argv: list[str]) -> int:
         return command_message_check()
     if subcommand == "read":
         return command_message_read(rest)
+    if subcommand == "search":
+        return command_message_search(rest)
+    if subcommand == "resolve":
+        return command_message_resolve(rest)
     if subcommand == "send":
         return command_message_send(rest)
     return write_stderr(f"Error: unknown message subcommand: {subcommand}\nCode: INVALID_ARG\n")

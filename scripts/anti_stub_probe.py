@@ -219,6 +219,58 @@ def probe_read_pagination(cli: Path, state_dir: Path) -> None:
     require("anchor not found" in missing, "missing read anchor did not fail closed")
 
 
+def probe_search_and_resolve(cli: Path, state_dir: Path) -> None:
+    target = f"#search-{uuid.uuid4().hex[:8]}"
+    needle = f"needle-{uuid.uuid4().hex}"
+    body = f"searchable message {needle} inside local persisted body"
+    other_target = f"#search-other-{uuid.uuid4().hex[:8]}"
+    other_body = f"other target also mentions {needle}"
+
+    sent_id = parse_message_id(run(cli, state_dir, "message", "send", "--target", target, stdin=body).stdout)
+    run(cli, state_dir, "message", "send", "--target", other_target, stdin=other_body)
+
+    search = run(cli, state_dir, "message", "search", "--query", needle, "--channel", target).stdout
+    require(f"Search results for: \"{needle}\" (1 results)" in search, "channel search did not return exactly one result")
+    require(sent_id in search, "search result missing generated message id")
+    require("<match>" in search and "</match>" in search, "search preview did not highlight query")
+    require("searchable message" in search, "search preview missing persisted prefix text")
+    require("inside local persisted body" in search, "search preview missing persisted suffix text")
+    require(other_body not in search, "channel-restricted search leaked other target")
+
+    sender_filtered = run(
+        cli,
+        state_dir,
+        "message",
+        "search",
+        "--query",
+        needle,
+        "--sender",
+        "@candidate",
+    ).stdout
+    require(sent_id in sender_filtered, "sender-filtered search missing candidate-authored message")
+    sender_empty = run(
+        cli,
+        state_dir,
+        "message",
+        "search",
+        "--query",
+        needle,
+        "--sender",
+        "@alice",
+    ).stdout
+    require("(0 results)" in sender_empty, "sender filter did not exclude non-matching author")
+
+    resolved_full = run(cli, state_dir, "message", "resolve", sent_id).stdout
+    require(f"msg={sent_id[:8]}" in resolved_full, "resolve full id did not print short canonical id")
+    require(f"target={target}" in resolved_full, "resolve full id missing target")
+    require(body in resolved_full, "resolve full id missing body")
+
+    resolved_short = run(cli, state_dir, "message", "resolve", sent_id[:8]).stdout
+    require(resolved_short == resolved_full, "resolve short id did not match full id output")
+    missing = run(cli, state_dir, "message", "resolve", "doesnotexist", expected=1).stderr
+    require("message not found" in missing, "resolve missing id did not fail closed")
+
+
 def probe_freshness_cursor(cli: Path, state_dir: Path) -> None:
     held_body = f"held draft body {uuid.uuid4()}"
     hold = run(cli, state_dir, "message", "send", "--target", "#general", stdin=held_body).stdout
@@ -473,6 +525,7 @@ def main() -> int:
         probe_inbox(cli, state_dir)
         probe_send_read_and_routes(cli, state_dir)
         probe_read_pagination(cli, state_dir)
+        probe_search_and_resolve(cli, state_dir)
         probe_freshness_cursor(cli, state_dir)
         probe_wall_clock_timestamps(cli, state_dir)
         probe_cross_process_locking(cli, state_dir)
@@ -481,7 +534,7 @@ def main() -> int:
         probe_navigation_surfaces(cli, state_dir)
         probe_membership_attention(cli, state_dir)
 
-    print("anti-stub probe ok: dynamic inbox, send/read, pagination, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, and membership")
+    print("anti-stub probe ok: dynamic inbox, send/read, pagination, search/resolve, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, and membership")
     return 0
 
 

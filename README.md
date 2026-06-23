@@ -9,6 +9,8 @@ Current implemented surface:
 
 - `swarm message check`
 - `swarm message read --channel ... [--before/--after/--around ...]`
+- `swarm message search --query ... [--channel/--sender/--sort/--before/--after/--limit ...]`
+- `swarm message resolve <id>`
 - `swarm message send --target ...` using stdin for channels, threads, and DMs
 - freshness-hold draft output across message targets with newer local context
 - `swarm task create --channel ... --title ...`
@@ -54,7 +56,7 @@ the user state directory (`$XDG_STATE_HOME/swarm-cli` or
 runs or to inspect a specific store.
 
 The anti-stub probe sends fixture-absent message bodies, reads them back, checks
-history pagination, thread/target isolation, drains real inbox state, and exercises the
+history pagination, message search/resolve, thread/target isolation, drains real inbox state, and exercises the
 freshness-hold draft cursor, DM persistence, target-generic freshness, and
 wall-clock sent timestamps. It also checks SQLite-backed task lifecycle
 create/list/claim/update behavior, reminder schedule/list/snooze/update/cancel/log
