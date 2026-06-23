@@ -547,6 +547,35 @@ def probe_navigation_surfaces(cli: Path, state_dir: Path) -> None:
     rejected = run(cli, state_dir, "profile", "show", "@other", expected=1).stderr
     require("machine API key required" in rejected, "profile show other did not fail closed")
 
+    display_name = f"Candidate {uuid.uuid4().hex[:6]}"
+    description = f"profile update {uuid.uuid4()}"
+    updated = run(
+        cli,
+        state_dir,
+        "profile",
+        "update",
+        "--display-name",
+        display_name,
+        "--description",
+        description,
+    ).stdout
+    require(updated == "Profile updated.\n", "profile update did not acknowledge write")
+    shown = run(cli, state_dir, "profile", "show").stdout
+    require(f"display_name: {display_name}" in shown, "profile show did not render updated display name")
+    require(f"description: {description}" in shown, "profile show did not render updated description")
+    server_after_profile = run(cli, state_dir, "server", "info").stdout
+    require(f"@candidate ({display_name})" in server_after_profile, "server info did not use updated display name")
+    conn = connect_state(state_dir)
+    try:
+        row = conn.execute(
+            "SELECT display_name, description FROM profiles WHERE name = 'candidate'"
+        ).fetchone()
+        require(row is not None, "updated profile row missing from SQLite")
+        require(row["display_name"] == display_name, "profile display name not persisted")
+        require(row["description"] == description, "profile description not persisted")
+    finally:
+        conn.close()
+
     dynamic_channel = f"#catalog-{uuid.uuid4().hex[:8]}"
     dynamic_body = f"catalog body {uuid.uuid4()}"
     run(cli, state_dir, "message", "send", "--target", dynamic_channel, stdin=dynamic_body)

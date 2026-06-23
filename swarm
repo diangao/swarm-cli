@@ -2427,6 +2427,29 @@ def command_profile_show(argv: list[str]) -> int:
     return with_read_state(action)
 
 
+def command_profile_update(argv: list[str]) -> int:
+    display_name = arg_value(argv, "--display-name")
+    description = arg_value(argv, "--description")
+    if display_name is None and description is None:
+        return write_stderr("Error: provide --display-name or --description\nCode: INVALID_ARG\n")
+    if display_name is not None and not display_name.strip():
+        return write_stderr("Error: --display-name must be non-empty\nCode: INVALID_ARG\n")
+    if description is not None and not description.strip():
+        return write_stderr("Error: --description must be non-empty\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        profile = profile_by_name(state, "candidate")
+        if profile is None:
+            return write_stderr("Error: Profile not found\nCode: NOT_FOUND\n")
+        if display_name is not None:
+            profile["display_name"] = display_name.strip()
+        if description is not None:
+            profile["description"] = description.strip()
+        return write_stdout("Profile updated.\n")
+
+    return with_mutable_state(action)
+
+
 def command_profile(argv: list[str]) -> int:
     if not argv:
         return command_profile_show([])
@@ -2434,6 +2457,8 @@ def command_profile(argv: list[str]) -> int:
     rest = argv[1:]
     if subcommand == "show":
         return command_profile_show(rest)
+    if subcommand == "update":
+        return command_profile_update(rest)
     return write_stderr(f"Error: unknown profile subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
