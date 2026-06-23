@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 
@@ -68,6 +69,15 @@ def parse_message_id(output: str) -> str:
     return match.group(1)
 
 
+def timestamp_for_body(history: str, body: str) -> datetime:
+    for line in history.splitlines():
+        if body in line:
+            match = re.search(r"time=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+            require(match is not None, f"missing timestamp for body line:\n{line}")
+            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    fail(f"body not found in history for timestamp check: {body}")
+
+
 def probe_inbox(cli: Path, state_dir: Path) -> None:
     first = run(cli, state_dir, "message", "check").stdout
     require("please check the fixture" in first, "first check did not display seeded pending inbox")
@@ -123,6 +133,16 @@ def probe_send_read_and_routes(cli: Path, state_dir: Path) -> None:
     require(beta_body in beta_history, "beta target did not retain its own message")
     require(alpha_body not in beta_history, "alpha message leaked into beta target")
 
+    dm_target = f"dm:@probe-{uuid.uuid4().hex[:8]}"
+    dm_body = f"dm isolated body {uuid.uuid4()}"
+    dm_sent = run(cli, state_dir, "message", "send", "--target", dm_target, stdin=dm_body).stdout
+    dm_id = parse_message_id(dm_sent)
+    require(f"Message sent to {dm_target}." in dm_sent, "DM send did not succeed")
+    dm_history = run(cli, state_dir, "message", "read", "--channel", dm_target).stdout
+    require(dm_body in dm_history, "DM body was not read back")
+    require(dm_id in dm_history, "DM read did not include generated message id")
+    require(dm_body not in alpha_history, "DM message leaked into channel history")
+
 
 def probe_freshness_cursor(cli: Path, state_dir: Path) -> None:
     held_body = f"held draft body {uuid.uuid4()}"
@@ -145,6 +165,42 @@ def probe_freshness_cursor(cli: Path, state_dir: Path) -> None:
     final_history = run(cli, state_dir, "message", "read", "--channel", "#general").stdout
     require(direct_body in final_history, "post-cursor direct send was not read back")
 
+    fresh_target = f"#fresh-{uuid.uuid4().hex[:8]}"
+    fresh_body = f"any-channel fresh incoming {uuid.uuid4()}"
+    state = read_state(state_dir)
+    incoming = {
+        "seq": state["next_seq"],
+        "target": fresh_target,
+        "id": str(uuid.uuid4()),
+        "time": "2026-03-15 03:00:00",
+        "type": "human",
+        "author": "verifier",
+        "body": fresh_body,
+    }
+    state["next_seq"] += 1
+    state.setdefault("messages", []).append(incoming)
+    state.setdefault("freshness", {})[fresh_target] = {"cursor": incoming["seq"] - 1, "draft": None}
+    write_state(state_dir, state)
+
+    held_any_body = f"any-channel held draft {uuid.uuid4()}"
+    hold_any = run(cli, state_dir, "message", "send", "--target", fresh_target, stdin=held_any_body).stdout
+    require("Freshness hold:" in hold_any, "non-#general target did not hit freshness hold")
+    require(fresh_body in hold_any, "freshness hold did not show target-specific newer message")
+    run(cli, state_dir, "message", "send", "--send-draft", "--target", fresh_target)
+    fresh_history = run(cli, state_dir, "message", "read", "--channel", fresh_target).stdout
+    require(held_any_body in fresh_history, "any-channel send-draft did not append saved draft")
+
+
+def probe_wall_clock_timestamps(cli: Path, state_dir: Path) -> None:
+    target = f"#timestamp-{uuid.uuid4().hex[:8]}"
+    body = f"timestamp body {uuid.uuid4()}"
+    before = datetime.now()
+    run(cli, state_dir, "message", "send", "--target", target, stdin=body)
+    after = datetime.now()
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    observed = timestamp_for_body(history, body)
+    require(before.replace(microsecond=0) <= observed <= after.replace(microsecond=0), "sent timestamp is not current wall-clock time")
+
 
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
@@ -155,8 +211,9 @@ def main() -> int:
         probe_inbox(cli, state_dir)
         probe_send_read_and_routes(cli, state_dir)
         probe_freshness_cursor(cli, state_dir)
+        probe_wall_clock_timestamps(cli, state_dir)
 
-    print("anti-stub probe ok: dynamic inbox, send/read, routing, and freshness cursor")
+    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, and timestamps")
     return 0
 
 

@@ -6,14 +6,15 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 import uuid
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
+import tempfile
 from typing import Any
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STATE_FILE = "state.json"
 
 
@@ -130,6 +131,10 @@ SEED_STATE: dict[str, Any] = {
         "#general": {
             "cursor": 100,
             "draft": None,
+        },
+        "#general:00000000": {
+            "cursor": 101,
+            "draft": None,
         }
     },
 }
@@ -232,9 +237,12 @@ def arg_value(argv: list[str], flag: str) -> str | None:
 
 
 def next_message_id(state: dict[str, Any]) -> str:
-    counter = int(state.get("next_id_counter", 0)) + 1
-    state["next_id_counter"] = counter
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"swarm-candidate-message-{counter}"))
+    state["next_id_counter"] = int(state.get("next_id_counter", 0)) + 1
+    return str(uuid.uuid4())
+
+
+def current_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def append_message(state: dict[str, Any], target: str, body: str) -> dict[str, Any]:
@@ -244,7 +252,7 @@ def append_message(state: dict[str, Any], target: str, body: str) -> dict[str, A
         seq,
         target,
         next_message_id(state),
-        "2026-03-15 01:03:00",
+        current_timestamp(),
         "agent",
         "candidate",
         body.rstrip("\n"),
@@ -284,6 +292,8 @@ def command_message_check() -> int:
 
 def known_surface(state: dict[str, Any], target: str) -> bool:
     if target in {"#general", "#general:00000000"}:
+        return True
+    if target.startswith("dm:@"):
         return True
     return any(record["target"] == target for record in state["messages"])
 
@@ -367,6 +377,7 @@ def command_message_send(argv: list[str]) -> int:
     if target is None:
         return write_stderr("Error: --target is required\nCode: INVALID_ARG\n")
     state = load_state()
+    target_allowed = target.startswith("#") or target.startswith("dm:@")
 
     if "--send-draft" in argv:
         draft = state.get("freshness", {}).get(target, {}).get("draft")
@@ -379,15 +390,15 @@ def command_message_send(argv: list[str]) -> int:
         return write_stdout(success_text(target, record))
 
     body = sys.stdin.read()
-    if target == "#general" and freshness_blockers(state, target):
+    if not target_allowed:
+        return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
+    if freshness_blockers(state, target):
         return render_freshness_hold(state, target, body)
-    if target.startswith("#"):
-        record = append_message(state, target, body)
-        if target in state.get("freshness", {}):
-            state["freshness"][target]["cursor"] = record["seq"]
-        save_state(state)
-        return write_stdout(success_text(target, record))
-    return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
+    record = append_message(state, target, body)
+    if target in state.get("freshness", {}):
+        state["freshness"][target]["cursor"] = record["seq"]
+    save_state(state)
+    return write_stdout(success_text(target, record))
 
 
 def command_message(argv: list[str]) -> int:
