@@ -612,6 +612,39 @@ def probe_attachments(cli: Path, state_dir: Path) -> None:
     finally:
         conn.close()
 
+    message_body = f"message carrying attachment {uuid.uuid4()}"
+    sent = run(
+        cli,
+        state_dir,
+        "message",
+        "send",
+        "--target",
+        "#attachments",
+        "--attachment-id",
+        attachment_id,
+        stdin=message_body,
+    ).stdout
+    message_id = parse_message_id(sent)
+    history = run(cli, state_dir, "message", "read", "--channel", "#attachments").stdout
+    require(message_body in history, "attachment message body was not readable")
+    require(f"id:{attachment_id}" in history, "message read did not render attachment id")
+    require("source-attachment.txt" in history, "message read did not render attachment filename")
+
+    resolved = run(cli, state_dir, "message", "resolve", message_id).stdout
+    require(f"id:{attachment_id}" in resolved, "message resolve did not render attachment id")
+
+    conn = connect_state(state_dir)
+    try:
+        link = conn.execute(
+            "SELECT attachment_id, ordinal FROM message_attachments WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+        require(link is not None, "message attachment link was not persisted")
+        require(link["attachment_id"] == attachment_id, "message attachment link id mismatch")
+        require(link["ordinal"] == 1, "message attachment link ordinal mismatch")
+    finally:
+        conn.close()
+
     missing = run(cli, state_dir, "attachment", "view", "--id", str(uuid.uuid4()), "--output", str(output), expected=1).stderr
     require("Attachment not found" in missing, "unknown attachment id did not fail closed")
 

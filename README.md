@@ -11,7 +11,7 @@ Current implemented surface:
 - `swarm message read --channel ... [--before/--after/--around ...]`
 - `swarm message search --query ... [--channel/--sender/--sort/--before/--after/--limit ...]`
 - `swarm message resolve <id>`
-- `swarm message send --target ...` using stdin for channels, threads, and DMs
+- `swarm message send --target ... [--attachment-id ...]` using stdin for channels, threads, and DMs
 - freshness-hold draft output across message targets with newer local context
 - `swarm task create --channel ... --title ...`
 - `swarm task list --channel ...`
@@ -36,7 +36,7 @@ Current implemented surface:
 - generated message IDs and wall-clock sent timestamps
 
 It does not implement a daemon, server, automatic reminder firing,
-integrations, message attachment rendering, or production workspace access.
+integrations, or production workspace access.
 
 ## Verify
 
@@ -70,4 +70,5 @@ persistence, target-generic freshness, and wall-clock sent timestamps. It also
 checks SQLite-backed task lifecycle create/list/claim/update behavior, reminder
 schedule/list/snooze/update/cancel/log behavior, local server/channel/profile
 catalog reads, channel join/leave, thread unfollow state, local attachment
-upload/view byte persistence, and concurrent write serialization.
+upload/view byte persistence, message attachment rendering, and concurrent
+write serialization.
