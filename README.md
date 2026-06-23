@@ -31,7 +31,7 @@ Current implemented surface:
 - `swarm channel leave ...`
 - `swarm thread unfollow ...`
 - `swarm profile show`
-- `swarm profile update --display-name ... --description ...`
+- `swarm profile update --display-name ... --description ... [--avatar-url ...|--avatar-file ...]`
 - `swarm attachment upload --path ... --channel ... [--mime-type ...]`
 - `swarm attachment view --id ... --output ...`
 - `--content` rejection
@@ -74,6 +74,6 @@ checks SQLite-backed message reaction add/remove rendering, task lifecycle
 create/list/claim/unclaim/update behavior,
 including repeatable task claim/unclaim flags, reminder
 schedule/list/snooze/update/cancel/log behavior, local server/channel/profile
-catalog reads, profile update persistence, channel join/leave, thread unfollow
-state, local attachment upload/view byte persistence, message attachment
-rendering, and concurrent write serialization.
+catalog reads, profile update and avatar persistence, channel join/leave,
+thread unfollow state, local attachment upload/view byte persistence, message
+attachment rendering, and concurrent write serialization.

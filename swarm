@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -189,12 +189,21 @@ def channel_member_item(
     }
 
 
-def profile_item(name: str, display_name: str, kind: str, description: str) -> dict[str, Any]:
+def profile_item(
+    name: str,
+    display_name: str,
+    kind: str,
+    description: str,
+    avatar_url: str | None = None,
+    avatar_file: str | None = None,
+) -> dict[str, Any]:
     return {
         "name": name,
         "display_name": display_name,
         "kind": kind,
         "description": description,
+        "avatar_url": avatar_url,
+        "avatar_file": avatar_file,
     }
 
 
@@ -393,6 +402,10 @@ def attachment_root() -> Path:
     return state_dir() / "attachments"
 
 
+def profile_avatar_root() -> Path:
+    return state_dir() / "profile-avatars"
+
+
 def seed_state() -> dict[str, Any]:
     return deepcopy(SEED_STATE)
 
@@ -538,7 +551,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             name TEXT PRIMARY KEY,
             display_name TEXT NOT NULL,
             kind TEXT NOT NULL CHECK (kind IN ('agent', 'human')),
-            description TEXT NOT NULL
+            description TEXT NOT NULL,
+            avatar_url TEXT,
+            avatar_file TEXT
         );
         CREATE TABLE IF NOT EXISTS thread_attention (
             target TEXT PRIMARY KEY,
@@ -547,6 +562,17 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+
+
+def ensure_profile_columns(conn: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
+    }
+    if "avatar_url" not in columns:
+        conn.execute("ALTER TABLE profiles ADD COLUMN avatar_url TEXT")
+    if "avatar_file" not in columns:
+        conn.execute("ALTER TABLE profiles ADD COLUMN avatar_file TEXT")
 
 
 def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
@@ -759,8 +785,8 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     )
     conn.executemany(
         """
-        INSERT INTO profiles(name, display_name, kind, description)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO profiles(name, display_name, kind, description, avatar_url, avatar_file)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -768,6 +794,8 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 profile["display_name"],
                 profile["kind"],
                 profile.get("description", ""),
+                profile.get("avatar_url"),
+                profile.get("avatar_file"),
             )
             for profile in state.get("profiles", [])
         ],
@@ -792,17 +820,25 @@ def ensure_base_catalog(conn: sqlite3.Connection) -> None:
     for row in BASE_PROFILES:
         conn.execute(
             """
-            INSERT INTO profiles(name, display_name, kind, description)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO profiles(name, display_name, kind, description, avatar_url, avatar_file)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO NOTHING
             """,
-            (row["name"], row["display_name"], row["kind"], row["description"]),
+            (
+                row["name"],
+                row["display_name"],
+                row["kind"],
+                row["description"],
+                row.get("avatar_url"),
+                row.get("avatar_file"),
+            ),
         )
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:
     with conn:
         create_schema(conn)
+        ensure_profile_columns(conn)
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         if row is None:
             replace_state(conn, initial_state())
@@ -987,9 +1023,20 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         ).fetchall()
     ]
     profiles = [
-        profile_item(row["name"], row["display_name"], row["kind"], row["description"])
+        profile_item(
+            row["name"],
+            row["display_name"],
+            row["kind"],
+            row["description"],
+            row["avatar_url"],
+            row["avatar_file"],
+        )
         for row in conn.execute(
-            "SELECT name, display_name, kind, description FROM profiles ORDER BY kind, name"
+            """
+            SELECT name, display_name, kind, description, avatar_url, avatar_file
+            FROM profiles
+            ORDER BY kind, name
+            """
         ).fetchall()
     ]
     thread_attention = [
@@ -1399,6 +1446,17 @@ def attachment_source_path(path_text: str) -> Path | None:
     if not resolved.is_file():
         return None
     return resolved
+
+
+def store_profile_avatar(source: Path) -> str:
+    suffix = source.suffix if source.suffix and len(source.suffix) <= 12 else ".bin"
+    avatar_id = str(uuid.uuid4())
+    destination = profile_avatar_root() / f"{avatar_id}{suffix}"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp_destination = destination.with_suffix(destination.suffix + ".tmp")
+    shutil.copyfile(source, tmp_destination)
+    tmp_destination.replace(destination)
+    return f"profile-avatars/{destination.name}"
 
 
 def attachment_mime_type(path: Path, override: str | None) -> str:
@@ -2584,12 +2642,18 @@ def command_profile_show(argv: list[str]) -> int:
         profile = profile_by_name(state, "candidate")
         if profile is None:
             return write_stderr("Error: Profile not found\nCode: NOT_FOUND\n")
+        avatar_rows = ""
+        if profile.get("avatar_url"):
+            avatar_rows += f"avatar_url: {profile['avatar_url']}\n"
+        if profile.get("avatar_file"):
+            avatar_rows += f"avatar_file: {profile['avatar_file']}\n"
         return write_stdout(
             "## Profile\n\n"
             f"@{profile['name']}\n"
             f"display_name: {profile['display_name']}\n"
             f"type: {profile['kind']}\n"
             f"description: {profile['description']}\n"
+            f"{avatar_rows}"
         )
 
     return with_read_state(action)
@@ -2598,12 +2662,28 @@ def command_profile_show(argv: list[str]) -> int:
 def command_profile_update(argv: list[str]) -> int:
     display_name = arg_value(argv, "--display-name")
     description = arg_value(argv, "--description")
-    if display_name is None and description is None:
-        return write_stderr("Error: provide --display-name or --description\nCode: INVALID_ARG\n")
+    avatar_url = arg_value(argv, "--avatar-url")
+    avatar_file_text = arg_value(argv, "--avatar-file")
+    if display_name is None and description is None and avatar_url is None and avatar_file_text is None:
+        return write_stderr(
+            "Error: provide --display-name, --description, --avatar-url, or --avatar-file\n"
+            "Code: INVALID_ARG\n"
+        )
+    if avatar_url is not None and avatar_file_text is not None:
+        return write_stderr("Error: use only one of --avatar-url or --avatar-file\nCode: INVALID_ARG\n")
     if display_name is not None and not display_name.strip():
         return write_stderr("Error: --display-name must be non-empty\nCode: INVALID_ARG\n")
     if description is not None and not description.strip():
         return write_stderr("Error: --description must be non-empty\nCode: INVALID_ARG\n")
+    if avatar_url is not None and not avatar_url.strip():
+        return write_stderr("Error: --avatar-url must be non-empty\nCode: INVALID_ARG\n")
+    avatar_source = None
+    if avatar_file_text is not None:
+        if not avatar_file_text.strip():
+            return write_stderr("Error: --avatar-file must be non-empty\nCode: INVALID_ARG\n")
+        avatar_source = attachment_source_path(avatar_file_text)
+        if avatar_source is None:
+            return write_stderr("Error: Avatar file not found\nCode: NOT_FOUND\n")
 
     def action(state: dict[str, Any]) -> int:
         profile = profile_by_name(state, "candidate")
@@ -2613,6 +2693,12 @@ def command_profile_update(argv: list[str]) -> int:
             profile["display_name"] = display_name.strip()
         if description is not None:
             profile["description"] = description.strip()
+        if avatar_url is not None:
+            profile["avatar_url"] = avatar_url.strip()
+            profile["avatar_file"] = None
+        if avatar_source is not None:
+            profile["avatar_file"] = store_profile_avatar(avatar_source)
+            profile["avatar_url"] = None
         return write_stdout("Profile updated.\n")
 
     return with_mutable_state(action)
