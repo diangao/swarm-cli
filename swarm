@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal candidate Swarm CLI for v0 live conformance."""
+"""Minimal state-backed candidate Swarm CLI for v0 live conformance."""
 
 from __future__ import annotations
 
@@ -7,58 +7,132 @@ import json
 import os
 import sys
 import tempfile
+import uuid
+from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 
+SCHEMA_VERSION = 3
 STATE_FILE = "state.json"
 
-CHANNEL_HISTORY = """## Message History for #general (3 messages)
-Your last read position: seq 100. Use swarm message read --channel "#general" --after 100 to see only unread messages.
 
-[seq=99 msg=99999999-9999-4999-8999-999999999999 time=2026-03-15 00:59:50 type=human] @alice: earlier message
-[seq=100 msg=00000000-0000-4000-8000-000000000000 time=2026-03-15 01:00:00 type=human] @alice: parent message
-[seq=103 msg=44444444-4444-4444-8444-444444444444 time=2026-03-15 01:02:00 type=agent] @builder: later channel message
+def message(
+    seq: int,
+    target: str,
+    msg_id: str,
+    timestamp: str,
+    sender_type: str,
+    author: str,
+    body: str,
+) -> dict[str, Any]:
+    return {
+        "seq": seq,
+        "target": target,
+        "id": msg_id,
+        "time": timestamp,
+        "type": sender_type,
+        "author": author,
+        "body": body,
+    }
 
---- 3 messages shown. Use before=99 to load older messages. ---
-"""
 
-THREAD_HISTORY = """## Message History for #general:00000000 (2 messages)
+def inbox_item(
+    target: str,
+    msg_id: str,
+    timestamp: str,
+    sender_type: str,
+    author: str,
+    body: str,
+) -> dict[str, Any]:
+    return {
+        "target": target,
+        "message_id": msg_id,
+        "time": timestamp,
+        "type": sender_type,
+        "author": author,
+        "body": body,
+    }
 
-[seq=100 msg=00000000-0000-4000-8000-000000000000 time=2026-03-15 01:00:00 type=human] @alice: parent message
-[seq=101 msg=11111111-1111-4111-8111-111111111111 time=2026-03-15 01:00:10 type=agent] @builder: thread reply
 
---- 2 messages shown. Use before=100 to load older messages. ---
-"""
-
-PENDING_CHECK = """[target=#general msg=00000000 time=2026-03-15T01:00:00 type=human] @alice: please check the fixture
-[target=#general:00000000 msg=11111111 time=2026-03-15T01:00:10 type=agent] @builder: thread reply fixture
-No more new messages.
-"""
-
-SEND_SUCCESS = """Message sent to #general:00000000. Message ID: 22222222-2222-4222-8222-222222222222 (to reply in this message's thread, use target "#general:00000000")
-"""
-
-FRESHNESS_HOLD = """Freshness hold: showing latest 1 of 1 newer message.
-Your message has been saved as a draft. Review the bounded context shown here, then choose one path.
-Lineage: producerFactId=freshness_decision_fact:0000000000000000000000000000000000000000000000000000000000000000.
-
-## Message History for #general (1 messages)
-
-[seq=102 msg=33333333-3333-4333-8333-333333333333 time=2026-03-15 01:01:00 type=human] @alice: newer message
-
-To update the draft, send revised content normally:
-  swarm message send --target "#general" <<'SWARMMSG'
-  revised message
-  SWARMMSG
-To send the current draft unchanged:
-  swarm message send --send-draft --target "#general"
-"""
-
-CONTENT_REJECTED = """Error: --content is no longer supported. Pipe message content to stdin.
-Use:
-  printf 'hello' | swarm message send --target "#channel"
-Code: CONTENT_FLAG_UNSUPPORTED
-"""
+SEED_STATE: dict[str, Any] = {
+    "schema_version": SCHEMA_VERSION,
+    "next_seq": 104,
+    "next_id_counter": 0,
+    "last_read": {"#general": 100},
+    "messages": [
+        message(
+            99,
+            "#general",
+            "99999999-9999-4999-8999-999999999999",
+            "2026-03-15 00:59:50",
+            "human",
+            "alice",
+            "earlier message",
+        ),
+        message(
+            100,
+            "#general",
+            "00000000-0000-4000-8000-000000000000",
+            "2026-03-15 01:00:00",
+            "human",
+            "alice",
+            "parent message",
+        ),
+        message(
+            101,
+            "#general:00000000",
+            "11111111-1111-4111-8111-111111111111",
+            "2026-03-15 01:00:10",
+            "agent",
+            "builder",
+            "thread reply",
+        ),
+        message(
+            102,
+            "#general",
+            "33333333-3333-4333-8333-333333333333",
+            "2026-03-15 01:01:00",
+            "human",
+            "alice",
+            "newer message",
+        ),
+        message(
+            103,
+            "#general",
+            "44444444-4444-4444-8444-444444444444",
+            "2026-03-15 01:02:00",
+            "agent",
+            "builder",
+            "later channel message",
+        ),
+    ],
+    "remote_inbox": [
+        inbox_item(
+            "#general",
+            "00000000-0000-4000-8000-000000000000",
+            "2026-03-15T01:00:00",
+            "human",
+            "alice",
+            "please check the fixture",
+        ),
+        inbox_item(
+            "#general:00000000",
+            "11111111-1111-4111-8111-111111111111",
+            "2026-03-15T01:00:10",
+            "agent",
+            "builder",
+            "thread reply fixture",
+        ),
+    ],
+    "local_inbox": [],
+    "freshness": {
+        "#general": {
+            "cursor": 100,
+            "draft": None,
+        }
+    },
+}
 
 
 def state_dir() -> Path:
@@ -68,23 +142,74 @@ def state_dir() -> Path:
     return Path(tempfile.gettempdir()) / "swarm-candidate-impl" / f"ppid-{os.getppid()}"
 
 
-def load_state() -> dict[str, int]:
-    path = state_dir() / STATE_FILE
+def state_path() -> Path:
+    return state_dir() / STATE_FILE
+
+
+def seed_state() -> dict[str, Any]:
+    return deepcopy(SEED_STATE)
+
+
+def load_state() -> dict[str, Any]:
+    path = state_path()
     if not path.exists():
-        return {"message_check_calls": 0}
+        state = seed_state()
+        save_state(state)
+        return state
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        state = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return {"message_check_calls": 0}
-    if not isinstance(data, dict):
-        return {"message_check_calls": 0}
-    return {"message_check_calls": int(data.get("message_check_calls", 0))}
+        state = seed_state()
+        save_state(state)
+        return state
+    if state.get("schema_version") != SCHEMA_VERSION:
+        state = seed_state()
+        save_state(state)
+    return state
 
 
-def save_state(state: dict[str, int]) -> None:
+def save_state(state: dict[str, Any]) -> None:
     root = state_dir()
     root.mkdir(parents=True, exist_ok=True)
-    (root / STATE_FILE).write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    state_path().write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def short_id(msg_id: str) -> str:
+    return msg_id.split("-", 1)[0]
+
+
+def format_history_row(record: dict[str, Any]) -> str:
+    return (
+        f"[seq={record['seq']} msg={record['id']} time={record['time']} "
+        f"type={record['type']}] @{record['author']}: {record['body']}"
+    )
+
+
+def format_inbox_row(record: dict[str, Any]) -> str:
+    msg = record.get("msg") or short_id(str(record["message_id"]))
+    return (
+        f"[target={record['target']} msg={msg} time={record['time']} "
+        f"type={record['type']}] @{record['author']}: {record['body']}"
+    )
+
+
+def parent_message_for_thread(state: dict[str, Any], target: str) -> dict[str, Any] | None:
+    if ":" not in target:
+        return None
+    channel, root = target.rsplit(":", 1)
+    for record in state["messages"]:
+        if record["target"] == channel and short_id(record["id"]) == root:
+            return record
+    return None
+
+
+def records_for_surface(state: dict[str, Any], target: str) -> list[dict[str, Any]]:
+    rows = [record for record in state["messages"] if record["target"] == target]
+    if ":" in target:
+        parent = parent_message_for_thread(state, target)
+        if parent is not None:
+            rows = [parent, *rows]
+    return sorted(rows, key=lambda row: row["seq"])
 
 
 def write_stdout(text: str) -> int:
@@ -106,38 +231,176 @@ def arg_value(argv: list[str], flag: str) -> str | None:
     return argv[idx + 1]
 
 
+def next_message_id(state: dict[str, Any]) -> str:
+    counter = int(state.get("next_id_counter", 0)) + 1
+    state["next_id_counter"] = counter
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"swarm-candidate-message-{counter}"))
+
+
+def append_message(state: dict[str, Any], target: str, body: str) -> dict[str, Any]:
+    seq = int(state["next_seq"])
+    state["next_seq"] = seq + 1
+    record = message(
+        seq,
+        target,
+        next_message_id(state),
+        "2026-03-15 01:03:00",
+        "agent",
+        "candidate",
+        body.rstrip("\n"),
+    )
+    state["messages"].append(record)
+    return record
+
+
+def success_text(target: str, record: dict[str, Any]) -> str:
+    return (
+        f"Message sent to {target}. Message ID: {record['id']} "
+        f"(to reply in this message's thread, use target \"{target}\")\n"
+    )
+
+
+def sync_remote_inbox(state: dict[str, Any]) -> None:
+    if not state.get("remote_inbox"):
+        return
+    state.setdefault("local_inbox", []).extend(state["remote_inbox"])
+    state["remote_inbox"] = []
+
+
+def command_message_check() -> int:
+    state = load_state()
+    local_inbox = state.setdefault("local_inbox", [])
+    if not local_inbox:
+        sync_remote_inbox(state)
+        save_state(state)
+        return write_stdout("No new messages.\n")
+
+    available = list(local_inbox)
+    state["local_inbox"] = []
+    save_state(state)
+    text = "\n".join(format_inbox_row(item) for item in available)
+    return write_stdout(f"{text}\nNo more new messages.\n")
+
+
+def known_surface(state: dict[str, Any], target: str) -> bool:
+    if target in {"#general", "#general:00000000"}:
+        return True
+    return any(record["target"] == target for record in state["messages"])
+
+
+def command_message_read(argv: list[str]) -> int:
+    state = load_state()
+    channel = arg_value(argv, "--channel")
+    if channel is None:
+        return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
+
+    if not known_surface(state, channel):
+        return write_stderr(f"Error: Channel not found: {channel}\nCode: NOT_FOUND\n")
+
+    records = records_for_surface(state, channel)
+    if channel == "#general":
+        last_read = state.get("last_read", {}).get("#general", 0)
+        header = (
+            f"## Message History for #general ({len(records)} messages)\n"
+            f"Your last read position: seq {last_read}. Use swarm message read --channel "
+            f"\"#general\" --after {last_read} to see only unread messages.\n\n"
+        )
+    elif channel == "#general:00000000":
+        header = f"## Message History for #general:00000000 ({len(records)} messages)\n\n"
+    else:
+        header = f"## Message History for {channel} ({len(records)} messages)\n\n"
+
+    if not records:
+        return write_stdout(f"## Message History for {channel} (0 messages)\n\n--- 0 messages shown. ---\n")
+
+    before = records[0]["seq"]
+    rows = "\n".join(format_history_row(record) for record in records)
+    return write_stdout(
+        f"{header}{rows}\n\n--- {len(records)} messages shown. "
+        f"Use before={before} to load older messages. ---\n"
+    )
+
+
+def freshness_blockers(state: dict[str, Any], target: str) -> list[dict[str, Any]]:
+    freshness = state.setdefault("freshness", {}).setdefault(target, {"cursor": 0, "draft": None})
+    cursor = int(freshness.get("cursor", 0))
+    return sorted(
+        [record for record in state["messages"] if record["target"] == target and int(record["seq"]) > cursor],
+        key=lambda row: int(row["seq"]),
+    )
+
+
+def render_freshness_hold(state: dict[str, Any], target: str, body: str) -> int:
+    freshness = state.setdefault("freshness", {}).setdefault(target, {})
+    freshness["draft"] = body
+    blocking = freshness_blockers(state, target)
+    visible = blocking[-1:]
+    save_state(state)
+
+    history_rows = "\n".join(format_history_row(record) for record in visible)
+    return write_stdout(
+        f"Freshness hold: showing latest {len(visible)} of {len(blocking)} newer message.\n"
+        "Your message has been saved as a draft. Review the bounded context shown here, then choose one path.\n"
+        "Lineage: producerFactId=freshness_decision_fact:"
+        "0000000000000000000000000000000000000000000000000000000000000000.\n\n"
+        f"## Message History for {target} ({len(visible)} messages)\n\n"
+        f"{history_rows}\n\n"
+        "To update the draft, send revised content normally:\n"
+        f"  swarm message send --target \"{target}\" <<'SWARMMSG'\n"
+        "  revised message\n"
+        "  SWARMMSG\n"
+        "To send the current draft unchanged:\n"
+        f"  swarm message send --send-draft --target \"{target}\"\n"
+    )
+
+
+def command_message_send(argv: list[str]) -> int:
+    if "--content" in argv:
+        return write_stderr(
+            "Error: --content is no longer supported. Pipe message content to stdin.\n"
+            "Use:\n"
+            "  printf 'hello' | swarm message send --target \"#channel\"\n"
+            "Code: CONTENT_FLAG_UNSUPPORTED\n"
+        )
+
+    target = arg_value(argv, "--target")
+    if target is None:
+        return write_stderr("Error: --target is required\nCode: INVALID_ARG\n")
+    state = load_state()
+
+    if "--send-draft" in argv:
+        draft = state.get("freshness", {}).get(target, {}).get("draft")
+        if not draft:
+            return write_stderr("Error: No draft saved for target\nCode: NOT_FOUND\n")
+        record = append_message(state, target, draft)
+        state["freshness"][target]["draft"] = None
+        state["freshness"][target]["cursor"] = record["seq"]
+        save_state(state)
+        return write_stdout(success_text(target, record))
+
+    body = sys.stdin.read()
+    if target == "#general" and freshness_blockers(state, target):
+        return render_freshness_hold(state, target, body)
+    if target.startswith("#"):
+        record = append_message(state, target, body)
+        if target in state.get("freshness", {}):
+            state["freshness"][target]["cursor"] = record["seq"]
+        save_state(state)
+        return write_stdout(success_text(target, record))
+    return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
+
+
 def command_message(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing message subcommand\nCode: INVALID_ARG\n")
     subcommand = argv[0]
     rest = argv[1:]
     if subcommand == "check":
-        state = load_state()
-        calls = state["message_check_calls"]
-        state["message_check_calls"] = calls + 1
-        save_state(state)
-        if calls == 0:
-            return write_stdout("No new messages.\n")
-        if calls == 1:
-            return write_stdout(PENDING_CHECK)
-        return write_stdout("No new messages.\n")
+        return command_message_check()
     if subcommand == "read":
-        channel = arg_value(rest, "--channel")
-        if channel == "#general":
-            return write_stdout(CHANNEL_HISTORY)
-        if channel == "#general:00000000":
-            return write_stdout(THREAD_HISTORY)
-        return write_stderr(f"Error: Channel not found: {channel}\nCode: NOT_FOUND\n")
+        return command_message_read(rest)
     if subcommand == "send":
-        if "--content" in rest:
-            return write_stderr(CONTENT_REJECTED)
-        target = arg_value(rest, "--target")
-        _body = sys.stdin.read()
-        if target == "#general:00000000":
-            return write_stdout(SEND_SUCCESS)
-        if target == "#general":
-            return write_stdout(FRESHNESS_HOLD)
-        return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
+        return command_message_send(rest)
     return write_stderr(f"Error: unknown message subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
