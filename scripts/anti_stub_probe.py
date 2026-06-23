@@ -251,9 +251,28 @@ def probe_read_pagination(cli: Path, state_dir: Path) -> None:
     for body in bodies:
         require(body in full, f"full paged read missing body: {body}")
 
+    limited = run(cli, state_dir, "message", "read", "--channel", target, "--limit", "2").stdout
+    require(bodies[2] in limited and bodies[3] in limited, "--limit 2 did not show the newest two records")
+    require(bodies[0] not in limited and bodies[1] not in limited, "--limit 2 included records outside the window")
+
     before = run(cli, state_dir, "message", "read", "--channel", target, "--before", sent_ids[2][:8]).stdout
     require(bodies[0] in before and bodies[1] in before, "--before short id did not show earlier records")
     require(bodies[2] not in before and bodies[3] not in before, "--before included anchor or later records")
+
+    before_limited = run(
+        cli,
+        state_dir,
+        "message",
+        "read",
+        "--channel",
+        target,
+        "--before",
+        sent_ids[3],
+        "--limit",
+        "1",
+    ).stdout
+    require(bodies[2] in before_limited, "--before with --limit 1 did not show the nearest earlier record")
+    require(bodies[0] not in before_limited and bodies[1] not in before_limited, "--before limit leaked older records")
 
     after = run(cli, state_dir, "message", "read", "--channel", target, "--after", sent_ids[1]).stdout
     require(bodies[2] in after and bodies[3] in after, "--after full id did not show later records")
@@ -265,6 +284,9 @@ def probe_read_pagination(cli: Path, state_dir: Path) -> None:
 
     missing = run(cli, state_dir, "message", "read", "--channel", target, "--around", "does-not-exist", expected=1).stderr
     require("anchor not found" in missing, "missing read anchor did not fail closed")
+
+    invalid_limit = run(cli, state_dir, "message", "read", "--channel", target, "--limit", "0", expected=1).stderr
+    require("--limit must be a positive integer" in invalid_limit, "invalid read limit did not fail closed")
 
 
 def probe_search_and_resolve(cli: Path, state_dir: Path) -> None:
@@ -935,7 +957,7 @@ def main() -> int:
         probe_membership_attention(cli, state_dir)
         probe_attachments(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, profile avatars, membership, and attachments")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, profile avatars, membership, and attachments")
     return 0
 
 

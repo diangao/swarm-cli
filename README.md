@@ -8,7 +8,7 @@ moving the CLI toward product behavior that can be used day to day.
 Current implemented surface:
 
 - `swarm message check`
-- `swarm message read --channel ... [--before/--after/--around ...]`
+- `swarm message read --channel ... [--limit ...] [--before/--after/--around ...]`
 - `swarm message search --query ... [--channel/--sender/--sort/--before/--after/--limit ...]`
 - `swarm message resolve <id>`
 - `swarm message react --message-id ... --emoji ... [--remove]`
@@ -67,7 +67,7 @@ historical contract fixtures, so test runs that need those rows must set
 
 The anti-stub probe sends fixture-absent message bodies, reads them back, checks
 that unseeded fresh stores are empty, then uses explicit test fixtures for
-history pagination, message search/resolve, thread/target isolation, drains
+history pagination and bounded limits, message search/resolve, thread/target isolation, drains
 real inbox state, and exercises the freshness-hold draft cursor, DM
 persistence, target-generic freshness, and wall-clock sent timestamps. It also
 checks SQLite-backed message reaction add/remove rendering, task lifecycle
