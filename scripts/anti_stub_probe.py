@@ -395,6 +395,48 @@ def probe_navigation_surfaces(cli: Path, state_dir: Path) -> None:
     require("@candidate" in dynamic_members, "dynamic channel did not include candidate member")
 
 
+def probe_membership_attention(cli: Path, state_dir: Path) -> None:
+    target = f"#join-{uuid.uuid4().hex[:8]}"
+    joined = run(cli, state_dir, "channel", "join", target).stdout
+    require(f"Joined {target}." in joined, "channel join did not acknowledge target")
+    info = run(cli, state_dir, "server", "info").stdout
+    require(f"{target} (public, joined)" in info, "joined channel missing from server info")
+
+    left = run(cli, state_dir, "channel", "leave", target).stdout
+    require(f"Left {target}." in left, "channel leave did not acknowledge target")
+    after_leave_info = run(cli, state_dir, "server", "info").stdout
+    require(f"{target} (public, not joined)" in after_leave_info, "left channel did not become not joined")
+    rejected_send = run(
+        cli,
+        state_dir,
+        "message",
+        "send",
+        "--target",
+        target,
+        stdin="should not send while left",
+        expected=1,
+    ).stderr
+    require("Not joined to target" in rejected_send, "send to left channel did not fail closed")
+
+    run(cli, state_dir, "channel", "join", target)
+    accepted = run(cli, state_dir, "message", "send", "--target", target, stdin=f"after rejoin {uuid.uuid4()}").stdout
+    require(f"Message sent to {target}." in accepted, "send after rejoin did not succeed")
+
+    private_rejected = run(cli, state_dir, "channel", "leave", "#private-fixture", expected=1).stderr
+    require("private channel membership is managed by the server" in private_rejected, "private leave did not fail closed")
+
+    thread_target = f"{target}:abcd1234"
+    unfollowed = run(cli, state_dir, "thread", "unfollow", "--target", thread_target).stdout
+    require(f"Unfollowed {thread_target}." in unfollowed, "thread unfollow did not acknowledge target")
+    conn = connect_state(state_dir)
+    try:
+        row = conn.execute("SELECT followed FROM thread_attention WHERE target = ?", (thread_target,)).fetchone()
+        require(row is not None, "thread unfollow did not persist attention row")
+        require(row["followed"] == 0, "thread unfollow row did not mark followed=false")
+    finally:
+        conn.close()
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -409,8 +451,9 @@ def main() -> int:
         probe_task_lifecycle(cli, state_dir)
         probe_reminder_lifecycle(cli, state_dir)
         probe_navigation_surfaces(cli, state_dir)
+        probe_membership_attention(cli, state_dir)
 
-    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, and navigation")
+    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, and membership")
     return 0
 
 

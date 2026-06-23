@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 
@@ -152,6 +152,14 @@ def profile_item(name: str, display_name: str, kind: str, description: str) -> d
     }
 
 
+def thread_attention_item(target: str, followed: bool, updated_at: str) -> dict[str, Any]:
+    return {
+        "target": target,
+        "followed": followed,
+        "updated_at": updated_at,
+    }
+
+
 SEED_CHANNELS = [
     channel_item("#general", False, True, "General local workspace channel"),
     channel_item("#private-fixture", True, True, "Private fixture channel visible to authorized members"),
@@ -285,6 +293,9 @@ SEED_STATE: dict[str, Any] = {
     "channels": SEED_CHANNELS,
     "channel_members": SEED_CHANNEL_MEMBERS,
     "profiles": SEED_PROFILES,
+    "thread_attention": [
+        thread_attention_item("#general:00000000", True, "2026-03-15 01:00:10"),
+    ],
 }
 
 
@@ -405,6 +416,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
             kind TEXT NOT NULL CHECK (kind IN ('agent', 'human')),
             description TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS thread_attention (
+            target TEXT PRIMARY KEY,
+            followed INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
 
@@ -420,6 +436,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM channel_members")
     conn.execute("DELETE FROM channels")
     conn.execute("DELETE FROM profiles")
+    conn.execute("DELETE FROM thread_attention")
     conn.execute("DELETE FROM meta")
     conn.executemany(
         "INSERT INTO meta(key, value) VALUES (?, ?)",
@@ -580,6 +597,20 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             for profile in state.get("profiles", [])
         ],
     )
+    conn.executemany(
+        """
+        INSERT INTO thread_attention(target, followed, updated_at)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (
+                attention["target"],
+                1 if attention.get("followed") else 0,
+                attention["updated_at"],
+            )
+            for attention in state.get("thread_attention", [])
+        ],
+    )
 
 
 def ensure_seed_catalog(conn: sqlite3.Connection) -> None:
@@ -609,6 +640,15 @@ def ensure_seed_catalog(conn: sqlite3.Connection) -> None:
             VALUES (?, ?, ?, ?)
             """,
             [(row["name"], row["display_name"], row["kind"], row["description"]) for row in SEED_PROFILES],
+        )
+    thread_count = conn.execute("SELECT COUNT(*) AS count FROM thread_attention").fetchone()["count"]
+    if thread_count == 0:
+        conn.executemany(
+            """
+            INSERT INTO thread_attention(target, followed, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            [("#general:00000000", 1, "2026-03-15 01:00:10")],
         )
 
 
@@ -751,6 +791,12 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             "SELECT name, display_name, kind, description FROM profiles ORDER BY kind, name"
         ).fetchall()
     ]
+    thread_attention = [
+        thread_attention_item(row["target"], bool(row["followed"]), row["updated_at"])
+        for row in conn.execute(
+            "SELECT target, followed, updated_at FROM thread_attention ORDER BY target"
+        ).fetchall()
+    ]
     return {
         "schema_version": SCHEMA_VERSION,
         "next_seq": meta_int(conn, "next_seq", 1),
@@ -767,6 +813,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "channels": channels,
         "channel_members": channel_members,
         "profiles": profiles,
+        "thread_attention": thread_attention,
     }
 
 
@@ -877,9 +924,45 @@ def ensure_channel_catalog(state: dict[str, Any], target: str) -> None:
     if any(channel["name"] == target for channel in state.get("channels", [])):
         return
     state.setdefault("channels", []).append(channel_item(target, False, True, "Local channel"))
+    ensure_candidate_member(state, target)
+
+
+def top_level_channel_record(state: dict[str, Any], channel: str) -> dict[str, Any] | None:
+    for record in state.get("channels", []):
+        if record["name"] == channel:
+            return record
+    return None
+
+
+def ensure_candidate_member(state: dict[str, Any], channel: str) -> None:
+    if any(member["channel"] == channel and member["name"] == "candidate" for member in state.get("channel_members", [])):
+        return
     state.setdefault("channel_members", []).append(
-        channel_member_item(target, "candidate", "agent", None, "active")
+        channel_member_item(channel, "candidate", "agent", None, "active")
     )
+
+
+def remove_candidate_member(state: dict[str, Any], channel: str) -> None:
+    state["channel_members"] = [
+        member
+        for member in state.get("channel_members", [])
+        if not (member["channel"] == channel and member["name"] == "candidate")
+    ]
+
+
+def target_joined_for_write(state: dict[str, Any], target: str) -> bool:
+    if target.startswith("dm:@"):
+        return True
+    channel = channel_for_target(target)
+    record = top_level_channel_record(state, channel)
+    return record is None or bool(record.get("joined"))
+
+
+def thread_attention_record(state: dict[str, Any], target: str) -> dict[str, Any] | None:
+    for record in state.get("thread_attention", []):
+        if record["target"] == target:
+            return record
+    return None
 
 
 def members_for_target(state: dict[str, Any], target: str) -> list[dict[str, Any]]:
@@ -1244,6 +1327,8 @@ def command_message_send(argv: list[str]) -> int:
         body = sys.stdin.read()
         if not target_allowed:
             return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
+        if not target_joined_for_write(state, target):
+            return write_stderr(f"Error: Not joined to target: {target}\nCode: NOT_JOINED\n")
         if freshness_blockers(state, target):
             return render_freshness_hold(state, target, body)
         record = append_message(state, target, body)
@@ -1304,6 +1389,8 @@ def command_task_create(argv: list[str]) -> int:
 
     def action(state: dict[str, Any]) -> int:
         ensure_channel_catalog(state, channel)
+        if not target_joined_for_write(state, channel):
+            return write_stderr(f"Error: Not joined to target: {channel}\nCode: NOT_JOINED\n")
         task = append_task(state, channel, title)
         return write_stdout(
             f"Task #{task['number']} created in {channel}. "
@@ -1689,6 +1776,49 @@ def command_channel_members(argv: list[str]) -> int:
     return with_read_state(action)
 
 
+def command_channel_join(argv: list[str]) -> int:
+    target = arg_value(argv, "--target")
+    if target is None and argv:
+        target = argv[0]
+    if target is None:
+        return write_stderr("Error: channel target is required\nCode: INVALID_ARG\n")
+    if not target.startswith("#") or ":" in target:
+        return write_stderr("Error: join target must be a top-level channel\nCode: INVALID_TARGET\n")
+
+    def action(state: dict[str, Any]) -> int:
+        record = top_level_channel_record(state, target)
+        if record is None:
+            state.setdefault("channels", []).append(channel_item(target, False, True, "Local channel"))
+        else:
+            record["joined"] = True
+        ensure_candidate_member(state, target)
+        return write_stdout(f"Joined {target}.\n")
+
+    return with_mutable_state(action)
+
+
+def command_channel_leave(argv: list[str]) -> int:
+    target = arg_value(argv, "--target")
+    if target is None and argv:
+        target = argv[0]
+    if target is None:
+        return write_stderr("Error: channel target is required\nCode: INVALID_ARG\n")
+    if not target.startswith("#") or ":" in target:
+        return write_stderr("Error: leave target must be a top-level channel\nCode: INVALID_TARGET\n")
+
+    def action(state: dict[str, Any]) -> int:
+        record = top_level_channel_record(state, target)
+        if record is None:
+            return write_stderr("Error: Channel not found\nCode: NOT_FOUND\n")
+        if record.get("private"):
+            return write_stderr("Error: private channel membership is managed by the server\nCode: LEAVE_FAILED\n")
+        record["joined"] = False
+        remove_candidate_member(state, target)
+        return write_stdout(f"Left {target}.\n")
+
+    return with_mutable_state(action)
+
+
 def command_channel(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing channel subcommand\nCode: INVALID_ARG\n")
@@ -1696,7 +1826,43 @@ def command_channel(argv: list[str]) -> int:
     rest = argv[1:]
     if subcommand == "members":
         return command_channel_members(rest)
+    if subcommand == "join":
+        return command_channel_join(rest)
+    if subcommand == "leave":
+        return command_channel_leave(rest)
     return write_stderr(f"Error: unknown channel subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
+def command_thread_unfollow(argv: list[str]) -> int:
+    target = arg_value(argv, "--target")
+    if target is None and argv:
+        target = argv[0]
+    if target is None:
+        return write_stderr("Error: thread target is required\nCode: INVALID_ARG\n")
+    if ":" not in target or not (target.startswith("#") or target.startswith("dm:@")):
+        return write_stderr("Error: unfollow target must be a thread target\nCode: INVALID_TARGET\n")
+
+    def action(state: dict[str, Any]) -> int:
+        record = thread_attention_record(state, target)
+        now = current_timestamp()
+        if record is None:
+            state.setdefault("thread_attention", []).append(thread_attention_item(target, False, now))
+        else:
+            record["followed"] = False
+            record["updated_at"] = now
+        return write_stdout(f"Unfollowed {target}.\n")
+
+    return with_mutable_state(action)
+
+
+def command_thread(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing thread subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "unfollow":
+        return command_thread_unfollow(rest)
+    return write_stderr(f"Error: unknown thread subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
 def command_profile_show(argv: list[str]) -> int:
@@ -1760,6 +1926,8 @@ def main(argv: list[str]) -> int:
         return command_server(argv[1:])
     if command == "channel":
         return command_channel(argv[1:])
+    if command == "thread":
+        return command_thread(argv[1:])
     if command == "profile":
         return command_profile(argv[1:])
     return write_stderr(f"Error: unknown command: {command}\nCode: INVALID_ARG\n")
