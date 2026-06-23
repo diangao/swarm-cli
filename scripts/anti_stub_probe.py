@@ -33,9 +33,20 @@ def require(condition: bool, message: str) -> None:
         fail(message)
 
 
-def run(cli: Path, state_dir: Path, *args: str, stdin: str | None = None, expected: int = 0) -> subprocess.CompletedProcess[str]:
+def run(
+    cli: Path,
+    state_dir: Path,
+    *args: str,
+    stdin: str | None = None,
+    expected: int = 0,
+    seed_fixtures: bool = True,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["SWARM_CANDIDATE_STATE_DIR"] = str(state_dir)
+    if seed_fixtures:
+        env["SWARM_CANDIDATE_SEED_FIXTURES"] = "1"
+    else:
+        env.pop("SWARM_CANDIDATE_SEED_FIXTURES", None)
     proc = subprocess.run(
         [str(cli), *args],
         input=stdin,
@@ -52,6 +63,31 @@ def run(cli: Path, state_dir: Path, *args: str, stdin: str | None = None, expect
             f"stderr:\n{proc.stderr}"
         )
     return proc
+
+
+def probe_fresh_store_empty(cli: Path) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp)
+        check = run(cli, state_dir, "message", "check", seed_fixtures=False).stdout
+        require(check == "No new messages.\n", f"fresh unseeded inbox was not empty:\n{check}")
+
+        history = run(cli, state_dir, "message", "read", "--channel", "#general", seed_fixtures=False).stdout
+        require("## Message History for #general (0 messages)" in history, "fresh #general read was not empty")
+        require("alice" not in history, "fresh #general leaked fixture user")
+        require("parent message" not in history, "fresh #general leaked fixture message")
+
+        search = run(
+            cli,
+            state_dir,
+            "message",
+            "search",
+            "--query",
+            "parent",
+            "--channel",
+            "#general",
+            seed_fixtures=False,
+        ).stdout
+        require("(0 results)" in search, "fresh #general search leaked seeded records")
 
 
 def connect_state(state_dir: Path) -> sqlite3.Connection:
@@ -268,7 +304,9 @@ def probe_search_and_resolve(cli: Path, state_dir: Path) -> None:
     resolved_short = run(cli, state_dir, "message", "resolve", sent_id[:8]).stdout
     require(resolved_short == resolved_full, "resolve short id did not match full id output")
     missing = run(cli, state_dir, "message", "resolve", "doesnotexist", expected=1).stderr
-    require("message not found" in missing, "resolve missing id did not fail closed")
+    require("Error: Message not found" in missing, "resolve missing id did not fail closed")
+    require("Next action:" in missing, "resolve missing id did not include recovery hint")
+    require("doesnotexist" not in missing, "resolve missing id echoed unknown id")
 
 
 def probe_freshness_cursor(cli: Path, state_dir: Path) -> None:
@@ -519,6 +557,7 @@ def probe_membership_attention(cli: Path, state_dir: Path) -> None:
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
+    probe_fresh_store_empty(cli)
 
     with tempfile.TemporaryDirectory(prefix="swarm-anti-stub-") as tmp:
         state_dir = Path(tmp)
@@ -534,7 +573,7 @@ def main() -> int:
         probe_navigation_surfaces(cli, state_dir)
         probe_membership_attention(cli, state_dir)
 
-    print("anti-stub probe ok: dynamic inbox, send/read, pagination, search/resolve, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, and membership")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination, search/resolve, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, and membership")
     return 0
 
 

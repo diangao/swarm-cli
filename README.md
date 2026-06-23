@@ -41,7 +41,7 @@ integrations, attachments, or production workspace access.
 From the `swarm-harness` checkout:
 
 ```bash
-SWARM_CANDIDATE_STATE_DIR="$(mktemp -d)" SWARM_CLI=/path/to/swarm-candidate-impl/swarm python3 scripts/contract_check.py --live
+SWARM_CANDIDATE_STATE_DIR="$(mktemp -d)" SWARM_CANDIDATE_SEED_FIXTURES=1 SWARM_CLI=/path/to/swarm-candidate-impl/swarm python3 scripts/contract_check.py --live
 ```
 
 From this checkout:
@@ -55,10 +55,17 @@ the user state directory (`$XDG_STATE_HOME/swarm-cli` or
 `~/.local/state/swarm-cli`); set `SWARM_CANDIDATE_STATE_DIR` for isolated test
 runs or to inspect a specific store.
 
+Fresh product stores start empty: no fixture messages, tasks, channels, or
+inbox entries are injected. The frozen public harness still expects its
+historical contract fixtures, so test runs that need those rows must set
+`SWARM_CANDIDATE_SEED_FIXTURES=1` against an isolated state directory.
+
 The anti-stub probe sends fixture-absent message bodies, reads them back, checks
-history pagination, message search/resolve, thread/target isolation, drains real inbox state, and exercises the
-freshness-hold draft cursor, DM persistence, target-generic freshness, and
-wall-clock sent timestamps. It also checks SQLite-backed task lifecycle
-create/list/claim/update behavior, reminder schedule/list/snooze/update/cancel/log
-behavior, local server/channel/profile catalog reads, channel join/leave,
-thread unfollow state, and concurrent write serialization.
+that unseeded fresh stores are empty, then uses explicit test fixtures for
+history pagination, message search/resolve, thread/target isolation, drains
+real inbox state, and exercises the freshness-hold draft cursor, DM
+persistence, target-generic freshness, and wall-clock sent timestamps. It also
+checks SQLite-backed task lifecycle create/list/claim/update behavior, reminder
+schedule/list/snooze/update/cancel/log behavior, local server/channel/profile
+catalog reads, channel join/leave, thread unfollow state, and concurrent write
+serialization.

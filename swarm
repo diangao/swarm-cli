@@ -183,6 +183,31 @@ SEED_PROFILES = [
 ]
 
 
+BASE_PROFILES = [
+    profile_item("candidate", "Candidate Agent", "agent", "Local self-contained Swarm CLI agent"),
+]
+
+
+EMPTY_STATE: dict[str, Any] = {
+    "schema_version": SCHEMA_VERSION,
+    "next_seq": 1,
+    "next_id_counter": 0,
+    "next_task_number": 1,
+    "last_read": {},
+    "messages": [],
+    "remote_inbox": [],
+    "local_inbox": [],
+    "freshness": {},
+    "tasks": [],
+    "reminders": [],
+    "reminder_events": [],
+    "channels": [],
+    "channel_members": [],
+    "profiles": BASE_PROFILES,
+    "thread_attention": [],
+}
+
+
 SEED_STATE: dict[str, Any] = {
     "schema_version": SCHEMA_VERSION,
     "next_seq": 104,
@@ -315,6 +340,20 @@ def state_path() -> Path:
 
 def seed_state() -> dict[str, Any]:
     return deepcopy(SEED_STATE)
+
+
+def empty_state() -> dict[str, Any]:
+    return deepcopy(EMPTY_STATE)
+
+
+def should_seed_fixtures() -> bool:
+    return os.environ.get("SWARM_CANDIDATE_SEED_FIXTURES") == "1"
+
+
+def initial_state() -> dict[str, Any]:
+    if should_seed_fixtures():
+        return seed_state()
+    return empty_state()
 
 
 def connect_state() -> sqlite3.Connection:
@@ -614,42 +653,15 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     )
 
 
-def ensure_seed_catalog(conn: sqlite3.Connection) -> None:
-    channel_count = conn.execute("SELECT COUNT(*) AS count FROM channels").fetchone()["count"]
-    if channel_count == 0:
-        conn.executemany(
-            """
-            INSERT INTO channels(name, private, joined, description)
-            VALUES (?, ?, ?, ?)
-            """,
-            [(row["name"], int(row["private"]), int(row["joined"]), row["description"]) for row in SEED_CHANNELS],
-        )
-    member_count = conn.execute("SELECT COUNT(*) AS count FROM channel_members").fetchone()["count"]
-    if member_count == 0:
-        conn.executemany(
-            """
-            INSERT INTO channel_members(channel, name, kind, role, status)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [(row["channel"], row["name"], row["kind"], row["role"], row["status"]) for row in SEED_CHANNEL_MEMBERS],
-        )
-    profile_count = conn.execute("SELECT COUNT(*) AS count FROM profiles").fetchone()["count"]
-    if profile_count == 0:
-        conn.executemany(
+def ensure_base_catalog(conn: sqlite3.Connection) -> None:
+    for row in BASE_PROFILES:
+        conn.execute(
             """
             INSERT INTO profiles(name, display_name, kind, description)
             VALUES (?, ?, ?, ?)
+            ON CONFLICT(name) DO NOTHING
             """,
-            [(row["name"], row["display_name"], row["kind"], row["description"]) for row in SEED_PROFILES],
-        )
-    thread_count = conn.execute("SELECT COUNT(*) AS count FROM thread_attention").fetchone()["count"]
-    if thread_count == 0:
-        conn.executemany(
-            """
-            INSERT INTO thread_attention(target, followed, updated_at)
-            VALUES (?, ?, ?)
-            """,
-            [("#general:00000000", 1, "2026-03-15 01:00:10")],
+            (row["name"], row["display_name"], row["kind"], row["description"]),
         )
 
 
@@ -658,7 +670,7 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         create_schema(conn)
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         if row is None:
-            replace_state(conn, seed_state())
+            replace_state(conn, initial_state())
         elif row["value"] != str(SCHEMA_VERSION):
             conn.execute(
                 """
@@ -667,7 +679,7 @@ def initialize_database(conn: sqlite3.Connection) -> None:
                 """,
                 (str(SCHEMA_VERSION),),
             )
-        ensure_seed_catalog(conn)
+        ensure_base_catalog(conn)
 
 
 def meta_int(conn: sqlite3.Connection, key: str, default: int) -> int:
@@ -1462,7 +1474,11 @@ def command_message_resolve(argv: list[str]) -> int:
         if error == "ambiguous":
             return write_stderr(f"Error: ambiguous message id: {msg_id}\nCode: AMBIGUOUS_ID\n")
         if record is None:
-            return write_stderr(f"Error: message not found: {msg_id}\nCode: NOT_FOUND\n")
+            return write_stderr(
+                "Error: Message not found\n"
+                "Code: NOT_FOUND\n"
+                "Next action: Check the message id and try again.\n"
+            )
         return write_stdout(f"{format_canonical_message(record)}\n")
 
     return with_read_state(action)
