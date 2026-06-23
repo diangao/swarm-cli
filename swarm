@@ -1923,6 +1923,40 @@ def resolve_task_arg(state: dict[str, Any], channel: str, argv: list[str]) -> di
     return None
 
 
+def resolve_task_args(
+    state: dict[str, Any], channel: str, argv: list[str]
+) -> tuple[list[dict[str, Any]], str | None]:
+    tasks: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    number_values = arg_values(argv, "--number")
+    message_ids = arg_values(argv, "--message-id")
+    if not number_values and not message_ids:
+        task = resolve_task_arg(state, channel, argv)
+        return ([task], None) if task is not None else ([], "Task not found")
+    for value in number_values:
+        try:
+            task = task_by_number(state, channel, int(value))
+        except ValueError:
+            return [], "Task not found"
+        if task is None:
+            return [], "Task not found"
+        number = int(task["number"])
+        if number not in seen:
+            tasks.append(task)
+            seen.add(number)
+    for msg_id in message_ids:
+        task = task_by_message_id(state, channel, msg_id)
+        if task is None:
+            return [], "Task not found"
+        number = int(task["number"])
+        if number not in seen:
+            tasks.append(task)
+            seen.add(number)
+    if not tasks:
+        return [], "Task not found"
+    return tasks, None
+
+
 def command_task_claim(argv: list[str]) -> int:
     channel = arg_value(argv, "--channel")
     if channel is None:
@@ -1931,21 +1965,24 @@ def command_task_claim(argv: list[str]) -> int:
     def action(state: dict[str, Any]) -> int:
         if not channel_has_task_surface(state, channel):
             return write_stderr("Error: Agent or channel not found\nCode: CLAIM_FAILED\n")
-        task = resolve_task_arg(state, channel, argv)
-        if task is None:
-            return write_stderr("Error: Task not found\nCode: NOT_FOUND\n")
+        tasks, error = resolve_task_args(state, channel, argv)
+        if error is not None:
+            return write_stderr(f"Error: {error}\nCode: NOT_FOUND\n")
         if freshness_blockers(state, channel):
             return render_task_freshness_hold(state, channel)
-        if task.get("assignee") and task["assignee"] != "candidate":
-            return write_stderr(
-                f"Error: task #{task['number']} is already claimed by @{task['assignee']}\n"
-                "Code: CLAIM_CONFLICT\n"
-            )
-        task["assignee"] = "candidate"
-        if task["status"] == "todo":
-            task["status"] = "in_progress"
-        task["updated_at"] = current_timestamp()
-        return write_stdout(f"Task #{task['number']} claimed by @candidate.\n")
+        for task in tasks:
+            if task.get("assignee") and task["assignee"] != "candidate":
+                return write_stderr(
+                    f"Error: task #{task['number']} is already claimed by @{task['assignee']}\n"
+                    "Code: CLAIM_CONFLICT\n"
+                )
+        for task in tasks:
+            task["assignee"] = "candidate"
+            if task["status"] == "todo":
+                task["status"] = "in_progress"
+            task["updated_at"] = current_timestamp()
+        lines = [f"Task #{task['number']} claimed by @candidate." for task in tasks]
+        return write_stdout("\n".join(lines) + "\n")
 
     return with_mutable_state(action)
 
@@ -1958,21 +1995,24 @@ def command_task_unclaim(argv: list[str]) -> int:
     def action(state: dict[str, Any]) -> int:
         if not channel_has_task_surface(state, channel):
             return write_stderr("Error: Agent or channel not found\nCode: UNCLAIM_FAILED\n")
-        task = resolve_task_arg(state, channel, argv)
-        if task is None:
-            return write_stderr("Error: Task not found\nCode: NOT_FOUND\n")
+        tasks, error = resolve_task_args(state, channel, argv)
+        if error is not None:
+            return write_stderr(f"Error: {error}\nCode: NOT_FOUND\n")
         if freshness_blockers(state, channel):
             return render_task_freshness_hold(state, channel)
-        if task["status"] == "done":
-            return write_stderr("Error: done tasks cannot be unclaimed\nCode: UNCLAIM_FAILED\n")
-        if task.get("assignee") != "candidate":
-            return write_stderr(
-                f"Error: task #{task['number']} is not claimed by @candidate\n"
-                "Code: UNCLAIM_FAILED\n"
-            )
-        task["assignee"] = None
-        task["updated_at"] = current_timestamp()
-        return write_stdout(f"Task #{task['number']} unclaimed by @candidate.\n")
+        for task in tasks:
+            if task["status"] == "done":
+                return write_stderr("Error: done tasks cannot be unclaimed\nCode: UNCLAIM_FAILED\n")
+            if task.get("assignee") != "candidate":
+                return write_stderr(
+                    f"Error: task #{task['number']} is not claimed by @candidate\n"
+                    "Code: UNCLAIM_FAILED\n"
+                )
+        for task in tasks:
+            task["assignee"] = None
+            task["updated_at"] = current_timestamp()
+        lines = [f"Task #{task['number']} unclaimed by @candidate." for task in tasks]
+        return write_stdout("\n".join(lines) + "\n")
 
     return with_mutable_state(action)
 
