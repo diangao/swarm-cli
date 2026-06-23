@@ -21,6 +21,9 @@ Current implemented surface:
 - `swarm reminder update --id ...`
 - `swarm reminder cancel --id ...`
 - `swarm reminder log --id ...`
+- `swarm server info`
+- `swarm channel members ...`
+- `swarm profile show`
 - `--content` rejection
 - local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
@@ -52,4 +55,5 @@ thread/target isolation, drains real inbox state, and exercises the
 freshness-hold draft cursor, DM persistence, target-generic freshness, and
 wall-clock sent timestamps. It also checks SQLite-backed task lifecycle
 create/list/claim/update behavior, reminder schedule/list/snooze/update/cancel/log
-behavior, and concurrent write serialization.
+behavior, local server/channel/profile catalog reads, and concurrent write
+serialization.

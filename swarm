@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 
@@ -116,6 +116,62 @@ def reminder_event_item(
         "event": event,
         "detail": detail,
     }
+
+
+def channel_item(name: str, private: bool, joined: bool, description: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "private": private,
+        "joined": joined,
+        "description": description,
+    }
+
+
+def channel_member_item(
+    channel: str,
+    name: str,
+    kind: str,
+    role: str | None,
+    status: str | None,
+) -> dict[str, Any]:
+    return {
+        "channel": channel,
+        "name": name,
+        "kind": kind,
+        "role": role,
+        "status": status,
+    }
+
+
+def profile_item(name: str, display_name: str, kind: str, description: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "display_name": display_name,
+        "kind": kind,
+        "description": description,
+    }
+
+
+SEED_CHANNELS = [
+    channel_item("#general", False, True, "General local workspace channel"),
+    channel_item("#private-fixture", True, True, "Private fixture channel visible to authorized members"),
+]
+
+
+SEED_CHANNEL_MEMBERS = [
+    channel_member_item("#general", "candidate", "agent", None, "active"),
+    channel_member_item("#general", "builder", "agent", None, "active"),
+    channel_member_item("#general", "alice", "human", "owner", None),
+    channel_member_item("#private-fixture", "builder", "agent", None, "active"),
+    channel_member_item("#private-fixture", "alice", "human", "owner", None),
+]
+
+
+SEED_PROFILES = [
+    profile_item("candidate", "Candidate Agent", "agent", "Local self-contained Swarm CLI agent"),
+    profile_item("builder", "Builder", "agent", "Fixture agent profile"),
+    profile_item("alice", "Alice", "human", "Fixture human profile"),
+]
 
 
 SEED_STATE: dict[str, Any] = {
@@ -226,6 +282,9 @@ SEED_STATE: dict[str, Any] = {
     ],
     "reminders": [],
     "reminder_events": [],
+    "channels": SEED_CHANNELS,
+    "channel_members": SEED_CHANNEL_MEMBERS,
+    "profiles": SEED_PROFILES,
 }
 
 
@@ -324,6 +383,28 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_reminder_events_id_ordinal
             ON reminder_events(reminder_id, ordinal);
+        CREATE TABLE IF NOT EXISTS channels (
+            name TEXT PRIMARY KEY,
+            private INTEGER NOT NULL,
+            joined INTEGER NOT NULL,
+            description TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS channel_members (
+            channel TEXT NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('agent', 'human')),
+            role TEXT,
+            status TEXT,
+            PRIMARY KEY (channel, name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_channel_members_channel_kind
+            ON channel_members(channel, kind, name);
+        CREATE TABLE IF NOT EXISTS profiles (
+            name TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('agent', 'human')),
+            description TEXT NOT NULL
+        );
         """
     )
 
@@ -336,6 +417,9 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM tasks")
     conn.execute("DELETE FROM reminder_events")
     conn.execute("DELETE FROM reminders")
+    conn.execute("DELETE FROM channel_members")
+    conn.execute("DELETE FROM channels")
+    conn.execute("DELETE FROM profiles")
     conn.execute("DELETE FROM meta")
     conn.executemany(
         "INSERT INTO meta(key, value) VALUES (?, ?)",
@@ -450,6 +534,82 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             for event in state.get("reminder_events", [])
         ],
     )
+    conn.executemany(
+        """
+        INSERT INTO channels(name, private, joined, description)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (
+                channel["name"],
+                1 if channel.get("private") else 0,
+                1 if channel.get("joined") else 0,
+                channel.get("description", ""),
+            )
+            for channel in state.get("channels", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO channel_members(channel, name, kind, role, status)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                member["channel"],
+                member["name"],
+                member["kind"],
+                member.get("role"),
+                member.get("status"),
+            )
+            for member in state.get("channel_members", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO profiles(name, display_name, kind, description)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (
+                profile["name"],
+                profile["display_name"],
+                profile["kind"],
+                profile.get("description", ""),
+            )
+            for profile in state.get("profiles", [])
+        ],
+    )
+
+
+def ensure_seed_catalog(conn: sqlite3.Connection) -> None:
+    channel_count = conn.execute("SELECT COUNT(*) AS count FROM channels").fetchone()["count"]
+    if channel_count == 0:
+        conn.executemany(
+            """
+            INSERT INTO channels(name, private, joined, description)
+            VALUES (?, ?, ?, ?)
+            """,
+            [(row["name"], int(row["private"]), int(row["joined"]), row["description"]) for row in SEED_CHANNELS],
+        )
+    member_count = conn.execute("SELECT COUNT(*) AS count FROM channel_members").fetchone()["count"]
+    if member_count == 0:
+        conn.executemany(
+            """
+            INSERT INTO channel_members(channel, name, kind, role, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [(row["channel"], row["name"], row["kind"], row["role"], row["status"]) for row in SEED_CHANNEL_MEMBERS],
+        )
+    profile_count = conn.execute("SELECT COUNT(*) AS count FROM profiles").fetchone()["count"]
+    if profile_count == 0:
+        conn.executemany(
+            """
+            INSERT INTO profiles(name, display_name, kind, description)
+            VALUES (?, ?, ?, ?)
+            """,
+            [(row["name"], row["display_name"], row["kind"], row["description"]) for row in SEED_PROFILES],
+        )
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:
@@ -466,6 +626,7 @@ def initialize_database(conn: sqlite3.Connection) -> None:
                 """,
                 (str(SCHEMA_VERSION),),
             )
+        ensure_seed_catalog(conn)
 
 
 def meta_int(conn: sqlite3.Connection, key: str, default: int) -> int:
@@ -561,6 +722,35 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    channels = [
+        channel_item(
+            row["name"],
+            bool(row["private"]),
+            bool(row["joined"]),
+            row["description"],
+        )
+        for row in conn.execute(
+            "SELECT name, private, joined, description FROM channels ORDER BY name"
+        ).fetchall()
+    ]
+    channel_members = [
+        channel_member_item(
+            row["channel"],
+            row["name"],
+            row["kind"],
+            row["role"],
+            row["status"],
+        )
+        for row in conn.execute(
+            "SELECT channel, name, kind, role, status FROM channel_members ORDER BY channel, kind, name"
+        ).fetchall()
+    ]
+    profiles = [
+        profile_item(row["name"], row["display_name"], row["kind"], row["description"])
+        for row in conn.execute(
+            "SELECT name, display_name, kind, description FROM profiles ORDER BY kind, name"
+        ).fetchall()
+    ]
     return {
         "schema_version": SCHEMA_VERSION,
         "next_seq": meta_int(conn, "next_seq", 1),
@@ -574,6 +764,9 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "tasks": tasks,
         "reminders": reminders,
         "reminder_events": reminder_events,
+        "channels": channels,
+        "channel_members": channel_members,
+        "profiles": profiles,
     }
 
 
@@ -652,6 +845,68 @@ def format_reminder_row(record: dict[str, Any]) -> str:
         f"{record['id']} [{record['status']}] {record['title']}{target} "
         f"next={record['next_fire_at']}{recurrence}"
     )
+
+
+def format_channel_row(record: dict[str, Any]) -> str:
+    visibility = "private" if record.get("private") else "public"
+    joined = "joined" if record.get("joined") else "not joined"
+    description = f" - {record['description']}" if record.get("description") else ""
+    return f"- {record['name']} ({visibility}, {joined}){description}"
+
+
+def member_display(record: dict[str, Any]) -> str:
+    parts = [f"@{record['name']}"]
+    if record.get("role"):
+        parts.append(f"({record['role']})")
+    if record.get("status"):
+        parts.append(f"({record['status']})")
+    return " ".join(parts)
+
+
+def channel_for_target(target: str) -> str:
+    if target.startswith("dm:@"):
+        return target
+    if ":" in target:
+        return target.rsplit(":", 1)[0]
+    return target
+
+
+def ensure_channel_catalog(state: dict[str, Any], target: str) -> None:
+    if not target.startswith("#") or ":" in target:
+        return
+    if any(channel["name"] == target for channel in state.get("channels", [])):
+        return
+    state.setdefault("channels", []).append(channel_item(target, False, True, "Local channel"))
+    state.setdefault("channel_members", []).append(
+        channel_member_item(target, "candidate", "agent", None, "active")
+    )
+
+
+def members_for_target(state: dict[str, Any], target: str) -> list[dict[str, Any]]:
+    if target.startswith("dm:@"):
+        peer = target.removeprefix("dm:@")
+        return [
+            channel_member_item(target, "candidate", "agent", None, "active"),
+            channel_member_item(target, peer, "human", None, None),
+        ]
+    channel = channel_for_target(target)
+    return [member for member in state.get("channel_members", []) if member["channel"] == channel]
+
+
+def channel_record(state: dict[str, Any], target: str) -> dict[str, Any] | None:
+    channel = channel_for_target(target)
+    for record in state.get("channels", []):
+        if record["name"] == channel:
+            return record
+    return None
+
+
+def profile_by_name(state: dict[str, Any], name: str) -> dict[str, Any] | None:
+    normalized = name.removeprefix("@")
+    for record in state.get("profiles", []):
+        if record["name"] == normalized:
+            return record
+    return None
 
 
 def tasks_for_channel(state: dict[str, Any], channel: str) -> list[dict[str, Any]]:
@@ -784,6 +1039,7 @@ def schedule_time_from_args(argv: list[str], absolute_flag: str = "--at", relati
 
 
 def append_message(state: dict[str, Any], target: str, body: str) -> dict[str, Any]:
+    ensure_channel_catalog(state, target)
     seq = int(state["next_seq"])
     state["next_seq"] = seq + 1
     record = message(
@@ -1047,6 +1303,7 @@ def command_task_create(argv: list[str]) -> int:
         return write_stderr("Error: task title is required\nCode: INVALID_ARG\n")
 
     def action(state: dict[str, Any]) -> int:
+        ensure_channel_catalog(state, channel)
         task = append_task(state, channel, title)
         return write_stdout(
             f"Task #{task['number']} created in {channel}. "
@@ -1369,6 +1626,112 @@ def command_reminder(argv: list[str]) -> int:
     return write_stderr(f"Error: unknown reminder subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
+def command_server_info() -> int:
+    def action(state: dict[str, Any]) -> int:
+        channels = sorted(state.get("channels", []), key=lambda row: row["name"])
+        agents = [profile for profile in state.get("profiles", []) if profile["kind"] == "agent"]
+        humans = [profile for profile in state.get("profiles", []) if profile["kind"] == "human"]
+        channel_rows = "\n".join(format_channel_row(channel) for channel in channels) or "No channels."
+        agent_rows = "\n".join(f"- @{profile['name']} ({profile['display_name']})" for profile in agents) or "No agents."
+        human_rows = "\n".join(f"- @{profile['name']} ({profile['display_name']})" for profile in humans) or "No humans."
+        return write_stdout(
+            "## Server Info\n\n"
+            "### Channels\n"
+            f"{channel_rows}\n\n"
+            "### Agents\n"
+            f"{agent_rows}\n\n"
+            "### Humans\n"
+            f"{human_rows}\n"
+        )
+
+    return with_read_state(action)
+
+
+def command_server(argv: list[str]) -> int:
+    if argv == ["info"]:
+        return command_server_info()
+    return write_stderr("Error: unknown server subcommand\nCode: INVALID_ARG\n")
+
+
+def command_channel_members(argv: list[str]) -> int:
+    target = arg_value(argv, "--target")
+    if target is None and argv:
+        target = argv[0]
+    if target is None:
+        return write_stderr("Error: channel target is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        channel = channel_record(state, target)
+        if channel is None and not target.startswith("dm:@"):
+            return write_stderr("Error: Channel not found\nCode: NOT_FOUND\n")
+        members = members_for_target(state, target)
+        agents = [member for member in members if member["kind"] == "agent"]
+        humans = [member for member in members if member["kind"] == "human"]
+        agent_rows = "\n".join(f"  - {member_display(member)}" for member in agents) or "  - none"
+        human_rows = "\n".join(f"  - {member_display(member)}" for member in humans) or "  - none"
+        if target.startswith("dm:@"):
+            channel_label = target
+        else:
+            channel_label = channel_for_target(target)
+            if channel and channel.get("private"):
+                channel_label += " (private)"
+        return write_stdout(
+            "## Channel Members\n\n"
+            f"Channel: {channel_label}\n"
+            "Members means join/post authority for this surface.\n\n"
+            "### Agents\n"
+            f"{agent_rows}\n\n"
+            "### Humans\n"
+            "Role labels show server-level owner/admin authority; no role label means ordinary member.\n"
+            f"{human_rows}\n"
+        )
+
+    return with_read_state(action)
+
+
+def command_channel(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing channel subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "members":
+        return command_channel_members(rest)
+    return write_stderr(f"Error: unknown channel subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
+def command_profile_show(argv: list[str]) -> int:
+    requested = argv[0] if argv and not argv[0].startswith("--") else "@candidate"
+    if requested not in {"candidate", "@candidate"}:
+        return write_stderr(
+            "Error: Invalid authentication: machine API key required\n"
+            "Code: PROFILE_SHOW_FAILED\n"
+        )
+
+    def action(state: dict[str, Any]) -> int:
+        profile = profile_by_name(state, "candidate")
+        if profile is None:
+            return write_stderr("Error: Profile not found\nCode: NOT_FOUND\n")
+        return write_stdout(
+            "## Profile\n\n"
+            f"@{profile['name']}\n"
+            f"display_name: {profile['display_name']}\n"
+            f"type: {profile['kind']}\n"
+            f"description: {profile['description']}\n"
+        )
+
+    return with_read_state(action)
+
+
+def command_profile(argv: list[str]) -> int:
+    if not argv:
+        return command_profile_show([])
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "show":
+        return command_profile_show(rest)
+    return write_stderr(f"Error: unknown profile subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def command_message(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing message subcommand\nCode: INVALID_ARG\n")
@@ -1393,6 +1756,12 @@ def main(argv: list[str]) -> int:
         return command_task(argv[1:])
     if command == "reminder":
         return command_reminder(argv[1:])
+    if command == "server":
+        return command_server(argv[1:])
+    if command == "channel":
+        return command_channel(argv[1:])
+    if command == "profile":
+        return command_profile(argv[1:])
     return write_stderr(f"Error: unknown command: {command}\nCode: INVALID_ARG\n")
 
 

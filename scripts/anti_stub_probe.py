@@ -364,6 +364,37 @@ def probe_reminder_lifecycle(cli: Path, state_dir: Path) -> None:
     require("canceled reminders cannot be snoozed" in rejected, "canceled snooze was not rejected")
 
 
+def probe_navigation_surfaces(cli: Path, state_dir: Path) -> None:
+    server_info = run(cli, state_dir, "server", "info").stdout
+    require("### Channels" in server_info, "server info missing Channels section")
+    require("### Agents" in server_info, "server info missing Agents section")
+    require("### Humans" in server_info, "server info missing Humans section")
+    require("#general" in server_info, "server info missing seeded channel")
+
+    members = run(cli, state_dir, "channel", "members", "#general").stdout
+    require("## Channel Members" in members, "channel members missing heading")
+    require("@candidate" in members, "channel members missing local agent")
+    require("@alice" in members, "channel members missing seeded human")
+
+    private_members = run(cli, state_dir, "channel", "members", "#private-fixture").stdout
+    require("Channel: #private-fixture (private)" in private_members, "private channel visibility label missing")
+    require("Members means join/post authority" in private_members, "private channel boundary text missing")
+
+    profile = run(cli, state_dir, "profile", "show").stdout
+    require("## Profile" in profile, "profile show missing heading")
+    require("@candidate" in profile, "profile show missing local profile name")
+    rejected = run(cli, state_dir, "profile", "show", "@other", expected=1).stderr
+    require("machine API key required" in rejected, "profile show other did not fail closed")
+
+    dynamic_channel = f"#catalog-{uuid.uuid4().hex[:8]}"
+    dynamic_body = f"catalog body {uuid.uuid4()}"
+    run(cli, state_dir, "message", "send", "--target", dynamic_channel, stdin=dynamic_body)
+    updated_server_info = run(cli, state_dir, "server", "info").stdout
+    require(dynamic_channel in updated_server_info, "server info did not include dynamic local channel")
+    dynamic_members = run(cli, state_dir, "channel", "members", dynamic_channel).stdout
+    require("@candidate" in dynamic_members, "dynamic channel did not include candidate member")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -377,8 +408,9 @@ def main() -> int:
         probe_cross_process_locking(cli, state_dir)
         probe_task_lifecycle(cli, state_dir)
         probe_reminder_lifecycle(cli, state_dir)
+        probe_navigation_surfaces(cli, state_dir)
 
-    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, and reminders")
+    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, and navigation")
     return 0
 
 
