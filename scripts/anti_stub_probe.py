@@ -3,20 +3,21 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLI = ROOT / "swarm"
-STATE_FILE = "state.json"
+STATE_FILE = "state.sqlite3"
 
 
 class ProbeFailure(AssertionError):
@@ -53,14 +54,59 @@ def run(cli: Path, state_dir: Path, *args: str, stdin: str | None = None, expect
     return proc
 
 
-def read_state(state_dir: Path) -> dict:
+def connect_state(state_dir: Path) -> sqlite3.Connection:
     path = state_dir / STATE_FILE
     require(path.exists(), f"state file not created: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    conn = sqlite3.connect(path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def write_state(state_dir: Path, state: dict) -> None:
-    (state_dir / STATE_FILE).write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+def require_sqlite_store(state_dir: Path) -> None:
+    require((state_dir / STATE_FILE).exists(), "SQLite state file was not created")
+    require(not (state_dir / "state.json").exists(), "legacy JSON state file should not be used")
+
+
+def insert_local_inbox(state_dir: Path, body: str) -> None:
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO inbox(kind, target, message_id, time, type, author, body)
+                VALUES ('local', ?, ?, ?, ?, ?, ?)
+                """,
+                ("#probe-inbox", str(uuid.uuid4()), "2026-03-15T02:00:00", "human", "verifier", body),
+            )
+    finally:
+        conn.close()
+
+
+def insert_freshness_blocker(state_dir: Path, target: str, body: str) -> None:
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'next_seq'").fetchone()
+            require(row is not None, "state meta missing next_seq")
+            seq = int(row["value"])
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'next_seq'", (str(seq + 1),))
+            conn.execute(
+                """
+                INSERT INTO messages(seq, target, id, time, type, author, body)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (seq, target, str(uuid.uuid4()), "2026-03-15 03:00:00", "human", "verifier", body),
+            )
+            conn.execute(
+                """
+                INSERT INTO freshness(target, cursor, draft)
+                VALUES (?, ?, NULL)
+                ON CONFLICT(target) DO UPDATE SET cursor = excluded.cursor, draft = NULL
+                """,
+                (target, seq - 1),
+            )
+    finally:
+        conn.close()
 
 
 def parse_message_id(output: str) -> str:
@@ -80,6 +126,7 @@ def timestamp_for_body(history: str, body: str) -> datetime:
 
 def probe_inbox(cli: Path, state_dir: Path) -> None:
     first = run(cli, state_dir, "message", "check").stdout
+    require_sqlite_store(state_dir)
     require("please check the fixture" in first, "first check did not display seeded pending inbox")
     require("No more new messages." in first, "pending check missing drain footer")
 
@@ -87,18 +134,7 @@ def probe_inbox(cli: Path, state_dir: Path) -> None:
     require(second == "No new messages.\n", f"second check should be empty after drain, got:\n{second}")
 
     custom_body = f"anti-stub inbox {uuid.uuid4()}"
-    state = read_state(state_dir)
-    state.setdefault("local_inbox", []).append(
-        {
-            "target": "#probe-inbox",
-            "message_id": str(uuid.uuid4()),
-            "time": "2026-03-15T02:00:00",
-            "type": "human",
-            "author": "verifier",
-            "body": custom_body,
-        }
-    )
-    write_state(state_dir, state)
+    insert_local_inbox(state_dir, custom_body)
 
     custom = run(cli, state_dir, "message", "check").stdout
     require(custom_body in custom, "custom local inbox item was not emitted")
@@ -167,20 +203,7 @@ def probe_freshness_cursor(cli: Path, state_dir: Path) -> None:
 
     fresh_target = f"#fresh-{uuid.uuid4().hex[:8]}"
     fresh_body = f"any-channel fresh incoming {uuid.uuid4()}"
-    state = read_state(state_dir)
-    incoming = {
-        "seq": state["next_seq"],
-        "target": fresh_target,
-        "id": str(uuid.uuid4()),
-        "time": "2026-03-15 03:00:00",
-        "type": "human",
-        "author": "verifier",
-        "body": fresh_body,
-    }
-    state["next_seq"] += 1
-    state.setdefault("messages", []).append(incoming)
-    state.setdefault("freshness", {})[fresh_target] = {"cursor": incoming["seq"] - 1, "draft": None}
-    write_state(state_dir, state)
+    insert_freshness_blocker(state_dir, fresh_target, fresh_body)
 
     held_any_body = f"any-channel held draft {uuid.uuid4()}"
     hold_any = run(cli, state_dir, "message", "send", "--target", fresh_target, stdin=held_any_body).stdout
@@ -202,6 +225,24 @@ def probe_wall_clock_timestamps(cli: Path, state_dir: Path) -> None:
     require(before.replace(microsecond=0) <= observed <= after.replace(microsecond=0), "sent timestamp is not current wall-clock time")
 
 
+def probe_cross_process_locking(cli: Path, state_dir: Path) -> None:
+    target = f"#concurrent-{uuid.uuid4().hex[:8]}"
+    bodies = [f"concurrent body {idx} {uuid.uuid4()}" for idx in range(4)]
+
+    with ThreadPoolExecutor(max_workers=len(bodies)) as pool:
+        futures = [
+            pool.submit(run, cli, state_dir, "message", "send", "--target", target, stdin=body)
+            for body in bodies
+        ]
+        for future in as_completed(futures):
+            output = future.result().stdout
+            require(f"Message sent to {target}." in output, f"concurrent send failed:\n{output}")
+
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    for body in bodies:
+        require(body in history, f"concurrent body missing after serialized SQLite writes: {body}")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -212,8 +253,9 @@ def main() -> int:
         probe_send_read_and_routes(cli, state_dir)
         probe_freshness_cursor(cli, state_dir)
         probe_wall_clock_timestamps(cli, state_dir)
+        probe_cross_process_locking(cli, state_dir)
 
-    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, and timestamps")
+    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, and SQLite locking")
     return 0
 
 
