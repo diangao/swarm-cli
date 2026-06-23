@@ -457,6 +457,59 @@ def probe_task_lifecycle(cli: Path, state_dir: Path) -> None:
     ).stderr
     require("done tasks cannot be unclaimed" in done_unclaim, "unclaim of done task did not fail closed")
 
+    batch_title_1 = f"batch task one {uuid.uuid4()}"
+    batch_title_2 = f"batch task two {uuid.uuid4()}"
+    batch_one = run(cli, state_dir, "task", "create", "--channel", target, "--title", batch_title_1).stdout
+    batch_two = run(cli, state_dir, "task", "create", "--channel", target, "--title", batch_title_2).stdout
+    batch_number_1 = parse_task_number(batch_one)
+    batch_number_2 = parse_task_number(batch_two)
+    batch_claimed = run(
+        cli,
+        state_dir,
+        "task",
+        "claim",
+        "--channel",
+        target,
+        "--number",
+        str(batch_number_1),
+        "--number",
+        str(batch_number_2),
+    ).stdout
+    require(f"Task #{batch_number_1} claimed by @candidate." in batch_claimed, "batch claim missing first task")
+    require(f"Task #{batch_number_2} claimed by @candidate." in batch_claimed, "batch claim missing second task")
+    batch_board = run(cli, state_dir, "task", "list", "--channel", target).stdout
+    require(
+        f"#{batch_number_1} [in_progress] {batch_title_1} → @candidate" in batch_board,
+        "batch claim did not persist first assignee",
+    )
+    require(
+        f"#{batch_number_2} [in_progress] {batch_title_2} → @candidate" in batch_board,
+        "batch claim did not persist second assignee",
+    )
+    batch_unclaimed = run(
+        cli,
+        state_dir,
+        "task",
+        "unclaim",
+        "--channel",
+        target,
+        "--number",
+        str(batch_number_1),
+        "--number",
+        str(batch_number_2),
+    ).stdout
+    require(f"Task #{batch_number_1} unclaimed by @candidate." in batch_unclaimed, "batch unclaim missing first task")
+    require(f"Task #{batch_number_2} unclaimed by @candidate." in batch_unclaimed, "batch unclaim missing second task")
+    batch_unclaimed_board = run(cli, state_dir, "task", "list", "--channel", target).stdout
+    require(
+        f"#{batch_number_1} [in_progress] {batch_title_1} (by @candidate)" in batch_unclaimed_board,
+        "batch unclaim did not clear first assignee",
+    )
+    require(
+        f"#{batch_number_2} [in_progress] {batch_title_2} (by @candidate)" in batch_unclaimed_board,
+        "batch unclaim did not clear second assignee",
+    )
+
 
 def probe_reminder_lifecycle(cli: Path, state_dir: Path) -> None:
     empty = run(cli, state_dir, "reminder", "list").stdout

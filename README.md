@@ -15,8 +15,8 @@ Current implemented surface:
 - freshness-hold draft output across message targets with newer local context
 - `swarm task create --channel ... --title ...`
 - `swarm task list --channel ...`
-- `swarm task claim --channel ... --number ...`
-- `swarm task unclaim --channel ... --number ...`
+- `swarm task claim --channel ... --number ... [--number ...]`
+- `swarm task unclaim --channel ... --number ... [--number ...]`
 - `swarm task update --channel ... --number ... --status ...`
 - `swarm reminder schedule --title ... --at ...`
 - `swarm reminder list`
@@ -70,7 +70,8 @@ history pagination, message search/resolve, thread/target isolation, drains
 real inbox state, and exercises the freshness-hold draft cursor, DM
 persistence, target-generic freshness, and wall-clock sent timestamps. It also
 checks SQLite-backed task lifecycle create/list/claim/unclaim/update behavior,
-reminder schedule/list/snooze/update/cancel/log behavior, local
-server/channel/profile catalog reads, profile update persistence,
-channel join/leave, thread unfollow state, local attachment upload/view byte
-persistence, message attachment rendering, and concurrent write serialization.
+including repeatable task claim/unclaim flags, reminder
+schedule/list/snooze/update/cancel/log behavior, local server/channel/profile
+catalog reads, profile update persistence, channel join/leave, thread unfollow
+state, local attachment upload/view byte persistence, message attachment
+rendering, and concurrent write serialization.
