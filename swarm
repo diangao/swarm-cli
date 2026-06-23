@@ -2053,9 +2053,9 @@ def command_task_list(argv: list[str]) -> int:
 
 
 def task_title_from_args(argv: list[str]) -> str | None:
-    title = arg_value(argv, "--title")
-    if title is not None:
-        return title
+    titles = arg_values(argv, "--title")
+    if titles:
+        return titles[0]
     positional: list[str] = []
     skip_next = False
     for value in argv:
@@ -2073,25 +2073,37 @@ def task_title_from_args(argv: list[str]) -> str | None:
     return None
 
 
+def task_titles_from_args(argv: list[str]) -> list[str]:
+    titles = arg_values(argv, "--title")
+    if titles:
+        return titles
+    title = task_title_from_args(argv)
+    return [title] if title is not None else []
+
+
 def command_task_create(argv: list[str]) -> int:
     channel = arg_value(argv, "--channel")
     if channel is None:
         return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
     if ":" in channel or not channel.startswith("#"):
         return write_stderr("Error: tasks must be created in a top-level channel\nCode: INVALID_TARGET\n")
-    title = task_title_from_args(argv)
-    if title is None or not title.strip():
+    titles = task_titles_from_args(argv)
+    if not titles:
+        return write_stderr("Error: task title is required\nCode: INVALID_ARG\n")
+    if any(not title.strip() for title in titles):
         return write_stderr("Error: task title is required\nCode: INVALID_ARG\n")
 
     def action(state: dict[str, Any]) -> int:
         ensure_channel_catalog(state, channel)
         if not target_joined_for_write(state, channel):
             return write_stderr(f"Error: Not joined to target: {channel}\nCode: NOT_JOINED\n")
-        task = append_task(state, channel, title)
-        return write_stdout(
+        tasks = [append_task(state, channel, title.strip()) for title in titles]
+        output = "".join(
             f"Task #{task['number']} created in {channel}. "
             f"Message ID: {task['message_id']}\n"
+            for task in tasks
         )
+        return write_stdout(output)
 
     return with_mutable_state(action)
 

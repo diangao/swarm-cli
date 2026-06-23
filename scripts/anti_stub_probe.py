@@ -163,6 +163,12 @@ def parse_task_number(output: str) -> int:
     return int(match.group(1))
 
 
+def parse_task_numbers(output: str) -> list[int]:
+    numbers = [int(value) for value in re.findall(r"Task #(\d+)", output)]
+    require(numbers, f"missing task numbers in output:\n{output}")
+    return numbers
+
+
 def parse_reminder_id(output: str) -> str:
     match = re.search(r"Reminder (rem_[0-9a-f]{8})", output)
     require(match is not None, f"missing reminder id in output:\n{output}")
@@ -520,10 +526,40 @@ def probe_task_lifecycle(cli: Path, state_dir: Path) -> None:
 
     batch_title_1 = f"batch task one {uuid.uuid4()}"
     batch_title_2 = f"batch task two {uuid.uuid4()}"
-    batch_one = run(cli, state_dir, "task", "create", "--channel", target, "--title", batch_title_1).stdout
-    batch_two = run(cli, state_dir, "task", "create", "--channel", target, "--title", batch_title_2).stdout
-    batch_number_1 = parse_task_number(batch_one)
-    batch_number_2 = parse_task_number(batch_two)
+    batch_created = run(
+        cli,
+        state_dir,
+        "task",
+        "create",
+        "--channel",
+        target,
+        "--title",
+        batch_title_1,
+        "--title",
+        batch_title_2,
+    ).stdout
+    batch_number_1, batch_number_2 = parse_task_numbers(batch_created)
+    require(f"Task #{batch_number_1} created in {target}." in batch_created, "batch create missing first task")
+    require(f"Task #{batch_number_2} created in {target}." in batch_created, "batch create missing second task")
+    batch_created_board = run(cli, state_dir, "task", "list", "--channel", target).stdout
+    require(f"#{batch_number_1} [todo] {batch_title_1} (by @candidate)" in batch_created_board, "batch create did not persist first task")
+    require(f"#{batch_number_2} [todo] {batch_title_2} (by @candidate)" in batch_created_board, "batch create did not persist second task")
+    rejected_batch_create = run(
+        cli,
+        state_dir,
+        "task",
+        "create",
+        "--channel",
+        target,
+        "--title",
+        "",
+        "--title",
+        f"should not create {uuid.uuid4()}",
+        expected=1,
+    ).stderr
+    require("task title is required" in rejected_batch_create, "batch create with empty title did not fail closed")
+    after_rejected_batch = run(cli, state_dir, "task", "list", "--channel", target).stdout
+    require("should not create" not in after_rejected_batch, "invalid batch create partially created a task")
     batch_claimed = run(
         cli,
         state_dir,
