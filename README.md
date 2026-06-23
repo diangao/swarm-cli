@@ -14,7 +14,7 @@ Current implemented surface:
 - `swarm message react --message-id ... --emoji ... [--remove]`
 - `swarm message send --target ... [--attachment-id ...]` using stdin for channels, threads, and DMs
 - freshness-hold draft output across message targets with newer local context
-- `swarm task create --channel ... --title ...`
+- `swarm task create --channel ... --title ... [--title ...]`
 - `swarm task list --channel ...`
 - `swarm task claim --channel ... --number ... [--number ...]`
 - `swarm task unclaim --channel ... --number ... [--number ...]`
@@ -72,7 +72,7 @@ real inbox state, and exercises the freshness-hold draft cursor, DM
 persistence, target-generic freshness, and wall-clock sent timestamps. It also
 checks SQLite-backed message reaction add/remove rendering, task lifecycle
 create/list/claim/unclaim/update behavior,
-including repeatable task claim/unclaim flags, reminder
+including repeatable task create/claim/unclaim flags, reminder
 schedule/list/snooze/update/cancel/log behavior, local server/channel/profile
 catalog reads, profile update and avatar persistence, channel join/leave,
 thread unfollow state, local attachment upload/view byte persistence, message
