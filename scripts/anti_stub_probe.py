@@ -115,6 +115,12 @@ def parse_message_id(output: str) -> str:
     return match.group(1)
 
 
+def parse_task_number(output: str) -> int:
+    match = re.search(r"Task #(\d+)", output)
+    require(match is not None, f"missing task number in output:\n{output}")
+    return int(match.group(1))
+
+
 def timestamp_for_body(history: str, body: str) -> datetime:
     for line in history.splitlines():
         if body in line:
@@ -243,6 +249,48 @@ def probe_cross_process_locking(cli: Path, state_dir: Path) -> None:
         require(body in history, f"concurrent body missing after serialized SQLite writes: {body}")
 
 
+def probe_task_lifecycle(cli: Path, state_dir: Path) -> None:
+    seed_board = run(cli, state_dir, "task", "list", "--channel", "#general").stdout
+    require("## Task Board for #general (2 tasks)" in seed_board, "seed task board did not render")
+    require("#1 [in_progress] fixture task title" in seed_board, "seed task #1 missing")
+
+    target = f"#tasks-{uuid.uuid4().hex[:8]}"
+    title = f"task lifecycle {uuid.uuid4()}"
+    created = run(cli, state_dir, "task", "create", "--channel", target, "--title", title).stdout
+    number = parse_task_number(created)
+    require(f"Task #{number} created in {target}." in created, "task create did not acknowledge target")
+
+    board = run(cli, state_dir, "task", "list", "--channel", target).stdout
+    require(f"#{number} [todo] {title} (by @candidate)" in board, "created task did not appear as todo")
+
+    claimed = run(cli, state_dir, "task", "claim", "--channel", target, "--number", str(number)).stdout
+    require(f"Task #{number} claimed by @candidate." in claimed, "task claim did not acknowledge candidate assignee")
+
+    claimed_board = run(cli, state_dir, "task", "list", "--channel", target).stdout
+    require(f"#{number} [in_progress] {title} → @candidate" in claimed_board, "claimed task did not become in_progress")
+
+    reviewed = run(cli, state_dir, "task", "update", "--channel", target, "--number", str(number), "--status", "in_review").stdout
+    require(f"Task #{number} updated: in_progress -> in_review." in reviewed, "task update to in_review failed")
+
+    done = run(cli, state_dir, "task", "update", "--channel", target, "--number", str(number), "--status", "done").stdout
+    require(f"Task #{number} updated: in_review -> done." in done, "task update to done failed")
+
+    rejected = run(
+        cli,
+        state_dir,
+        "task",
+        "update",
+        "--channel",
+        target,
+        "--number",
+        str(number),
+        "--status",
+        "done",
+        expected=1,
+    ).stderr
+    require("cannot transition from done to done" in rejected, "idempotent done update was not rejected")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -254,8 +302,9 @@ def main() -> int:
         probe_freshness_cursor(cli, state_dir)
         probe_wall_clock_timestamps(cli, state_dir)
         probe_cross_process_locking(cli, state_dir)
+        probe_task_lifecycle(cli, state_dir)
 
-    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, and SQLite locking")
+    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, SQLite locking, and tasks")
     return 0
 
 

@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 STATE_FILE = "state.sqlite3"
+TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 
 
 def message(
@@ -55,10 +56,35 @@ def inbox_item(
     }
 
 
+def task_item(
+    number: int,
+    channel: str,
+    title: str,
+    status: str,
+    creator: str,
+    assignee: str | None,
+    message_id: str,
+    created_at: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    return {
+        "number": number,
+        "channel": channel,
+        "title": title,
+        "status": status,
+        "creator": creator,
+        "assignee": assignee,
+        "message_id": message_id,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
 SEED_STATE: dict[str, Any] = {
     "schema_version": SCHEMA_VERSION,
     "next_seq": 104,
     "next_id_counter": 0,
+    "next_task_number": 3,
     "last_read": {"#general": 100},
     "messages": [
         message(
@@ -95,7 +121,7 @@ SEED_STATE: dict[str, Any] = {
             "2026-03-15 01:01:00",
             "human",
             "alice",
-            "newer message",
+            "newer task context",
         ),
         message(
             103,
@@ -136,6 +162,30 @@ SEED_STATE: dict[str, Any] = {
             "draft": None,
         }
     },
+    "tasks": [
+        task_item(
+            1,
+            "#general",
+            "fixture task title",
+            "in_progress",
+            "alice",
+            "builder",
+            "00000000-0000-4000-8000-000000000000",
+            "2026-03-15 01:00:00",
+            "2026-03-15 01:00:00",
+        ),
+        task_item(
+            2,
+            "#general",
+            "second fixture task",
+            "in_review",
+            "alice",
+            None,
+            "11111111-1111-4111-8111-111111111111",
+            "2026-03-15 01:00:10",
+            "2026-03-15 01:00:10",
+        ),
+    ],
 }
 
 
@@ -202,6 +252,18 @@ def create_schema(conn: sqlite3.Connection) -> None:
             target TEXT PRIMARY KEY,
             seq INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS tasks (
+            number INTEGER PRIMARY KEY,
+            channel TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            creator TEXT NOT NULL,
+            assignee TEXT,
+            message_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tasks_channel_number ON tasks(channel, number);
         """
     )
 
@@ -211,6 +273,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM messages")
     conn.execute("DELETE FROM freshness")
     conn.execute("DELETE FROM last_read")
+    conn.execute("DELETE FROM tasks")
     conn.execute("DELETE FROM meta")
     conn.executemany(
         "INSERT INTO meta(key, value) VALUES (?, ?)",
@@ -218,6 +281,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             ("schema_version", str(SCHEMA_VERSION)),
             ("next_seq", str(int(state.get("next_seq", 1)))),
             ("next_id_counter", str(int(state.get("next_id_counter", 0)))),
+            ("next_task_number", str(int(state.get("next_task_number", 1)))),
         ],
     )
     conn.executemany(
@@ -270,6 +334,26 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
         "INSERT INTO last_read(target, seq) VALUES (?, ?)",
         [(target, int(seq)) for target, seq in state.get("last_read", {}).items()],
     )
+    conn.executemany(
+        """
+        INSERT INTO tasks(number, channel, title, status, creator, assignee, message_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                int(task["number"]),
+                task["channel"],
+                task["title"],
+                task["status"],
+                task["creator"],
+                task.get("assignee"),
+                task["message_id"],
+                task["created_at"],
+                task["updated_at"],
+            )
+            for task in state.get("tasks", [])
+        ],
+    )
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:
@@ -318,15 +402,37 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         row["target"]: row["seq"]
         for row in conn.execute("SELECT target, seq FROM last_read ORDER BY target").fetchall()
     }
+    tasks = [
+        task_item(
+            row["number"],
+            row["channel"],
+            row["title"],
+            row["status"],
+            row["creator"],
+            row["assignee"],
+            row["message_id"],
+            row["created_at"],
+            row["updated_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT number, channel, title, status, creator, assignee, message_id, created_at, updated_at
+            FROM tasks
+            ORDER BY number
+            """
+        ).fetchall()
+    ]
     return {
         "schema_version": SCHEMA_VERSION,
         "next_seq": meta_int(conn, "next_seq", 1),
         "next_id_counter": meta_int(conn, "next_id_counter", 0),
+        "next_task_number": meta_int(conn, "next_task_number", 1),
         "last_read": last_read,
         "messages": messages,
         "remote_inbox": inbox_rows(conn, "remote"),
         "local_inbox": inbox_rows(conn, "local"),
         "freshness": freshness,
+        "tasks": tasks,
     }
 
 
@@ -390,6 +496,46 @@ def format_inbox_row(record: dict[str, Any]) -> str:
     )
 
 
+def format_task_row(record: dict[str, Any]) -> str:
+    assignee = f" \u2192 @{record['assignee']}" if record.get("assignee") else ""
+    return (
+        f"#{record['number']} [{record['status']}] {record['title']}{assignee} "
+        f"(by @{record['creator']}) msg={short_id(str(record['message_id']))}"
+    )
+
+
+def tasks_for_channel(state: dict[str, Any], channel: str) -> list[dict[str, Any]]:
+    return sorted(
+        [record for record in state.get("tasks", []) if record["channel"] == channel],
+        key=lambda row: int(row["number"]),
+    )
+
+
+def task_by_number(state: dict[str, Any], channel: str, number: int) -> dict[str, Any] | None:
+    for record in tasks_for_channel(state, channel):
+        if int(record["number"]) == number:
+            return record
+    return None
+
+
+def task_by_message_id(state: dict[str, Any], channel: str, msg_id: str) -> dict[str, Any] | None:
+    for record in tasks_for_channel(state, channel):
+        full_id = str(record["message_id"])
+        if full_id == msg_id or short_id(full_id) == msg_id:
+            return record
+    return None
+
+
+def channel_has_task_surface(state: dict[str, Any], channel: str) -> bool:
+    if channel == "#missing-fixture":
+        return False
+    if channel in {"#general", "#general:00000000"}:
+        return True
+    if ":" in channel:
+        return False
+    return channel.startswith("#") or any(record["channel"] == channel for record in state.get("tasks", []))
+
+
 def parent_message_for_thread(state: dict[str, Any], target: str) -> dict[str, Any] | None:
     if ":" not in target:
         return None
@@ -428,6 +574,14 @@ def arg_value(argv: list[str], flag: str) -> str | None:
     return argv[idx + 1]
 
 
+def arg_values(argv: list[str], flag: str) -> list[str]:
+    values: list[str] = []
+    for idx, value in enumerate(argv):
+        if value == flag and idx + 1 < len(argv):
+            values.append(argv[idx + 1])
+    return values
+
+
 def next_message_id(state: dict[str, Any]) -> str:
     state["next_id_counter"] = int(state.get("next_id_counter", 0)) + 1
     return str(uuid.uuid4())
@@ -451,6 +605,28 @@ def append_message(state: dict[str, Any], target: str, body: str) -> dict[str, A
     )
     state["messages"].append(record)
     return record
+
+
+def append_task(state: dict[str, Any], channel: str, title: str) -> dict[str, Any]:
+    record = append_message(state, channel, title)
+    number = int(state.get("next_task_number", 1))
+    state["next_task_number"] = number + 1
+    now = current_timestamp()
+    task = task_item(
+        number,
+        channel,
+        title.strip(),
+        "todo",
+        "candidate",
+        None,
+        record["id"],
+        now,
+        now,
+    )
+    state.setdefault("tasks", []).append(task)
+    freshness = state.setdefault("freshness", {}).setdefault(channel, {"cursor": 0, "draft": None})
+    freshness["cursor"] = record["seq"]
+    return task
 
 
 def success_text(target: str, record: dict[str, Any]) -> str:
@@ -557,6 +733,21 @@ def render_freshness_hold(state: dict[str, Any], target: str, body: str) -> int:
     )
 
 
+def render_task_freshness_hold(state: dict[str, Any], channel: str) -> int:
+    blocking = freshness_blockers(state, channel)
+    visible = blocking[-1:]
+    history_rows = "\n".join(format_history_row(record) for record in visible)
+    return write_stdout(
+        f"Freshness hold: showing latest {len(visible)} of {len(blocking)} newer message.\n"
+        "Your task claim was not applied. Review the bounded context shown here, then choose one path.\n"
+        "Lineage: producerFactId=freshness_decision_fact:"
+        "0000000000000000000000000000000000000000000000000000000000000000.\n\n"
+        f"## Message History for {channel} ({len(visible)} messages)\n\n"
+        f"{history_rows}\n\n"
+        "After reviewing the newer context, rerun the task claim command if it is still correct.\n"
+    )
+
+
 def command_message_send(argv: list[str]) -> int:
     if "--content" in argv:
         return write_stderr(
@@ -594,6 +785,152 @@ def command_message_send(argv: list[str]) -> int:
     return with_mutable_state(action)
 
 
+def command_task_list(argv: list[str]) -> int:
+    channel = arg_value(argv, "--channel")
+    if channel is None:
+        return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if not channel_has_task_surface(state, channel):
+            return write_stderr("Error: Agent or channel not found\nCode: LIST_FAILED\n")
+        rows = tasks_for_channel(state, channel)
+        if not rows:
+            return write_stdout(f"## Task Board for {channel} (0 tasks)\n\nNo tasks.\n")
+        rendered = "\n".join(format_task_row(record) for record in rows)
+        return write_stdout(f"## Task Board for {channel} ({len(rows)} tasks)\n\n{rendered}\n")
+
+    return with_read_state(action)
+
+
+def task_title_from_args(argv: list[str]) -> str | None:
+    title = arg_value(argv, "--title")
+    if title is not None:
+        return title
+    positional: list[str] = []
+    skip_next = False
+    for value in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if value in {"--channel", "--title"}:
+            skip_next = True
+            continue
+        if value.startswith("--"):
+            continue
+        positional.append(value)
+    if positional:
+        return " ".join(positional)
+    return None
+
+
+def command_task_create(argv: list[str]) -> int:
+    channel = arg_value(argv, "--channel")
+    if channel is None:
+        return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
+    if ":" in channel or not channel.startswith("#"):
+        return write_stderr("Error: tasks must be created in a top-level channel\nCode: INVALID_TARGET\n")
+    title = task_title_from_args(argv)
+    if title is None or not title.strip():
+        return write_stderr("Error: task title is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        task = append_task(state, channel, title)
+        return write_stdout(
+            f"Task #{task['number']} created in {channel}. "
+            f"Message ID: {task['message_id']}\n"
+        )
+
+    return with_mutable_state(action)
+
+
+def resolve_task_arg(state: dict[str, Any], channel: str, argv: list[str]) -> dict[str, Any] | None:
+    number = arg_value(argv, "--number")
+    if number is not None:
+        try:
+            return task_by_number(state, channel, int(number))
+        except ValueError:
+            return None
+    message_ids = arg_values(argv, "--message-id")
+    if message_ids:
+        return task_by_message_id(state, channel, message_ids[0])
+    return None
+
+
+def command_task_claim(argv: list[str]) -> int:
+    channel = arg_value(argv, "--channel")
+    if channel is None:
+        return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if not channel_has_task_surface(state, channel):
+            return write_stderr("Error: Agent or channel not found\nCode: CLAIM_FAILED\n")
+        task = resolve_task_arg(state, channel, argv)
+        if task is None:
+            return write_stderr("Error: Task not found\nCode: NOT_FOUND\n")
+        if freshness_blockers(state, channel):
+            return render_task_freshness_hold(state, channel)
+        if task.get("assignee") and task["assignee"] != "candidate":
+            return write_stderr(
+                f"Error: task #{task['number']} is already claimed by @{task['assignee']}\n"
+                "Code: CLAIM_CONFLICT\n"
+            )
+        task["assignee"] = "candidate"
+        if task["status"] == "todo":
+            task["status"] = "in_progress"
+        task["updated_at"] = current_timestamp()
+        return write_stdout(f"Task #{task['number']} claimed by @candidate.\n")
+
+    return with_mutable_state(action)
+
+
+def command_task_update(argv: list[str]) -> int:
+    channel = arg_value(argv, "--channel")
+    if channel is None:
+        return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
+    status = arg_value(argv, "--status")
+    if status not in TASK_STATUSES:
+        return write_stderr("Error: --status must be one of todo, in_progress, in_review, done\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if not channel_has_task_surface(state, channel):
+            return write_stderr("Error: Agent or channel not found\nCode: UPDATE_FAILED\n")
+        task = resolve_task_arg(state, channel, argv)
+        if task is None:
+            return write_stderr("Error: Task not found\nCode: NOT_FOUND\n")
+        if task["status"] == status:
+            return write_stderr(
+                f"Error: cannot transition from {task['status']} to {status}\n"
+                "Code: UPDATE_FAILED\n"
+            )
+        if task["status"] == "done":
+            return write_stderr(
+                f"Error: cannot transition from done to {status}\n"
+                "Code: UPDATE_FAILED\n"
+            )
+        old_status = task["status"]
+        task["status"] = status
+        task["updated_at"] = current_timestamp()
+        return write_stdout(f"Task #{task['number']} updated: {old_status} -> {status}.\n")
+
+    return with_mutable_state(action)
+
+
+def command_task(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing task subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "list":
+        return command_task_list(rest)
+    if subcommand == "create":
+        return command_task_create(rest)
+    if subcommand == "claim":
+        return command_task_claim(rest)
+    if subcommand == "update":
+        return command_task_update(rest)
+    return write_stderr(f"Error: unknown task subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def command_message(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing message subcommand\nCode: INVALID_ARG\n")
@@ -614,6 +951,8 @@ def main(argv: list[str]) -> int:
     command = argv[0]
     if command == "message":
         return command_message(argv[1:])
+    if command == "task":
+        return command_task(argv[1:])
     return write_stderr(f"Error: unknown command: {command}\nCode: INVALID_ARG\n")
 
 

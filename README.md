@@ -11,12 +11,16 @@ Current implemented surface:
 - `swarm message read --channel ...`
 - `swarm message send --target ...` using stdin for channels, threads, and DMs
 - freshness-hold draft output across message targets with newer local context
+- `swarm task create --channel ... --title ...`
+- `swarm task list --channel ...`
+- `swarm task claim --channel ... --number ...`
+- `swarm task update --channel ... --number ... --status ...`
 - `--content` rejection
 - local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
 
-It does not implement a daemon, server, task board, reminders, integrations,
-attachments, or production workspace access.
+It does not implement a daemon, server, reminders, integrations, attachments,
+or production workspace access.
 
 ## Verify
 
@@ -40,4 +44,5 @@ runs or to inspect a specific store.
 The anti-stub probe sends fixture-absent message bodies, reads them back, checks
 thread/target isolation, drains real inbox state, and exercises the
 freshness-hold draft cursor, DM persistence, target-generic freshness, and
-wall-clock sent timestamps.
+wall-clock sent timestamps. It also checks SQLite-backed task lifecycle
+create/list/claim/update behavior and concurrent write serialization.
