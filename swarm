@@ -269,9 +269,9 @@ def sync_remote_inbox(state: dict[str, Any]) -> None:
 
 def command_message_check() -> int:
     state = load_state()
+    sync_remote_inbox(state)
     local_inbox = state.setdefault("local_inbox", [])
     if not local_inbox:
-        sync_remote_inbox(state)
         save_state(state)
         return write_stdout("No new messages.\n")
 

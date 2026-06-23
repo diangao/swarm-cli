@@ -70,14 +70,11 @@ def parse_message_id(output: str) -> str:
 
 def probe_inbox(cli: Path, state_dir: Path) -> None:
     first = run(cli, state_dir, "message", "check").stdout
-    require(first == "No new messages.\n", f"first check should be empty, got:\n{first}")
+    require("please check the fixture" in first, "first check did not display seeded pending inbox")
+    require("No more new messages." in first, "pending check missing drain footer")
 
     second = run(cli, state_dir, "message", "check").stdout
-    require("please check the fixture" in second, "second check did not drain seeded pending inbox")
-    require("No more new messages." in second, "pending check missing drain footer")
-
-    third = run(cli, state_dir, "message", "check").stdout
-    require(third == "No new messages.\n", f"third check should be empty after drain, got:\n{third}")
+    require(second == "No new messages.\n", f"second check should be empty after drain, got:\n{second}")
 
     custom_body = f"anti-stub inbox {uuid.uuid4()}"
     state = read_state(state_dir)
