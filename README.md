@@ -11,6 +11,7 @@ Current implemented surface:
 - `swarm message read --channel ... [--before/--after/--around ...]`
 - `swarm message search --query ... [--channel/--sender/--sort/--before/--after/--limit ...]`
 - `swarm message resolve <id>`
+- `swarm message react --message-id ... --emoji ... [--remove]`
 - `swarm message send --target ... [--attachment-id ...]` using stdin for channels, threads, and DMs
 - freshness-hold draft output across message targets with newer local context
 - `swarm task create --channel ... --title ...`
@@ -69,7 +70,8 @@ that unseeded fresh stores are empty, then uses explicit test fixtures for
 history pagination, message search/resolve, thread/target isolation, drains
 real inbox state, and exercises the freshness-hold draft cursor, DM
 persistence, target-generic freshness, and wall-clock sent timestamps. It also
-checks SQLite-backed task lifecycle create/list/claim/unclaim/update behavior,
+checks SQLite-backed message reaction add/remove rendering, task lifecycle
+create/list/claim/unclaim/update behavior,
 including repeatable task claim/unclaim flags, reminder
 schedule/list/snooze/update/cancel/log behavior, local server/channel/profile
 catalog reads, profile update persistence, channel join/leave, thread unfollow
