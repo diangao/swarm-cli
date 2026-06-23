@@ -121,6 +121,12 @@ def parse_task_number(output: str) -> int:
     return int(match.group(1))
 
 
+def parse_reminder_id(output: str) -> str:
+    match = re.search(r"Reminder (rem_[0-9a-f]{8})", output)
+    require(match is not None, f"missing reminder id in output:\n{output}")
+    return match.group(1)
+
+
 def timestamp_for_body(history: str, body: str) -> datetime:
     for line in history.splitlines():
         if body in line:
@@ -291,6 +297,73 @@ def probe_task_lifecycle(cli: Path, state_dir: Path) -> None:
     require("cannot transition from done to done" in rejected, "idempotent done update was not rejected")
 
 
+def probe_reminder_lifecycle(cli: Path, state_dir: Path) -> None:
+    empty = run(cli, state_dir, "reminder", "list").stdout
+    require(empty == "No reminders.\n", f"empty reminder list rendered unexpectedly:\n{empty}")
+
+    title = f"reminder lifecycle {uuid.uuid4()}"
+    scheduled = run(
+        cli,
+        state_dir,
+        "reminder",
+        "schedule",
+        "--target",
+        "#general:00000000",
+        "--title",
+        title,
+        "--at",
+        "2031-04-05T06:07:08",
+    ).stdout
+    reminder_id = parse_reminder_id(scheduled)
+    require("scheduled for 2031-04-05 06:07:08" in scheduled, "schedule did not normalize timestamp")
+
+    listed = run(cli, state_dir, "reminder", "list").stdout
+    require(reminder_id in listed, "scheduled reminder missing from list")
+    require(title in listed, "scheduled reminder title missing from list")
+    require("#general:00000000" in listed, "scheduled reminder target missing from list")
+
+    snoozed = run(cli, state_dir, "reminder", "snooze", "--id", reminder_id, "--until", "2031-04-06T06:07:08").stdout
+    require("snoozed: 2031-04-05 06:07:08 -> 2031-04-06 06:07:08" in snoozed, "snooze did not update fire time")
+    snoozed_list = run(cli, state_dir, "reminder", "list").stdout
+    require(f"{reminder_id} [snoozed]" in snoozed_list, "snoozed status missing from list")
+    require("next=2031-04-06 06:07:08" in snoozed_list, "snoozed next fire missing from list")
+
+    updated_title = f"updated reminder {uuid.uuid4()}"
+    updated = run(
+        cli,
+        state_dir,
+        "reminder",
+        "update",
+        "--id",
+        reminder_id,
+        "--title",
+        updated_title,
+        "--at",
+        "2031-04-07T06:07:08",
+        "--every",
+        "1d",
+    ).stdout
+    require(f"Reminder {reminder_id} updated." in updated, "update did not acknowledge reminder")
+    updated_list = run(cli, state_dir, "reminder", "list").stdout
+    require(f"{reminder_id} [scheduled]" in updated_list, "updated snoozed reminder did not return to scheduled")
+    require(updated_title in updated_list, "updated title missing from list")
+    require("next=2031-04-07 06:07:08" in updated_list, "updated next fire missing from list")
+    require("every=1d" in updated_list, "updated recurrence missing from list")
+
+    log = run(cli, state_dir, "reminder", "log", "--id", reminder_id).stdout
+    require("scheduled:" in log and "snoozed:" in log and "updated:" in log, "reminder log missing lifecycle events")
+    require(updated_title in log, "reminder log missing current reminder title")
+
+    canceled = run(cli, state_dir, "reminder", "cancel", "--id", reminder_id).stdout
+    require(f"Reminder {reminder_id} canceled." in canceled, "cancel did not acknowledge reminder")
+    active_list = run(cli, state_dir, "reminder", "list").stdout
+    require(reminder_id not in active_list, "canceled reminder should be hidden from active list")
+    all_list = run(cli, state_dir, "reminder", "list", "--all").stdout
+    require(f"{reminder_id} [canceled]" in all_list, "canceled reminder missing from --all list")
+    rejected = run(cli, state_dir, "reminder", "snooze", "--id", reminder_id, "--for", "5m", expected=1).stderr
+    require("canceled reminders cannot be snoozed" in rejected, "canceled snooze was not rejected")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -303,8 +376,9 @@ def main() -> int:
         probe_wall_clock_timestamps(cli, state_dir)
         probe_cross_process_locking(cli, state_dir)
         probe_task_lifecycle(cli, state_dir)
+        probe_reminder_lifecycle(cli, state_dir)
 
-    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, SQLite locking, and tasks")
+    print("anti-stub probe ok: dynamic inbox, send/read, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, and reminders")
     return 0
 
 
