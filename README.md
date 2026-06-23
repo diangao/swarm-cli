@@ -33,3 +33,9 @@ by default. Set `SWARM_CANDIDATE_STATE_DIR` to inspect or override that state.
 The anti-stub probe sends fixture-absent message bodies, reads them back, checks
 thread/target isolation, drains real inbox state, and exercises the
 freshness-hold draft cursor.
+
+## Known v0 Limits
+
+- Freshness hold is implemented for the seeded `#general` channel only.
+- DM targets are out of Phase 1 scope.
+- Sent fixture timestamps are deterministic rather than wall-clock generated.
