@@ -3,19 +3,18 @@
 
 from __future__ import annotations
 
-import json
 import os
+import sqlite3
 import sys
 import uuid
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-import tempfile
-from typing import Any
+from typing import Any, Callable
 
 
-SCHEMA_VERSION = 4
-STATE_FILE = "state.json"
+SCHEMA_VERSION = 5
+STATE_FILE = "state.sqlite3"
 
 
 def message(
@@ -144,7 +143,9 @@ def state_dir() -> Path:
     configured = os.environ.get("SWARM_CANDIDATE_STATE_DIR")
     if configured:
         return Path(configured)
-    return Path(tempfile.gettempdir()) / "swarm-candidate-impl" / f"ppid-{os.getppid()}"
+    state_home = os.environ.get("XDG_STATE_HOME")
+    base = Path(state_home) if state_home else Path.home() / ".local" / "state"
+    return base / "swarm-cli"
 
 
 def state_path() -> Path:
@@ -155,28 +156,219 @@ def seed_state() -> dict[str, Any]:
     return deepcopy(SEED_STATE)
 
 
+def connect_state() -> sqlite3.Connection:
+    root = state_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(state_path(), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def create_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            seq INTEGER PRIMARY KEY,
+            target TEXT NOT NULL,
+            id TEXT NOT NULL UNIQUE,
+            time TEXT NOT NULL,
+            type TEXT NOT NULL,
+            author TEXT NOT NULL,
+            body TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS inbox (
+            ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('remote', 'local')),
+            target TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            time TEXT NOT NULL,
+            type TEXT NOT NULL,
+            author TEXT NOT NULL,
+            body TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_inbox_kind_ordinal ON inbox(kind, ordinal);
+        CREATE TABLE IF NOT EXISTS freshness (
+            target TEXT PRIMARY KEY,
+            cursor INTEGER NOT NULL,
+            draft TEXT
+        );
+        CREATE TABLE IF NOT EXISTS last_read (
+            target TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL
+        );
+        """
+    )
+
+
+def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
+    conn.execute("DELETE FROM inbox")
+    conn.execute("DELETE FROM messages")
+    conn.execute("DELETE FROM freshness")
+    conn.execute("DELETE FROM last_read")
+    conn.execute("DELETE FROM meta")
+    conn.executemany(
+        "INSERT INTO meta(key, value) VALUES (?, ?)",
+        [
+            ("schema_version", str(SCHEMA_VERSION)),
+            ("next_seq", str(int(state.get("next_seq", 1)))),
+            ("next_id_counter", str(int(state.get("next_id_counter", 0)))),
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO messages(seq, target, id, time, type, author, body)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                int(record["seq"]),
+                record["target"],
+                record["id"],
+                record["time"],
+                record["type"],
+                record["author"],
+                record["body"],
+            )
+            for record in state.get("messages", [])
+        ],
+    )
+    inbox_rows = []
+    for kind, key in (("remote", "remote_inbox"), ("local", "local_inbox")):
+        for item in state.get(key, []):
+            inbox_rows.append(
+                (
+                    kind,
+                    item["target"],
+                    item["message_id"],
+                    item["time"],
+                    item["type"],
+                    item["author"],
+                    item["body"],
+                )
+            )
+    conn.executemany(
+        """
+        INSERT INTO inbox(kind, target, message_id, time, type, author, body)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        inbox_rows,
+    )
+    conn.executemany(
+        "INSERT INTO freshness(target, cursor, draft) VALUES (?, ?, ?)",
+        [
+            (target, int(value.get("cursor", 0)), value.get("draft"))
+            for target, value in state.get("freshness", {}).items()
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO last_read(target, seq) VALUES (?, ?)",
+        [(target, int(seq)) for target, seq in state.get("last_read", {}).items()],
+    )
+
+
+def initialize_database(conn: sqlite3.Connection) -> None:
+    with conn:
+        create_schema(conn)
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        if row is None or row["value"] != str(SCHEMA_VERSION):
+            replace_state(conn, seed_state())
+
+
+def meta_int(conn: sqlite3.Connection, key: str, default: int) -> int:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return default
+    return int(row["value"])
+
+
+def inbox_rows(conn: sqlite3.Connection, kind: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT target, message_id, time, type, author, body
+        FROM inbox
+        WHERE kind = ?
+        ORDER BY ordinal
+        """,
+        (kind,),
+    ).fetchall()
+    return [
+        inbox_item(row["target"], row["message_id"], row["time"], row["type"], row["author"], row["body"])
+        for row in rows
+    ]
+
+
+def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
+    messages = [
+        message(row["seq"], row["target"], row["id"], row["time"], row["type"], row["author"], row["body"])
+        for row in conn.execute(
+            "SELECT seq, target, id, time, type, author, body FROM messages ORDER BY seq"
+        ).fetchall()
+    ]
+    freshness = {
+        row["target"]: {"cursor": row["cursor"], "draft": row["draft"]}
+        for row in conn.execute("SELECT target, cursor, draft FROM freshness ORDER BY target").fetchall()
+    }
+    last_read = {
+        row["target"]: row["seq"]
+        for row in conn.execute("SELECT target, seq FROM last_read ORDER BY target").fetchall()
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "next_seq": meta_int(conn, "next_seq", 1),
+        "next_id_counter": meta_int(conn, "next_id_counter", 0),
+        "last_read": last_read,
+        "messages": messages,
+        "remote_inbox": inbox_rows(conn, "remote"),
+        "local_inbox": inbox_rows(conn, "local"),
+        "freshness": freshness,
+    }
+
+
 def load_state() -> dict[str, Any]:
-    path = state_path()
-    if not path.exists():
-        state = seed_state()
-        save_state(state)
-        return state
+    conn = connect_state()
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        state = seed_state()
-        save_state(state)
-        return state
-    if state.get("schema_version") != SCHEMA_VERSION:
-        state = seed_state()
-        save_state(state)
-    return state
+        initialize_database(conn)
+        return read_state(conn)
+    finally:
+        conn.close()
 
 
 def save_state(state: dict[str, Any]) -> None:
-    root = state_dir()
-    root.mkdir(parents=True, exist_ok=True)
-    state_path().write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    conn = connect_state()
+    try:
+        initialize_database(conn)
+        with conn:
+            replace_state(conn, state)
+    finally:
+        conn.close()
+
+
+def with_read_state(action: Callable[[dict[str, Any]], int]) -> int:
+    state = load_state()
+    return action(state)
+
+
+def with_mutable_state(action: Callable[[dict[str, Any]], int]) -> int:
+    conn = connect_state()
+    try:
+        initialize_database(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        state = read_state(conn)
+        result = action(state)
+        replace_state(conn, state)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def short_id(msg_id: str) -> str:
@@ -276,18 +468,18 @@ def sync_remote_inbox(state: dict[str, Any]) -> None:
 
 
 def command_message_check() -> int:
-    state = load_state()
-    sync_remote_inbox(state)
-    local_inbox = state.setdefault("local_inbox", [])
-    if not local_inbox:
-        save_state(state)
-        return write_stdout("No new messages.\n")
+    def action(state: dict[str, Any]) -> int:
+        sync_remote_inbox(state)
+        local_inbox = state.setdefault("local_inbox", [])
+        if not local_inbox:
+            return write_stdout("No new messages.\n")
 
-    available = list(local_inbox)
-    state["local_inbox"] = []
-    save_state(state)
-    text = "\n".join(format_inbox_row(item) for item in available)
-    return write_stdout(f"{text}\nNo more new messages.\n")
+        available = list(local_inbox)
+        state["local_inbox"] = []
+        text = "\n".join(format_inbox_row(item) for item in available)
+        return write_stdout(f"{text}\nNo more new messages.\n")
+
+    return with_mutable_state(action)
 
 
 def known_surface(state: dict[str, Any], target: str) -> bool:
@@ -299,36 +491,38 @@ def known_surface(state: dict[str, Any], target: str) -> bool:
 
 
 def command_message_read(argv: list[str]) -> int:
-    state = load_state()
     channel = arg_value(argv, "--channel")
     if channel is None:
         return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
 
-    if not known_surface(state, channel):
-        return write_stderr(f"Error: Channel not found: {channel}\nCode: NOT_FOUND\n")
+    def action(state: dict[str, Any]) -> int:
+        if not known_surface(state, channel):
+            return write_stderr(f"Error: Channel not found: {channel}\nCode: NOT_FOUND\n")
 
-    records = records_for_surface(state, channel)
-    if channel == "#general":
-        last_read = state.get("last_read", {}).get("#general", 0)
-        header = (
-            f"## Message History for #general ({len(records)} messages)\n"
-            f"Your last read position: seq {last_read}. Use swarm message read --channel "
-            f"\"#general\" --after {last_read} to see only unread messages.\n\n"
+        records = records_for_surface(state, channel)
+        if channel == "#general":
+            last_read = state.get("last_read", {}).get("#general", 0)
+            header = (
+                f"## Message History for #general ({len(records)} messages)\n"
+                f"Your last read position: seq {last_read}. Use swarm message read --channel "
+                f"\"#general\" --after {last_read} to see only unread messages.\n\n"
+            )
+        elif channel == "#general:00000000":
+            header = f"## Message History for #general:00000000 ({len(records)} messages)\n\n"
+        else:
+            header = f"## Message History for {channel} ({len(records)} messages)\n\n"
+
+        if not records:
+            return write_stdout(f"## Message History for {channel} (0 messages)\n\n--- 0 messages shown. ---\n")
+
+        before = records[0]["seq"]
+        rows = "\n".join(format_history_row(record) for record in records)
+        return write_stdout(
+            f"{header}{rows}\n\n--- {len(records)} messages shown. "
+            f"Use before={before} to load older messages. ---\n"
         )
-    elif channel == "#general:00000000":
-        header = f"## Message History for #general:00000000 ({len(records)} messages)\n\n"
-    else:
-        header = f"## Message History for {channel} ({len(records)} messages)\n\n"
 
-    if not records:
-        return write_stdout(f"## Message History for {channel} (0 messages)\n\n--- 0 messages shown. ---\n")
-
-    before = records[0]["seq"]
-    rows = "\n".join(format_history_row(record) for record in records)
-    return write_stdout(
-        f"{header}{rows}\n\n--- {len(records)} messages shown. "
-        f"Use before={before} to load older messages. ---\n"
-    )
+    return with_read_state(action)
 
 
 def freshness_blockers(state: dict[str, Any], target: str) -> list[dict[str, Any]]:
@@ -345,7 +539,6 @@ def render_freshness_hold(state: dict[str, Any], target: str, body: str) -> int:
     freshness["draft"] = body
     blocking = freshness_blockers(state, target)
     visible = blocking[-1:]
-    save_state(state)
 
     history_rows = "\n".join(format_history_row(record) for record in visible)
     return write_stdout(
@@ -376,29 +569,29 @@ def command_message_send(argv: list[str]) -> int:
     target = arg_value(argv, "--target")
     if target is None:
         return write_stderr("Error: --target is required\nCode: INVALID_ARG\n")
-    state = load_state()
     target_allowed = target.startswith("#") or target.startswith("dm:@")
 
-    if "--send-draft" in argv:
-        draft = state.get("freshness", {}).get(target, {}).get("draft")
-        if not draft:
-            return write_stderr("Error: No draft saved for target\nCode: NOT_FOUND\n")
-        record = append_message(state, target, draft)
-        state["freshness"][target]["draft"] = None
-        state["freshness"][target]["cursor"] = record["seq"]
-        save_state(state)
+    def action(state: dict[str, Any]) -> int:
+        if "--send-draft" in argv:
+            draft = state.get("freshness", {}).get(target, {}).get("draft")
+            if not draft:
+                return write_stderr("Error: No draft saved for target\nCode: NOT_FOUND\n")
+            record = append_message(state, target, draft)
+            state["freshness"][target]["draft"] = None
+            state["freshness"][target]["cursor"] = record["seq"]
+            return write_stdout(success_text(target, record))
+
+        body = sys.stdin.read()
+        if not target_allowed:
+            return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
+        if freshness_blockers(state, target):
+            return render_freshness_hold(state, target, body)
+        record = append_message(state, target, body)
+        if target in state.get("freshness", {}):
+            state["freshness"][target]["cursor"] = record["seq"]
         return write_stdout(success_text(target, record))
 
-    body = sys.stdin.read()
-    if not target_allowed:
-        return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
-    if freshness_blockers(state, target):
-        return render_freshness_hold(state, target, body)
-    record = append_message(state, target, body)
-    if target in state.get("freshness", {}):
-        state["freshness"][target]["cursor"] = record["seq"]
-    save_state(state)
-    return write_stdout(success_text(target, record))
+    return with_mutable_state(action)
 
 
 def command_message(argv: list[str]) -> int:

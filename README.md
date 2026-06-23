@@ -12,7 +12,7 @@ Current implemented surface:
 - `swarm message send --target ...` using stdin for channels, threads, and DMs
 - freshness-hold draft output across message targets with newer local context
 - `--content` rejection
-- local JSON-backed persistence
+- local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
 
 It does not implement a daemon, server, task board, reminders, integrations,
@@ -23,7 +23,7 @@ attachments, or production workspace access.
 From the `swarm-harness` checkout:
 
 ```bash
-SWARM_CLI=/path/to/swarm-candidate-impl/swarm python3 scripts/contract_check.py --live
+SWARM_CANDIDATE_STATE_DIR="$(mktemp -d)" SWARM_CLI=/path/to/swarm-candidate-impl/swarm python3 scripts/contract_check.py --live
 ```
 
 From this checkout:
@@ -32,8 +32,10 @@ From this checkout:
 python3 scripts/anti_stub_probe.py
 ```
 
-The local implementation stores live-check state outside the repo by default.
-Set `SWARM_CANDIDATE_STATE_DIR` to inspect or override that state.
+The local implementation stores state in `state.sqlite3`. By default it uses
+the user state directory (`$XDG_STATE_HOME/swarm-cli` or
+`~/.local/state/swarm-cli`); set `SWARM_CANDIDATE_STATE_DIR` for isolated test
+runs or to inspect a specific store.
 
 The anti-stub probe sends fixture-absent message bodies, reads them back, checks
 thread/target isolation, drains real inbox state, and exercises the
