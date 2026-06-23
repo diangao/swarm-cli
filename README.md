@@ -29,12 +29,14 @@ Current implemented surface:
 - `swarm channel leave ...`
 - `swarm thread unfollow ...`
 - `swarm profile show`
+- `swarm attachment upload --path ... --channel ... [--mime-type ...]`
+- `swarm attachment view --id ... --output ...`
 - `--content` rejection
 - local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
 
 It does not implement a daemon, server, automatic reminder firing,
-integrations, attachments, or production workspace access.
+integrations, message attachment rendering, or production workspace access.
 
 ## Verify
 
@@ -67,5 +69,5 @@ real inbox state, and exercises the freshness-hold draft cursor, DM
 persistence, target-generic freshness, and wall-clock sent timestamps. It also
 checks SQLite-backed task lifecycle create/list/claim/update behavior, reminder
 schedule/list/snooze/update/cancel/log behavior, local server/channel/profile
-catalog reads, channel join/leave, thread unfollow state, and concurrent write
-serialization.
+catalog reads, channel join/leave, thread unfollow state, local attachment
+upload/view byte persistence, and concurrent write serialization.

@@ -151,6 +151,12 @@ def parse_message_id(output: str) -> str:
     return match.group(1)
 
 
+def parse_attachment_id(output: str) -> str:
+    match = re.search(r"Attachment ID: ([0-9a-f-]{36})", output)
+    require(match is not None, f"missing attachment id in output:\n{output}")
+    return match.group(1)
+
+
 def parse_task_number(output: str) -> int:
     match = re.search(r"Task #(\d+)", output)
     require(match is not None, f"missing task number in output:\n{output}")
@@ -554,6 +560,75 @@ def probe_membership_attention(cli: Path, state_dir: Path) -> None:
         conn.close()
 
 
+def probe_attachments(cli: Path, state_dir: Path) -> None:
+    payload = f"attachment payload {uuid.uuid4()}\nsecond line\n".encode("utf-8")
+    source = state_dir / "source-attachment.txt"
+    source.write_bytes(payload)
+
+    uploaded = run(
+        cli,
+        state_dir,
+        "attachment",
+        "upload",
+        "--path",
+        str(source),
+        "--channel",
+        "#attachments",
+        "--mime-type",
+        "text/plain",
+    ).stdout
+    attachment_id = parse_attachment_id(uploaded)
+    require("filename: source-attachment.txt" in uploaded, "attachment upload missing filename metadata")
+    require("mime_type: text/plain" in uploaded, "attachment upload missing mime metadata")
+    require(f"size_bytes: {len(payload)}" in uploaded, "attachment upload missing byte size")
+    require("sha256:" in uploaded, "attachment upload missing digest")
+
+    output = state_dir / "downloaded" / "out.txt"
+    viewed = run(
+        cli,
+        state_dir,
+        "attachment",
+        "view",
+        "--id",
+        attachment_id,
+        "--output",
+        str(output),
+    ).stdout
+    require(f"Attachment {attachment_id} saved" in viewed, "attachment view did not acknowledge saved file")
+    require(output.read_bytes() == payload, "attachment view bytes did not match uploaded source")
+
+    conn = connect_state(state_dir)
+    try:
+        row = conn.execute(
+            "SELECT channel, filename, mime_type, size_bytes, stored_path FROM attachments WHERE id = ?",
+            (attachment_id,),
+        ).fetchone()
+        require(row is not None, "attachment metadata was not persisted")
+        require(row["channel"] == "#attachments", "attachment channel metadata mismatch")
+        require(row["filename"] == "source-attachment.txt", "attachment filename metadata mismatch")
+        require(row["mime_type"] == "text/plain", "attachment MIME metadata mismatch")
+        require(row["size_bytes"] == len(payload), "attachment size metadata mismatch")
+        require((state_dir / row["stored_path"]).read_bytes() == payload, "stored attachment bytes mismatch")
+    finally:
+        conn.close()
+
+    missing = run(cli, state_dir, "attachment", "view", "--id", str(uuid.uuid4()), "--output", str(output), expected=1).stderr
+    require("Attachment not found" in missing, "unknown attachment id did not fail closed")
+
+    missing_file = run(
+        cli,
+        state_dir,
+        "attachment",
+        "upload",
+        "--path",
+        str(state_dir / "missing.txt"),
+        "--channel",
+        "#attachments",
+        expected=1,
+    ).stderr
+    require("File not found" in missing_file, "missing upload path did not fail closed")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -572,8 +647,9 @@ def main() -> int:
         probe_reminder_lifecycle(cli, state_dir)
         probe_navigation_surfaces(cli, state_dir)
         probe_membership_attention(cli, state_dir)
+        probe_attachments(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination, search/resolve, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, and membership")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination, search/resolve, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, membership, and attachments")
     return 0
 
 

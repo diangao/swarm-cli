@@ -7,6 +7,9 @@ import os
 import sqlite3
 import sys
 import uuid
+import hashlib
+import mimetypes
+import shutil
 from html import escape
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -14,9 +17,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
+MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 
 def message(
@@ -119,6 +123,28 @@ def reminder_event_item(
     }
 
 
+def attachment_item(
+    attachment_id: str,
+    channel: str,
+    filename: str,
+    mime_type: str,
+    size_bytes: int,
+    sha256: str,
+    stored_path: str,
+    created_at: str,
+) -> dict[str, Any]:
+    return {
+        "id": attachment_id,
+        "channel": channel,
+        "filename": filename,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "sha256": sha256,
+        "stored_path": stored_path,
+        "created_at": created_at,
+    }
+
+
 def channel_item(name: str, private: bool, joined: bool, description: str) -> dict[str, Any]:
     return {
         "name": name,
@@ -201,6 +227,7 @@ EMPTY_STATE: dict[str, Any] = {
     "tasks": [],
     "reminders": [],
     "reminder_events": [],
+    "attachments": [],
     "channels": [],
     "channel_members": [],
     "profiles": BASE_PROFILES,
@@ -316,6 +343,7 @@ SEED_STATE: dict[str, Any] = {
     ],
     "reminders": [],
     "reminder_events": [],
+    "attachments": [],
     "channels": SEED_CHANNELS,
     "channel_members": SEED_CHANNEL_MEMBERS,
     "profiles": SEED_PROFILES,
@@ -336,6 +364,10 @@ def state_dir() -> Path:
 
 def state_path() -> Path:
     return state_dir() / STATE_FILE
+
+
+def attachment_root() -> Path:
+    return state_dir() / "attachments"
 
 
 def seed_state() -> dict[str, Any]:
@@ -434,6 +466,18 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_reminder_events_id_ordinal
             ON reminder_events(reminder_id, ordinal);
+        CREATE TABLE IF NOT EXISTS attachments (
+            id TEXT PRIMARY KEY,
+            channel TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            stored_path TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_attachments_channel_created
+            ON attachments(channel, created_at);
         CREATE TABLE IF NOT EXISTS channels (
             name TEXT PRIMARY KEY,
             private INTEGER NOT NULL,
@@ -473,6 +517,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM tasks")
     conn.execute("DELETE FROM reminder_events")
     conn.execute("DELETE FROM reminders")
+    conn.execute("DELETE FROM attachments")
     conn.execute("DELETE FROM channel_members")
     conn.execute("DELETE FROM channels")
     conn.execute("DELETE FROM profiles")
@@ -589,6 +634,25 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 event["detail"],
             )
             for event in state.get("reminder_events", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO attachments(id, channel, filename, mime_type, size_bytes, sha256, stored_path, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                attachment["id"],
+                attachment["channel"],
+                attachment["filename"],
+                attachment["mime_type"],
+                int(attachment["size_bytes"]),
+                attachment["sha256"],
+                attachment["stored_path"],
+                attachment["created_at"],
+            )
+            for attachment in state.get("attachments", [])
         ],
     )
     conn.executemany(
@@ -775,6 +839,25 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    attachments = [
+        attachment_item(
+            row["id"],
+            row["channel"],
+            row["filename"],
+            row["mime_type"],
+            row["size_bytes"],
+            row["sha256"],
+            row["stored_path"],
+            row["created_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT id, channel, filename, mime_type, size_bytes, sha256, stored_path, created_at
+            FROM attachments
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+    ]
     channels = [
         channel_item(
             row["name"],
@@ -823,6 +906,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "tasks": tasks,
         "reminders": reminders,
         "reminder_events": reminder_events,
+        "attachments": attachments,
         "channels": channels,
         "channel_members": channel_members,
         "profiles": profiles,
@@ -1136,6 +1220,52 @@ def arg_values(argv: list[str], flag: str) -> list[str]:
         if value == flag and idx + 1 < len(argv):
             values.append(argv[idx + 1])
     return values
+
+
+def attachment_by_id(state: dict[str, Any], attachment_id: str) -> dict[str, Any] | None:
+    for record in state.get("attachments", []):
+        if record["id"] == attachment_id:
+            return record
+    return None
+
+
+def attachment_source_path(path_text: str) -> Path | None:
+    path = Path(path_text).expanduser()
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def attachment_mime_type(path: Path, override: str | None) -> str:
+    if override is not None and override.strip():
+        return override.strip()
+    guessed, _encoding = mimetypes.guess_type(path.name)
+    return guessed or "application/octet-stream"
+
+
+def store_attachment_bytes(source: Path, attachment_id: str) -> tuple[str, str, int]:
+    destination = attachment_root() / f"{attachment_id}.bin"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    size = 0
+    tmp_destination = destination.with_suffix(".tmp")
+    with source.open("rb") as src, tmp_destination.open("wb") as dst:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_ATTACHMENT_BYTES:
+                tmp_destination.unlink(missing_ok=True)
+                raise ValueError("too_large")
+            digest.update(chunk)
+            dst.write(chunk)
+    tmp_destination.replace(destination)
+    return f"attachments/{attachment_id}.bin", digest.hexdigest(), size
 
 
 def next_message_id(state: dict[str, Any]) -> str:
@@ -2129,6 +2259,91 @@ def command_profile(argv: list[str]) -> int:
     return write_stderr(f"Error: unknown profile subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
+def command_attachment_upload(argv: list[str]) -> int:
+    path_text = arg_value(argv, "--path")
+    channel = arg_value(argv, "--channel")
+    mime_override = arg_value(argv, "--mime-type")
+    if path_text is None:
+        return write_stderr("Error: --path is required\nCode: INVALID_ARG\n")
+    if channel is None:
+        return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
+    if not (channel.startswith("#") or channel.startswith("dm:@")):
+        return write_stderr("Error: attachment channel must be a channel, thread, or DM\nCode: INVALID_TARGET\n")
+
+    source = attachment_source_path(path_text)
+    if source is None:
+        return write_stderr(f"Error: File not found: {path_text}\nCode: NOT_FOUND\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if not target_joined_for_write(state, channel):
+            return write_stderr(f"Error: Not joined to target: {channel}\nCode: NOT_JOINED\n")
+        if channel.startswith("#") and ":" not in channel:
+            ensure_channel_catalog(state, channel)
+        attachment_id = str(uuid.uuid4())
+        try:
+            stored_path, digest, size = store_attachment_bytes(source, attachment_id)
+        except ValueError as exc:
+            if str(exc) == "too_large":
+                return write_stderr("Error: attachment exceeds 50MB limit\nCode: UPLOAD_FAILED\n")
+            raise
+        record = attachment_item(
+            attachment_id,
+            channel,
+            source.name,
+            attachment_mime_type(source, mime_override),
+            size,
+            digest,
+            stored_path,
+            current_timestamp(),
+        )
+        state.setdefault("attachments", []).append(record)
+        return write_stdout(
+            f"Attachment uploaded. Attachment ID: {attachment_id}\n"
+            f"filename: {record['filename']}\n"
+            f"mime_type: {record['mime_type']}\n"
+            f"size_bytes: {record['size_bytes']}\n"
+            f"sha256: {record['sha256']}\n"
+            f"channel: {channel}\n"
+        )
+
+    return with_mutable_state(action)
+
+
+def command_attachment_view(argv: list[str]) -> int:
+    attachment_id = arg_value(argv, "--id")
+    output_text = arg_value(argv, "--output")
+    if attachment_id is None:
+        return write_stderr("Error: --id is required\nCode: INVALID_ARG\n")
+    if output_text is None:
+        return write_stderr("Error: --output is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        record = attachment_by_id(state, attachment_id)
+        if record is None:
+            return write_stderr("Error: Attachment not found\nCode: NOT_FOUND\n")
+        stored = state_dir() / record["stored_path"]
+        if not stored.is_file():
+            return write_stderr("Error: Attachment content missing\nCode: NOT_FOUND\n")
+        output = Path(output_text).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(stored, output)
+        return write_stdout(f"Attachment {attachment_id} saved to {output}.\n")
+
+    return with_read_state(action)
+
+
+def command_attachment(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing attachment subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "upload":
+        return command_attachment_upload(rest)
+    if subcommand == "view":
+        return command_attachment_view(rest)
+    return write_stderr(f"Error: unknown attachment subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def command_message(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing message subcommand\nCode: INVALID_ARG\n")
@@ -2165,6 +2380,8 @@ def main(argv: list[str]) -> int:
         return command_thread(argv[1:])
     if command == "profile":
         return command_profile(argv[1:])
+    if command == "attachment":
+        return command_attachment(argv[1:])
     return write_stderr(f"Error: unknown command: {command}\nCode: INVALID_ARG\n")
 
 
