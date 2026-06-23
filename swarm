@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import uuid
 import hashlib
+import json
 import mimetypes
 import shutil
 from html import escape
@@ -17,10 +18,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+DRAFT_PREFIX = "__SWARM_DRAFT_V1__"
 
 
 def message(
@@ -145,6 +147,14 @@ def attachment_item(
     }
 
 
+def message_attachment_item(message_id: str, attachment_id: str, ordinal: int) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "attachment_id": attachment_id,
+        "ordinal": ordinal,
+    }
+
+
 def channel_item(name: str, private: bool, joined: bool, description: str) -> dict[str, Any]:
     return {
         "name": name,
@@ -228,6 +238,7 @@ EMPTY_STATE: dict[str, Any] = {
     "reminders": [],
     "reminder_events": [],
     "attachments": [],
+    "message_attachments": [],
     "channels": [],
     "channel_members": [],
     "profiles": BASE_PROFILES,
@@ -344,6 +355,7 @@ SEED_STATE: dict[str, Any] = {
     "reminders": [],
     "reminder_events": [],
     "attachments": [],
+    "message_attachments": [],
     "channels": SEED_CHANNELS,
     "channel_members": SEED_CHANNEL_MEMBERS,
     "profiles": SEED_PROFILES,
@@ -478,6 +490,14 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_attachments_channel_created
             ON attachments(channel, created_at);
+        CREATE TABLE IF NOT EXISTS message_attachments (
+            message_id TEXT NOT NULL,
+            attachment_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY (message_id, ordinal)
+        );
+        CREATE INDEX IF NOT EXISTS idx_message_attachments_attachment
+            ON message_attachments(attachment_id);
         CREATE TABLE IF NOT EXISTS channels (
             name TEXT PRIMARY KEY,
             private INTEGER NOT NULL,
@@ -517,6 +537,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM tasks")
     conn.execute("DELETE FROM reminder_events")
     conn.execute("DELETE FROM reminders")
+    conn.execute("DELETE FROM message_attachments")
     conn.execute("DELETE FROM attachments")
     conn.execute("DELETE FROM channel_members")
     conn.execute("DELETE FROM channels")
@@ -653,6 +674,20 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 attachment["created_at"],
             )
             for attachment in state.get("attachments", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO message_attachments(message_id, attachment_id, ordinal)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (
+                link["message_id"],
+                link["attachment_id"],
+                int(link["ordinal"]),
+            )
+            for link in state.get("message_attachments", [])
         ],
     )
     conn.executemany(
@@ -858,6 +893,25 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    message_attachments = [
+        message_attachment_item(row["message_id"], row["attachment_id"], row["ordinal"])
+        for row in conn.execute(
+            """
+            SELECT message_id, attachment_id, ordinal
+            FROM message_attachments
+            ORDER BY message_id, ordinal
+            """
+        ).fetchall()
+    ]
+    attachments_by_id = {record["id"]: record for record in attachments}
+    links_by_message: dict[str, list[dict[str, Any]]] = {}
+    for link in message_attachments:
+        attachment = attachments_by_id.get(link["attachment_id"])
+        if attachment is None:
+            continue
+        links_by_message.setdefault(link["message_id"], []).append(attachment)
+    for record in messages:
+        record["attachments"] = links_by_message.get(record["id"], [])
     channels = [
         channel_item(
             row["name"],
@@ -907,6 +961,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "reminders": reminders,
         "reminder_events": reminder_events,
         "attachments": attachments,
+        "message_attachments": message_attachments,
         "channels": channels,
         "channel_members": channel_members,
         "profiles": profiles,
@@ -959,10 +1014,24 @@ def short_id(msg_id: str) -> str:
     return msg_id.split("-", 1)[0]
 
 
+def format_attachment_summary(record: dict[str, Any]) -> str:
+    attachments = record.get("attachments") or []
+    if not attachments:
+        return ""
+    label = "attachment" if len(attachments) == 1 else "attachments"
+    items = ", ".join(
+        f"{attachment['filename']} (id:{attachment['id']}, {attachment['mime_type']}, "
+        f"{attachment['size_bytes']} bytes)"
+        for attachment in attachments
+    )
+    return f" [{len(attachments)} {label}: {items}]"
+
+
 def format_history_row(record: dict[str, Any]) -> str:
     return (
         f"[seq={record['seq']} msg={record['id']} time={record['time']} "
         f"type={record['type']}] @{record['author']}: {record['body']}"
+        f"{format_attachment_summary(record)}"
     )
 
 
@@ -970,6 +1039,7 @@ def format_canonical_message(record: dict[str, Any]) -> str:
     return (
         f"[target={record['target']} msg={short_id(str(record['id']))} time={record['time']} "
         f"type={record['type']}] @{record['author']}: {record['body']}"
+        f"{format_attachment_summary(record)}"
     )
 
 
@@ -1229,6 +1299,29 @@ def attachment_by_id(state: dict[str, Any], attachment_id: str) -> dict[str, Any
     return None
 
 
+def attachment_allowed_for_target(attachment: dict[str, Any], target: str) -> bool:
+    attachment_channel = attachment["channel"]
+    return attachment_channel == target or attachment_channel == channel_for_target(target)
+
+
+def resolve_message_attachments(
+    state: dict[str, Any], target: str, attachment_ids: list[str]
+) -> tuple[list[dict[str, Any]], str | None]:
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for attachment_id in attachment_ids:
+        if attachment_id in seen:
+            continue
+        seen.add(attachment_id)
+        record = attachment_by_id(state, attachment_id)
+        if record is None:
+            return [], "Attachment not found"
+        if not attachment_allowed_for_target(record, target):
+            return [], f"Attachment {attachment_id} is not available for target {target}"
+        records.append(record)
+    return records, None
+
+
 def attachment_source_path(path_text: str) -> Path | None:
     path = Path(path_text).expanduser()
     try:
@@ -1319,8 +1412,14 @@ def schedule_time_from_args(argv: list[str], absolute_flag: str = "--at", relati
     return None
 
 
-def append_message(state: dict[str, Any], target: str, body: str) -> dict[str, Any]:
+def append_message(
+    state: dict[str, Any],
+    target: str,
+    body: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     ensure_channel_catalog(state, target)
+    attachments = attachments or []
     seq = int(state["next_seq"])
     state["next_seq"] = seq + 1
     record = message(
@@ -1332,7 +1431,12 @@ def append_message(state: dict[str, Any], target: str, body: str) -> dict[str, A
         "candidate",
         body.rstrip("\n"),
     )
+    record["attachments"] = list(attachments)
     state["messages"].append(record)
+    for ordinal, attachment in enumerate(attachments, start=1):
+        state.setdefault("message_attachments", []).append(
+            message_attachment_item(record["id"], attachment["id"], ordinal)
+        )
     return record
 
 
@@ -1377,6 +1481,31 @@ def reminder_by_id(state: dict[str, Any], reminder_id: str) -> dict[str, Any] | 
         if record["id"] == reminder_id:
             return record
     return None
+
+
+def encode_draft(body: str, attachment_ids: list[str]) -> str:
+    if not attachment_ids:
+        return body
+    return DRAFT_PREFIX + json.dumps(
+        {"body": body, "attachment_ids": attachment_ids},
+        separators=(",", ":"),
+    )
+
+
+def decode_draft(value: str) -> tuple[str, list[str]]:
+    if not value.startswith(DRAFT_PREFIX):
+        return value, []
+    payload = value[len(DRAFT_PREFIX) :]
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        return value, []
+    body = decoded.get("body")
+    attachment_ids = decoded.get("attachment_ids")
+    if not isinstance(body, str) or not isinstance(attachment_ids, list):
+        return value, []
+    clean_ids = [item for item in attachment_ids if isinstance(item, str)]
+    return body, clean_ids
 
 
 def success_text(target: str, record: dict[str, Any]) -> str:
@@ -1623,13 +1752,24 @@ def freshness_blockers(state: dict[str, Any], target: str) -> list[dict[str, Any
     )
 
 
-def render_freshness_hold(state: dict[str, Any], target: str, body: str) -> int:
+def render_freshness_hold(
+    state: dict[str, Any],
+    target: str,
+    body: str,
+    attachment_ids: list[str] | None = None,
+) -> int:
+    attachment_ids = attachment_ids or []
     freshness = state.setdefault("freshness", {}).setdefault(target, {})
-    freshness["draft"] = body
+    freshness["draft"] = encode_draft(body, attachment_ids)
     blocking = freshness_blockers(state, target)
     visible = blocking[-1:]
 
     history_rows = "\n".join(format_history_row(record) for record in visible)
+    attachment_note = (
+        f"Draft attachments: {', '.join(attachment_ids)}\n"
+        if attachment_ids
+        else ""
+    )
     return write_stdout(
         f"Freshness hold: showing latest {len(visible)} of {len(blocking)} newer message.\n"
         "Your message has been saved as a draft. Review the bounded context shown here, then choose one path.\n"
@@ -1637,6 +1777,7 @@ def render_freshness_hold(state: dict[str, Any], target: str, body: str) -> int:
         "0000000000000000000000000000000000000000000000000000000000000000.\n\n"
         f"## Message History for {target} ({len(visible)} messages)\n\n"
         f"{history_rows}\n\n"
+        f"{attachment_note}"
         "To update the draft, send revised content normally:\n"
         f"  swarm message send --target \"{target}\" <<'SWARMMSG'\n"
         "  revised message\n"
@@ -1674,13 +1815,18 @@ def command_message_send(argv: list[str]) -> int:
     if target is None:
         return write_stderr("Error: --target is required\nCode: INVALID_ARG\n")
     target_allowed = target.startswith("#") or target.startswith("dm:@")
+    attachment_ids = arg_values(argv, "--attachment-id")
 
     def action(state: dict[str, Any]) -> int:
         if "--send-draft" in argv:
             draft = state.get("freshness", {}).get(target, {}).get("draft")
             if not draft:
                 return write_stderr("Error: No draft saved for target\nCode: NOT_FOUND\n")
-            record = append_message(state, target, draft)
+            body, draft_attachment_ids = decode_draft(draft)
+            attachments, attachment_error = resolve_message_attachments(state, target, draft_attachment_ids)
+            if attachment_error is not None:
+                return write_stderr(f"Error: {attachment_error}\nCode: NOT_FOUND\n")
+            record = append_message(state, target, body, attachments)
             state["freshness"][target]["draft"] = None
             state["freshness"][target]["cursor"] = record["seq"]
             return write_stdout(success_text(target, record))
@@ -1690,9 +1836,12 @@ def command_message_send(argv: list[str]) -> int:
             return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
         if not target_joined_for_write(state, target):
             return write_stderr(f"Error: Not joined to target: {target}\nCode: NOT_JOINED\n")
+        attachments, attachment_error = resolve_message_attachments(state, target, attachment_ids)
+        if attachment_error is not None:
+            return write_stderr(f"Error: {attachment_error}\nCode: NOT_FOUND\n")
         if freshness_blockers(state, target):
-            return render_freshness_hold(state, target, body)
-        record = append_message(state, target, body)
+            return render_freshness_hold(state, target, body, [record["id"] for record in attachments])
+        record = append_message(state, target, body, attachments)
         if target in state.get("freshness", {}):
             state["freshness"][target]["cursor"] = record["seq"]
         return write_stdout(success_text(target, record))
