@@ -315,6 +315,67 @@ def probe_search_and_resolve(cli: Path, state_dir: Path) -> None:
     require("doesnotexist" not in missing, "resolve missing id echoed unknown id")
 
 
+def probe_message_reactions(cli: Path, state_dir: Path) -> None:
+    target = f"#react-{uuid.uuid4().hex[:8]}"
+    body = f"reactable body {uuid.uuid4()}"
+    msg_id = parse_message_id(run(cli, state_dir, "message", "send", "--target", target, stdin=body).stdout)
+
+    added = run(cli, state_dir, "message", "react", "--message-id", msg_id, "--emoji", "+1").stdout
+    require(f"Reaction +1 added to {msg_id[:8]}." in added, "message react did not acknowledge add")
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require("[reactions:" in history, "message read did not render reaction summary")
+    require("+1 x1 @candidate" in history, "message read did not render candidate reaction")
+    resolved = run(cli, state_dir, "message", "resolve", msg_id[:8]).stdout
+    require("+1 x1 @candidate" in resolved, "message resolve did not render reaction summary")
+
+    duplicate = run(cli, state_dir, "message", "react", "--message-id", msg_id, "--emoji", "+1").stdout
+    require("already present" in duplicate, "duplicate reaction add was not idempotent")
+    conn = connect_state(state_dir)
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM message_reactions
+            WHERE message_id = ? AND emoji = '+1' AND author = 'candidate'
+            """,
+            (msg_id,),
+        ).fetchone()
+        require(row is not None and row["count"] == 1, "duplicate reaction add created multiple rows")
+    finally:
+        conn.close()
+
+    removed = run(cli, state_dir, "message", "react", "--message-id", msg_id, "--emoji", "+1", "--remove").stdout
+    require(f"Reaction +1 removed from {msg_id[:8]}." in removed, "message react did not acknowledge remove")
+    after_remove = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require("+1 x1 @candidate" not in after_remove, "removed reaction still rendered in read output")
+
+    missing_reaction = run(
+        cli,
+        state_dir,
+        "message",
+        "react",
+        "--message-id",
+        msg_id,
+        "--emoji",
+        "+1",
+        "--remove",
+        expected=1,
+    ).stderr
+    require("Reaction not found" in missing_reaction, "removing absent reaction did not fail closed")
+    missing_message = run(
+        cli,
+        state_dir,
+        "message",
+        "react",
+        "--message-id",
+        "doesnotexist",
+        "--emoji",
+        "+1",
+        expected=1,
+    ).stderr
+    require("Message not found" in missing_message, "reacting to unknown message did not fail closed")
+
+
 def probe_freshness_cursor(cli: Path, state_dir: Path) -> None:
     held_body = f"held draft body {uuid.uuid4()}"
     hold = run(cli, state_dir, "message", "send", "--target", "#general", stdin=held_body).stdout
@@ -793,6 +854,7 @@ def main() -> int:
         probe_send_read_and_routes(cli, state_dir)
         probe_read_pagination(cli, state_dir)
         probe_search_and_resolve(cli, state_dir)
+        probe_message_reactions(cli, state_dir)
         probe_freshness_cursor(cli, state_dir)
         probe_wall_clock_timestamps(cli, state_dir)
         probe_cross_process_locking(cli, state_dir)
@@ -802,7 +864,7 @@ def main() -> int:
         probe_membership_attention(cli, state_dir)
         probe_attachments(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination, search/resolve, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, membership, and attachments")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, membership, and attachments")
     return 0
 
 

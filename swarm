@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -155,6 +155,15 @@ def message_attachment_item(message_id: str, attachment_id: str, ordinal: int) -
     }
 
 
+def message_reaction_item(message_id: str, emoji: str, author: str, created_at: str) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "emoji": emoji,
+        "author": author,
+        "created_at": created_at,
+    }
+
+
 def channel_item(name: str, private: bool, joined: bool, description: str) -> dict[str, Any]:
     return {
         "name": name,
@@ -239,6 +248,7 @@ EMPTY_STATE: dict[str, Any] = {
     "reminder_events": [],
     "attachments": [],
     "message_attachments": [],
+    "message_reactions": [],
     "channels": [],
     "channel_members": [],
     "profiles": BASE_PROFILES,
@@ -356,6 +366,7 @@ SEED_STATE: dict[str, Any] = {
     "reminder_events": [],
     "attachments": [],
     "message_attachments": [],
+    "message_reactions": [],
     "channels": SEED_CHANNELS,
     "channel_members": SEED_CHANNEL_MEMBERS,
     "profiles": SEED_PROFILES,
@@ -498,6 +509,15 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_message_attachments_attachment
             ON message_attachments(attachment_id);
+        CREATE TABLE IF NOT EXISTS message_reactions (
+            message_id TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            author TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (message_id, emoji, author)
+        );
+        CREATE INDEX IF NOT EXISTS idx_message_reactions_message
+            ON message_reactions(message_id);
         CREATE TABLE IF NOT EXISTS channels (
             name TEXT PRIMARY KEY,
             private INTEGER NOT NULL,
@@ -538,6 +558,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM reminder_events")
     conn.execute("DELETE FROM reminders")
     conn.execute("DELETE FROM message_attachments")
+    conn.execute("DELETE FROM message_reactions")
     conn.execute("DELETE FROM attachments")
     conn.execute("DELETE FROM channel_members")
     conn.execute("DELETE FROM channels")
@@ -688,6 +709,21 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 int(link["ordinal"]),
             )
             for link in state.get("message_attachments", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO message_reactions(message_id, emoji, author, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (
+                reaction["message_id"],
+                reaction["emoji"],
+                reaction["author"],
+                reaction["created_at"],
+            )
+            for reaction in state.get("message_reactions", [])
         ],
     )
     conn.executemany(
@@ -912,6 +948,21 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         links_by_message.setdefault(link["message_id"], []).append(attachment)
     for record in messages:
         record["attachments"] = links_by_message.get(record["id"], [])
+    message_reactions = [
+        message_reaction_item(row["message_id"], row["emoji"], row["author"], row["created_at"])
+        for row in conn.execute(
+            """
+            SELECT message_id, emoji, author, created_at
+            FROM message_reactions
+            ORDER BY message_id, emoji, created_at, author
+            """
+        ).fetchall()
+    ]
+    reactions_by_message: dict[str, list[dict[str, Any]]] = {}
+    for reaction in message_reactions:
+        reactions_by_message.setdefault(reaction["message_id"], []).append(reaction)
+    for record in messages:
+        record["reactions"] = reactions_by_message.get(record["id"], [])
     channels = [
         channel_item(
             row["name"],
@@ -962,6 +1013,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "reminder_events": reminder_events,
         "attachments": attachments,
         "message_attachments": message_attachments,
+        "message_reactions": message_reactions,
         "channels": channels,
         "channel_members": channel_members,
         "profiles": profiles,
@@ -1027,11 +1079,26 @@ def format_attachment_summary(record: dict[str, Any]) -> str:
     return f" [{len(attachments)} {label}: {items}]"
 
 
+def format_reaction_summary(record: dict[str, Any]) -> str:
+    reactions = record.get("reactions") or []
+    if not reactions:
+        return ""
+    grouped: dict[str, list[str]] = {}
+    for reaction in reactions:
+        grouped.setdefault(str(reaction["emoji"]), []).append(str(reaction["author"]))
+    items = []
+    for emoji in sorted(grouped):
+        authors = sorted(set(grouped[emoji]))
+        items.append(f"{emoji} x{len(authors)} @{', @'.join(authors)}")
+    return f" [reactions: {', '.join(items)}]"
+
+
 def format_history_row(record: dict[str, Any]) -> str:
     return (
         f"[seq={record['seq']} msg={record['id']} time={record['time']} "
         f"type={record['type']}] @{record['author']}: {record['body']}"
         f"{format_attachment_summary(record)}"
+        f"{format_reaction_summary(record)}"
     )
 
 
@@ -1040,6 +1107,7 @@ def format_canonical_message(record: dict[str, Any]) -> str:
         f"[target={record['target']} msg={short_id(str(record['id']))} time={record['time']} "
         f"type={record['type']}] @{record['author']}: {record['body']}"
         f"{format_attachment_summary(record)}"
+        f"{format_reaction_summary(record)}"
     )
 
 
@@ -1741,6 +1809,66 @@ def command_message_resolve(argv: list[str]) -> int:
         return write_stdout(f"{format_canonical_message(record)}\n")
 
     return with_read_state(action)
+
+
+def command_message_react(argv: list[str]) -> int:
+    msg_id = arg_value(argv, "--message-id")
+    emoji = arg_value(argv, "--emoji")
+    if msg_id is None:
+        return write_stderr("Error: --message-id is required\nCode: INVALID_ARG\n")
+    if emoji is None or not emoji.strip():
+        return write_stderr("Error: --emoji is required\nCode: INVALID_ARG\n")
+    emoji = emoji.strip()
+    remove = "--remove" in argv
+    author = "candidate"
+
+    def action(state: dict[str, Any]) -> int:
+        record, error = message_by_id(state, msg_id)
+        if error == "ambiguous":
+            return write_stderr(f"Error: ambiguous message id: {msg_id}\nCode: AMBIGUOUS_ID\n")
+        if record is None:
+            return write_stderr(
+                "Error: Message not found\n"
+                "Code: NOT_FOUND\n"
+                "Next action: Check the message id and try again.\n"
+            )
+
+        reactions = state.setdefault("message_reactions", [])
+        existing = [
+            reaction
+            for reaction in reactions
+            if reaction["message_id"] == record["id"]
+            and reaction["emoji"] == emoji
+            and reaction["author"] == author
+        ]
+        if remove:
+            if not existing:
+                return write_stderr("Error: Reaction not found\nCode: NOT_FOUND\n")
+            state["message_reactions"] = [
+                reaction
+                for reaction in reactions
+                if not (
+                    reaction["message_id"] == record["id"]
+                    and reaction["emoji"] == emoji
+                    and reaction["author"] == author
+                )
+            ]
+            record["reactions"] = [
+                reaction
+                for reaction in record.get("reactions", [])
+                if not (reaction["emoji"] == emoji and reaction["author"] == author)
+            ]
+            return write_stdout(f"Reaction {emoji} removed from {short_id(str(record['id']))}.\n")
+
+        if existing:
+            return write_stdout(f"Reaction {emoji} already present on {short_id(str(record['id']))}.\n")
+
+        reaction = message_reaction_item(record["id"], emoji, author, current_timestamp())
+        reactions.append(reaction)
+        record.setdefault("reactions", []).append(reaction)
+        return write_stdout(f"Reaction {emoji} added to {short_id(str(record['id']))}.\n")
+
+    return with_mutable_state(action)
 
 
 def freshness_blockers(state: dict[str, Any], target: str) -> list[dict[str, Any]]:
@@ -2600,6 +2728,8 @@ def command_message(argv: list[str]) -> int:
         return command_message_search(rest)
     if subcommand == "resolve":
         return command_message_resolve(rest)
+    if subcommand == "react":
+        return command_message_react(rest)
     if subcommand == "send":
         return command_message_send(rest)
     return write_stderr(f"Error: unknown message subcommand: {subcommand}\nCode: INVALID_ARG\n")
