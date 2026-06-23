@@ -1043,6 +1043,43 @@ def records_for_surface(state: dict[str, Any], target: str) -> list[dict[str, An
     return sorted(rows, key=lambda row: row["seq"])
 
 
+def anchor_seq(records: list[dict[str, Any]], anchor: str) -> int | None:
+    if anchor.isdigit():
+        return int(anchor)
+    for record in records:
+        msg_id = str(record["id"])
+        if msg_id == anchor or short_id(msg_id) == anchor:
+            return int(record["seq"])
+    return None
+
+
+def bounded_records(records: list[dict[str, Any]], argv: list[str], limit: int = 20) -> tuple[list[dict[str, Any]], str | None]:
+    before = arg_value(argv, "--before")
+    after = arg_value(argv, "--after")
+    around = arg_value(argv, "--around")
+    anchors = [value for value in (before, after, around) if value is not None]
+    if len(anchors) > 1:
+        return [], "use only one of --before, --after, or --around"
+    if before is not None:
+        seq = anchor_seq(records, before)
+        if seq is None:
+            return [], f"anchor not found: {before}"
+        return [record for record in records if int(record["seq"]) < seq][-limit:], None
+    if after is not None:
+        seq = anchor_seq(records, after)
+        if seq is None:
+            return [], f"anchor not found: {after}"
+        return [record for record in records if int(record["seq"]) > seq][:limit], None
+    if around is not None:
+        seq = anchor_seq(records, around)
+        if seq is None:
+            return [], f"anchor not found: {around}"
+        ordered = sorted(records, key=lambda row: abs(int(row["seq"]) - seq))
+        selected = sorted(ordered[: min(limit, len(ordered))], key=lambda row: int(row["seq"]))
+        return selected, None
+    return records[-limit:], None
+
+
 def write_stdout(text: str) -> int:
     sys.stdout.write(text)
     return 0
@@ -1228,6 +1265,9 @@ def command_message_read(argv: list[str]) -> int:
             return write_stderr(f"Error: Channel not found: {channel}\nCode: NOT_FOUND\n")
 
         records = records_for_surface(state, channel)
+        records, anchor_error = bounded_records(records, argv)
+        if anchor_error is not None:
+            return write_stderr(f"Error: {anchor_error}\nCode: NOT_FOUND\n")
         if channel == "#general":
             last_read = state.get("last_read", {}).get("#general", 0)
             header = (
@@ -1244,13 +1284,19 @@ def command_message_read(argv: list[str]) -> int:
             return write_stdout(f"## Message History for {channel} (0 messages)\n\n--- 0 messages shown. ---\n")
 
         before = records[0]["seq"]
+        after = records[-1]["seq"]
         rows = "\n".join(format_history_row(record) for record in records)
+        if ":" not in channel and not channel.startswith("dm:@"):
+            state.setdefault("last_read", {})[channel] = max(
+                int(state.get("last_read", {}).get(channel, 0)),
+                int(after),
+            )
         return write_stdout(
             f"{header}{rows}\n\n--- {len(records)} messages shown. "
-            f"Use before={before} to load older messages. ---\n"
+            f"Use before={before} to load older messages or after={after} to load newer messages. ---\n"
         )
 
-    return with_read_state(action)
+    return with_mutable_state(action)
 
 
 def freshness_blockers(state: dict[str, Any], target: str) -> list[dict[str, Any]]:
