@@ -8,12 +8,12 @@ import sqlite3
 import sys
 import uuid
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 
@@ -77,6 +77,44 @@ def task_item(
         "message_id": message_id,
         "created_at": created_at,
         "updated_at": updated_at,
+    }
+
+
+def reminder_item(
+    reminder_id: str,
+    title: str,
+    target: str | None,
+    status: str,
+    next_fire_at: str,
+    recurrence: str | None,
+    created_at: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    return {
+        "id": reminder_id,
+        "title": title,
+        "target": target,
+        "status": status,
+        "next_fire_at": next_fire_at,
+        "recurrence": recurrence,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def reminder_event_item(
+    ordinal: int,
+    reminder_id: str,
+    time: str,
+    event: str,
+    detail: str,
+) -> dict[str, Any]:
+    return {
+        "ordinal": ordinal,
+        "reminder_id": reminder_id,
+        "time": time,
+        "event": event,
+        "detail": detail,
     }
 
 
@@ -186,6 +224,8 @@ SEED_STATE: dict[str, Any] = {
             "2026-03-15 01:00:10",
         ),
     ],
+    "reminders": [],
+    "reminder_events": [],
 }
 
 
@@ -264,6 +304,26 @@ def create_schema(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_channel_number ON tasks(channel, number);
+        CREATE TABLE IF NOT EXISTS reminders (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            target TEXT,
+            status TEXT NOT NULL,
+            next_fire_at TEXT NOT NULL,
+            recurrence TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reminders_status_next ON reminders(status, next_fire_at);
+        CREATE TABLE IF NOT EXISTS reminder_events (
+            ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+            reminder_id TEXT NOT NULL,
+            time TEXT NOT NULL,
+            event TEXT NOT NULL,
+            detail TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reminder_events_id_ordinal
+            ON reminder_events(reminder_id, ordinal);
         """
     )
 
@@ -274,6 +334,8 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM freshness")
     conn.execute("DELETE FROM last_read")
     conn.execute("DELETE FROM tasks")
+    conn.execute("DELETE FROM reminder_events")
+    conn.execute("DELETE FROM reminders")
     conn.execute("DELETE FROM meta")
     conn.executemany(
         "INSERT INTO meta(key, value) VALUES (?, ?)",
@@ -354,14 +416,56 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             for task in state.get("tasks", [])
         ],
     )
+    conn.executemany(
+        """
+        INSERT INTO reminders(id, title, target, status, next_fire_at, recurrence, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                reminder["id"],
+                reminder["title"],
+                reminder.get("target"),
+                reminder["status"],
+                reminder["next_fire_at"],
+                reminder.get("recurrence"),
+                reminder["created_at"],
+                reminder["updated_at"],
+            )
+            for reminder in state.get("reminders", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO reminder_events(reminder_id, time, event, detail)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (
+                event["reminder_id"],
+                event["time"],
+                event["event"],
+                event["detail"],
+            )
+            for event in state.get("reminder_events", [])
+        ],
+    )
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:
     with conn:
         create_schema(conn)
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is None or row["value"] != str(SCHEMA_VERSION):
+        if row is None:
             replace_state(conn, seed_state())
+        elif row["value"] != str(SCHEMA_VERSION):
+            conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES ('schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(SCHEMA_VERSION),),
+            )
 
 
 def meta_int(conn: sqlite3.Connection, key: str, default: int) -> int:
@@ -422,6 +526,41 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    reminders = [
+        reminder_item(
+            row["id"],
+            row["title"],
+            row["target"],
+            row["status"],
+            row["next_fire_at"],
+            row["recurrence"],
+            row["created_at"],
+            row["updated_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT id, title, target, status, next_fire_at, recurrence, created_at, updated_at
+            FROM reminders
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+    ]
+    reminder_events = [
+        reminder_event_item(
+            row["ordinal"],
+            row["reminder_id"],
+            row["time"],
+            row["event"],
+            row["detail"],
+        )
+        for row in conn.execute(
+            """
+            SELECT ordinal, reminder_id, time, event, detail
+            FROM reminder_events
+            ORDER BY ordinal
+            """
+        ).fetchall()
+    ]
     return {
         "schema_version": SCHEMA_VERSION,
         "next_seq": meta_int(conn, "next_seq", 1),
@@ -433,6 +572,8 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "local_inbox": inbox_rows(conn, "local"),
         "freshness": freshness,
         "tasks": tasks,
+        "reminders": reminders,
+        "reminder_events": reminder_events,
     }
 
 
@@ -501,6 +642,15 @@ def format_task_row(record: dict[str, Any]) -> str:
     return (
         f"#{record['number']} [{record['status']}] {record['title']}{assignee} "
         f"(by @{record['creator']}) msg={short_id(str(record['message_id']))}"
+    )
+
+
+def format_reminder_row(record: dict[str, Any]) -> str:
+    target = f" target={record['target']}" if record.get("target") else ""
+    recurrence = f" every={record['recurrence']}" if record.get("recurrence") else ""
+    return (
+        f"{record['id']} [{record['status']}] {record['title']}{target} "
+        f"next={record['next_fire_at']}{recurrence}"
     )
 
 
@@ -591,6 +741,48 @@ def current_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def parse_duration(value: str) -> timedelta | None:
+    if len(value) < 2:
+        return None
+    amount_text, unit = value[:-1], value[-1]
+    if not amount_text.isdigit():
+        return None
+    amount = int(amount_text)
+    if unit == "s":
+        return timedelta(seconds=amount)
+    if unit == "m":
+        return timedelta(minutes=amount)
+    if unit == "h":
+        return timedelta(hours=amount)
+    if unit == "d":
+        return timedelta(days=amount)
+    return None
+
+
+def normalize_datetime_text(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return raw
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def schedule_time_from_args(argv: list[str], absolute_flag: str = "--at", relative_flag: str = "--in") -> str | None:
+    absolute = arg_value(argv, absolute_flag)
+    if absolute:
+        return normalize_datetime_text(absolute)
+    relative = arg_value(argv, relative_flag)
+    if relative:
+        delta = parse_duration(relative)
+        if delta is None:
+            return None
+        return (datetime.now() + delta).strftime("%Y-%m-%d %H:%M:%S")
+    return None
+
+
 def append_message(state: dict[str, Any], target: str, body: str) -> dict[str, Any]:
     seq = int(state["next_seq"])
     state["next_seq"] = seq + 1
@@ -627,6 +819,27 @@ def append_task(state: dict[str, Any], channel: str, title: str) -> dict[str, An
     freshness = state.setdefault("freshness", {}).setdefault(channel, {"cursor": 0, "draft": None})
     freshness["cursor"] = record["seq"]
     return task
+
+
+def next_reminder_id(state: dict[str, Any]) -> str:
+    existing = {record["id"] for record in state.get("reminders", [])}
+    while True:
+        reminder_id = f"rem_{uuid.uuid4().hex[:8]}"
+        if reminder_id not in existing:
+            return reminder_id
+
+
+def append_reminder_event(state: dict[str, Any], reminder_id: str, event: str, detail: str) -> None:
+    state.setdefault("reminder_events", []).append(
+        reminder_event_item(0, reminder_id, current_timestamp(), event, detail)
+    )
+
+
+def reminder_by_id(state: dict[str, Any], reminder_id: str) -> dict[str, Any] | None:
+    for record in state.get("reminders", []):
+        if record["id"] == reminder_id:
+            return record
+    return None
 
 
 def success_text(target: str, record: dict[str, Any]) -> str:
@@ -931,6 +1144,231 @@ def command_task(argv: list[str]) -> int:
     return write_stderr(f"Error: unknown task subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
+def reminder_title_from_args(argv: list[str]) -> str | None:
+    title = arg_value(argv, "--title")
+    if title is not None:
+        return title
+    positional: list[str] = []
+    skip_next = False
+    value_flags = {
+        "--target",
+        "--title",
+        "--at",
+        "--in",
+        "--every",
+        "--id",
+        "--until",
+        "--for",
+    }
+    for value in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if value in value_flags:
+            skip_next = True
+            continue
+        if value.startswith("--"):
+            continue
+        positional.append(value)
+    if positional:
+        return " ".join(positional)
+    return None
+
+
+def reminder_id_from_args(argv: list[str]) -> str | None:
+    reminder_id = arg_value(argv, "--id")
+    if reminder_id is not None:
+        return reminder_id
+    reminder_id = arg_value(argv, "--reminder-id")
+    if reminder_id is not None:
+        return reminder_id
+    if argv and not argv[0].startswith("--"):
+        return argv[0]
+    return None
+
+
+def command_reminder_list(argv: list[str]) -> int:
+    include_canceled = "--all" in argv
+
+    def action(state: dict[str, Any]) -> int:
+        rows = list(state.get("reminders", []))
+        if not include_canceled:
+            rows = [record for record in rows if record["status"] != "canceled"]
+        if not rows:
+            return write_stdout("No reminders.\n")
+        rendered = "\n".join(format_reminder_row(record) for record in rows)
+        return write_stdout(f"## Reminders ({len(rows)})\n\n{rendered}\n")
+
+    return with_read_state(action)
+
+
+def command_reminder_schedule(argv: list[str]) -> int:
+    title = reminder_title_from_args(argv)
+    if title is None or not title.strip():
+        return write_stderr("Error: reminder title is required\nCode: INVALID_ARG\n")
+    next_fire_at = schedule_time_from_args(argv)
+    if next_fire_at is None:
+        return write_stderr("Error: --at or --in with s/m/h/d duration is required\nCode: INVALID_ARG\n")
+    target = arg_value(argv, "--target")
+    if target is not None and not (target.startswith("#") or target.startswith("dm:@")):
+        return write_stderr("Error: reminder target must be a channel, thread, or DM\nCode: INVALID_TARGET\n")
+    recurrence = arg_value(argv, "--every")
+
+    def action(state: dict[str, Any]) -> int:
+        now = current_timestamp()
+        reminder_id = next_reminder_id(state)
+        reminder = reminder_item(
+            reminder_id,
+            title.strip(),
+            target,
+            "scheduled",
+            next_fire_at,
+            recurrence,
+            now,
+            now,
+        )
+        state.setdefault("reminders", []).append(reminder)
+        detail = f"title={reminder['title']} next={next_fire_at}"
+        if target:
+            detail += f" target={target}"
+        if recurrence:
+            detail += f" every={recurrence}"
+        append_reminder_event(state, reminder_id, "scheduled", detail)
+        return write_stdout(
+            f"Reminder {reminder_id} scheduled for {next_fire_at}."
+            f"{' Target: ' + target + '.' if target else ''}\n"
+        )
+
+    return with_mutable_state(action)
+
+
+def command_reminder_snooze(argv: list[str]) -> int:
+    reminder_id = reminder_id_from_args(argv)
+    if reminder_id is None:
+        return write_stderr("Error: --id is required\nCode: INVALID_ARG\n")
+    next_fire_at = schedule_time_from_args(argv, absolute_flag="--until", relative_flag="--for")
+    if next_fire_at is None:
+        return write_stderr("Error: --until or --for with s/m/h/d duration is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        reminder = reminder_by_id(state, reminder_id)
+        if reminder is None:
+            return write_stderr("Error: Reminder not found\nCode: NOT_FOUND\n")
+        if reminder["status"] == "canceled":
+            return write_stderr("Error: canceled reminders cannot be snoozed\nCode: UPDATE_FAILED\n")
+        old_next = reminder["next_fire_at"]
+        reminder["next_fire_at"] = next_fire_at
+        reminder["status"] = "snoozed"
+        reminder["updated_at"] = current_timestamp()
+        append_reminder_event(state, reminder_id, "snoozed", f"{old_next} -> {next_fire_at}")
+        return write_stdout(f"Reminder {reminder_id} snoozed: {old_next} -> {next_fire_at}.\n")
+
+    return with_mutable_state(action)
+
+
+def command_reminder_update(argv: list[str]) -> int:
+    reminder_id = reminder_id_from_args(argv)
+    if reminder_id is None:
+        return write_stderr("Error: --id is required\nCode: INVALID_ARG\n")
+    title = arg_value(argv, "--title")
+    target = arg_value(argv, "--target")
+    next_fire_at = schedule_time_from_args(argv)
+    recurrence = arg_value(argv, "--every")
+    if title is None and target is None and next_fire_at is None and recurrence is None:
+        return write_stderr("Error: provide --title, --target, --at/--in, or --every\nCode: INVALID_ARG\n")
+    if target is not None and target != "none" and not (target.startswith("#") or target.startswith("dm:@")):
+        return write_stderr("Error: reminder target must be a channel, thread, DM, or none\nCode: INVALID_TARGET\n")
+
+    def action(state: dict[str, Any]) -> int:
+        reminder = reminder_by_id(state, reminder_id)
+        if reminder is None:
+            return write_stderr("Error: Reminder not found\nCode: NOT_FOUND\n")
+        if reminder["status"] == "canceled":
+            return write_stderr("Error: canceled reminders cannot be updated\nCode: UPDATE_FAILED\n")
+        changes: list[str] = []
+        if title is not None:
+            changes.append(f"title={reminder['title']} -> {title.strip()}")
+            reminder["title"] = title.strip()
+        if target is not None:
+            next_target = None if target == "none" else target
+            changes.append(f"target={reminder.get('target')} -> {next_target}")
+            reminder["target"] = next_target
+        if next_fire_at is not None:
+            changes.append(f"next={reminder['next_fire_at']} -> {next_fire_at}")
+            reminder["next_fire_at"] = next_fire_at
+            if reminder["status"] == "snoozed":
+                reminder["status"] = "scheduled"
+        if recurrence is not None:
+            next_recurrence = None if recurrence == "none" else recurrence
+            changes.append(f"every={reminder.get('recurrence')} -> {next_recurrence}")
+            reminder["recurrence"] = next_recurrence
+        reminder["updated_at"] = current_timestamp()
+        append_reminder_event(state, reminder_id, "updated", "; ".join(changes))
+        return write_stdout(f"Reminder {reminder_id} updated.\n")
+
+    return with_mutable_state(action)
+
+
+def command_reminder_cancel(argv: list[str]) -> int:
+    reminder_id = reminder_id_from_args(argv)
+    if reminder_id is None:
+        return write_stderr("Error: --id is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        reminder = reminder_by_id(state, reminder_id)
+        if reminder is None:
+            return write_stderr("Error: Reminder not found\nCode: NOT_FOUND\n")
+        if reminder["status"] == "canceled":
+            return write_stderr("Error: reminder is already canceled\nCode: UPDATE_FAILED\n")
+        old_status = reminder["status"]
+        reminder["status"] = "canceled"
+        reminder["updated_at"] = current_timestamp()
+        append_reminder_event(state, reminder_id, "canceled", f"status={old_status} -> canceled")
+        return write_stdout(f"Reminder {reminder_id} canceled.\n")
+
+    return with_mutable_state(action)
+
+
+def command_reminder_log(argv: list[str]) -> int:
+    reminder_id = reminder_id_from_args(argv)
+    if reminder_id is None:
+        return write_stderr("Error: --id is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        reminder = reminder_by_id(state, reminder_id)
+        if reminder is None:
+            return write_stderr("Error: Reminder not found\nCode: NOT_FOUND\n")
+        events = [
+            event for event in state.get("reminder_events", []) if event["reminder_id"] == reminder_id
+        ]
+        rows = "\n".join(
+            f"[{event['time']}] {event['event']}: {event['detail']}" for event in events
+        )
+        return write_stdout(f"## Reminder Log {reminder_id}\n\n{format_reminder_row(reminder)}\n\n{rows}\n")
+
+    return with_read_state(action)
+
+
+def command_reminder(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing reminder subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "list":
+        return command_reminder_list(rest)
+    if subcommand == "schedule":
+        return command_reminder_schedule(rest)
+    if subcommand == "snooze":
+        return command_reminder_snooze(rest)
+    if subcommand == "update":
+        return command_reminder_update(rest)
+    if subcommand == "cancel":
+        return command_reminder_cancel(rest)
+    if subcommand == "log":
+        return command_reminder_log(rest)
+    return write_stderr(f"Error: unknown reminder subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def command_message(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing message subcommand\nCode: INVALID_ARG\n")
@@ -953,6 +1391,8 @@ def main(argv: list[str]) -> int:
         return command_message(argv[1:])
     if command == "task":
         return command_task(argv[1:])
+    if command == "reminder":
+        return command_reminder(argv[1:])
     return write_stderr(f"Error: unknown command: {command}\nCode: INVALID_ARG\n")
 
 
