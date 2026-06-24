@@ -13,6 +13,8 @@ import mimetypes
 import shutil
 import shlex
 import time
+import urllib.error
+import urllib.request
 from html import escape
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -2303,6 +2305,63 @@ def slack_outbound_plan_item(
     return request, None
 
 
+def slack_sendable_payload(plan: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "channel": plan["channel"],
+        "text": plan["text"],
+        "client_msg_id": plan["client_msg_id"],
+    }
+    if "thread_ts" in plan:
+        payload["thread_ts"] = plan["thread_ts"]
+    return payload
+
+
+def parse_slack_send_response(
+    response: dict[str, Any],
+    plan: dict[str, Any],
+) -> tuple[dict[str, str] | None, str | None]:
+    if response.get("ok") is not True:
+        reason = response.get("error") if isinstance(response.get("error"), str) else "unknown_error"
+        return None, f"Slack Web API rejected chat.postMessage: {reason}"
+    slack_ts = response.get("ts")
+    if not isinstance(slack_ts, str) or state_time_from_slack_ts(slack_ts) is None:
+        return None, "Slack Web API response did not include a valid ts"
+    channel_id = response.get("channel")
+    if channel_id is not None and channel_id != plan["channel"]:
+        return None, "Slack Web API response channel did not match request channel"
+    return {"channel": str(plan["channel"]), "ts": slack_ts}, None
+
+
+def slack_web_post_message(
+    token: str,
+    plan: dict[str, Any],
+    timeout_seconds: float,
+) -> tuple[dict[str, str] | None, str | None]:
+    request = urllib.request.Request(
+        "https://slack.com/api/chat.postMessage",
+        data=json.dumps(slack_sendable_payload(plan), separators=(",", ":")).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return None, f"Slack Web API HTTP error: {exc.code}"
+    except urllib.error.URLError:
+        return None, "Slack Web API transport error"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "Slack Web API response was not valid JSON"
+    if not isinstance(payload, dict):
+        return None, "Slack Web API response was not a JSON object"
+    return parse_slack_send_response(payload, plan)
+
+
 def slack_event_envelope(payload: dict[str, Any]) -> dict[str, Any]:
     event = payload.get("event")
     return event if isinstance(event, dict) else payload
@@ -4342,6 +4401,140 @@ def parse_after_seq(argv: list[str]) -> tuple[int, str | None]:
     return value, None
 
 
+def parse_timeout_seconds(argv: list[str]) -> tuple[float, str | None]:
+    raw = arg_value(argv, "--timeout-seconds")
+    if raw is None:
+        return 10.0, None
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.0, "--timeout-seconds must be a positive number"
+    if value <= 0 or value > 120:
+        return 0.0, "--timeout-seconds must be between 0 and 120"
+    return value, None
+
+
+def slack_outbound_plans_from_state(
+    state: dict[str, Any],
+    workspace: str,
+    target: str | None,
+    message_ids: list[str],
+    after_seq: int,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    if slack_workspace_by_id(state, workspace) is None:
+        return None, (
+            "Error: Slack workspace config not found\n"
+            "Code: NOT_FOUND\n"
+            "Next action: configure it with swarm slack configure.\n"
+        )
+    records: list[dict[str, Any]] = []
+    if message_ids:
+        seen: set[str] = set()
+        for msg_id in message_ids:
+            record, error = message_by_id(state, msg_id)
+            if error == "ambiguous":
+                return None, f"Error: ambiguous message id: {msg_id}\nCode: AMBIGUOUS_ID\n"
+            if record is None:
+                return None, "Error: Message not found\nCode: NOT_FOUND\n"
+            if target is not None and record["target"] != target:
+                return None, "Error: message target does not match --target\nCode: INVALID_TARGET\n"
+            if record["id"] not in seen:
+                records.append(record)
+                seen.add(record["id"])
+    else:
+        assert target is not None
+        if not known_surface(state, target):
+            return None, f"Error: Channel not found: {target}\nCode: NOT_FOUND\n"
+        records = [
+            record
+            for record in state.get("messages", [])
+            if record["target"] == target and int(record["seq"]) > after_seq
+        ]
+    if not records:
+        return [], None
+
+    plans: list[dict[str, Any]] = []
+    for record in sorted(records, key=lambda row: int(row["seq"])):
+        if not slack_record_needs_outbound(state, workspace, record):
+            continue
+        channel_mapping = known_slack_channel_mapping(state, workspace, str(record["target"]))
+        if channel_mapping is None:
+            return None, (
+                f"Error: Slack channel mapping not found for target {channel_for_target(str(record['target']))}\n"
+                "Code: NOT_FOUND\n"
+                "Next action: ingest a Slack message from that channel or mark a sent root with --channel-id.\n"
+            )
+        plan, plan_error = slack_outbound_plan_item(state, workspace, channel_mapping, record)
+        if plan_error is not None:
+            return None, f"Error: {plan_error}\nCode: NOT_FOUND\n"
+        assert plan is not None
+        plans.append(plan)
+    return plans, None
+
+
+def record_slack_sent_mapping(
+    state: dict[str, Any],
+    workspace: str,
+    msg_id: str,
+    slack_ts: str,
+    explicit_channel_id: str | None = None,
+    explicit_channel_name: str | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None, str | None]:
+    if slack_workspace_by_id(state, workspace) is None:
+        return None, None, None, (
+            "Error: Slack workspace config not found\n"
+            "Code: NOT_FOUND\n"
+            "Next action: configure it with swarm slack configure.\n"
+        )
+    record, error = message_by_id(state, msg_id)
+    if error == "ambiguous":
+        return None, None, None, f"Error: ambiguous message id: {msg_id}\nCode: AMBIGUOUS_ID\n"
+    if record is None:
+        return None, None, None, "Error: Message not found\nCode: NOT_FOUND\n"
+
+    existing_for_message = slack_mapping_by_message_id(state, workspace, str(record["id"]))
+    if existing_for_message is not None:
+        if existing_for_message["slack_ts"] == slack_ts:
+            return existing_for_message, record, "already", None
+        return None, None, None, (
+            "Error: swarm message is already mapped to a different Slack ts\n"
+            "Code: SLACK_MAPPING_CONFLICT\n"
+        )
+
+    channel_mapping = known_slack_channel_mapping(state, workspace, str(record["target"]))
+    channel_id = explicit_channel_id
+    channel_name = explicit_channel_name
+    if channel_mapping is not None:
+        channel_id = channel_id or channel_mapping["channel_id"]
+        channel_name = channel_name or channel_mapping.get("channel_name")
+    if channel_id is None:
+        return None, None, None, (
+            "Error: --channel-id is required when target has no existing Slack channel mapping\n"
+            "Code: INVALID_ARG\n"
+        )
+    existing_for_ts = slack_mapping_by_key(state, workspace, channel_id, slack_ts)
+    if existing_for_ts is not None:
+        return None, None, None, (
+            "Error: Slack ts is already mapped to another swarm message\n"
+            "Code: SLACK_TS_CONFLICT\n"
+        )
+    thread_ts, thread_error = slack_thread_ts_for_target(state, workspace, str(record["target"]))
+    if thread_error is not None:
+        return None, None, None, f"Error: {thread_error}\nCode: NOT_FOUND\n"
+    mapping = slack_message_item(
+        workspace,
+        channel_id,
+        channel_name,
+        slack_ts,
+        thread_ts,
+        record["target"],
+        record["id"],
+        current_timestamp(),
+    )
+    state.setdefault("slack_messages", []).append(mapping)
+    return mapping, record, "recorded", None
+
+
 def command_slack_outbound(argv: list[str]) -> int:
     if (
         flag_missing_value(argv, "--workspace")
@@ -4362,55 +4555,10 @@ def command_slack_outbound(argv: list[str]) -> int:
         return write_stderr("Error: --target or --message-id is required\nCode: INVALID_ARG\n")
 
     def action(state: dict[str, Any]) -> int:
-        if slack_workspace_by_id(state, workspace) is None:
-            return write_stderr(
-                "Error: Slack workspace config not found\n"
-                "Code: NOT_FOUND\n"
-                "Next action: configure it with swarm slack configure.\n"
-            )
-        records: list[dict[str, Any]] = []
-        if message_ids:
-            seen: set[str] = set()
-            for msg_id in message_ids:
-                record, error = message_by_id(state, msg_id)
-                if error == "ambiguous":
-                    return write_stderr(f"Error: ambiguous message id: {msg_id}\nCode: AMBIGUOUS_ID\n")
-                if record is None:
-                    return write_stderr("Error: Message not found\nCode: NOT_FOUND\n")
-                if target is not None and record["target"] != target:
-                    return write_stderr("Error: message target does not match --target\nCode: INVALID_TARGET\n")
-                if record["id"] not in seen:
-                    records.append(record)
-                    seen.add(record["id"])
-        else:
-            assert target is not None
-            if not known_surface(state, target):
-                return write_stderr(f"Error: Channel not found: {target}\nCode: NOT_FOUND\n")
-            records = [
-                record
-                for record in state.get("messages", [])
-                if record["target"] == target and int(record["seq"]) > after_seq
-            ]
-        if not records:
-            return write_stdout("## Slack Outbound Plan (0 requests)\n\nNo outbound messages.\n")
-
-        plans: list[dict[str, Any]] = []
-        for record in sorted(records, key=lambda row: int(row["seq"])):
-            if not slack_record_needs_outbound(state, workspace, record):
-                continue
-            channel_mapping = known_slack_channel_mapping(state, workspace, str(record["target"]))
-            if channel_mapping is None:
-                return write_stderr(
-                    f"Error: Slack channel mapping not found for target {channel_for_target(str(record['target']))}\n"
-                    "Code: NOT_FOUND\n"
-                    "Next action: ingest a Slack message from that channel or mark a sent root with --channel-id.\n"
-                )
-            plan, plan_error = slack_outbound_plan_item(state, workspace, channel_mapping, record)
-            if plan_error is not None:
-                return write_stderr(f"Error: {plan_error}\nCode: NOT_FOUND\n")
-            assert plan is not None
-            plans.append(plan)
-
+        plans, plan_error = slack_outbound_plans_from_state(state, workspace, target, message_ids, after_seq)
+        if plan_error is not None:
+            return write_stderr(plan_error)
+        assert plans is not None
         if not plans:
             return write_stdout("## Slack Outbound Plan (0 requests)\n\nNo outbound messages.\n")
         rendered = "\n".join(json.dumps(plan, sort_keys=True, separators=(",", ":")) for plan in plans)
@@ -4421,6 +4569,157 @@ def command_slack_outbound(argv: list[str]) -> int:
         )
 
     return with_read_state(action)
+
+
+def read_slack_mock_responses(path_value: str | None, plan_count: int) -> tuple[list[dict[str, Any]] | None, str | None]:
+    if path_value is None:
+        return None, None
+    path = Path(path_value).expanduser()
+    try:
+        raw = path.read_text()
+    except OSError:
+        return None, f"Slack mock response file not found: {path_value}"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "invalid Slack mock response JSON"
+    if isinstance(payload, dict):
+        responses = [payload]
+    elif isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+        responses = payload
+    else:
+        return None, "Slack mock response JSON must be an object or list of objects"
+    if len(responses) != plan_count:
+        return None, "Slack mock response count must match outbound plan count"
+    return responses, None
+
+
+def command_slack_send(argv: list[str]) -> int:
+    if (
+        flag_missing_value(argv, "--workspace")
+        or flag_missing_value(argv, "--target")
+        or flag_missing_value(argv, "--message-id")
+        or flag_missing_value(argv, "--after-seq")
+        or flag_missing_value(argv, "--mock-response-file")
+        or flag_missing_value(argv, "--timeout-seconds")
+    ):
+        return write_stderr("Error: Slack send flags require values\nCode: INVALID_ARG\n")
+    workspace = arg_value(argv, "--workspace")
+    target = arg_value(argv, "--target")
+    message_ids = arg_values(argv, "--message-id")
+    mock_response_file = arg_value(argv, "--mock-response-file")
+    after_seq, seq_error = parse_after_seq(argv)
+    if seq_error is not None:
+        return write_stderr(f"Error: {seq_error}\nCode: INVALID_ARG\n")
+    timeout_seconds, timeout_error = parse_timeout_seconds(argv)
+    if timeout_error is not None:
+        return write_stderr(f"Error: {timeout_error}\nCode: INVALID_ARG\n")
+    if not workspace:
+        return write_stderr("Error: --workspace is required\nCode: INVALID_ARG\n")
+    if target is None and not message_ids:
+        return write_stderr("Error: --target or --message-id is required\nCode: INVALID_ARG\n")
+
+    context: dict[str, Any] = {}
+
+    def plan_action(state: dict[str, Any]) -> int:
+        config = slack_workspace_by_id(state, workspace)
+        if config is None:
+            return write_stderr(
+                "Error: Slack workspace config not found\n"
+                "Code: NOT_FOUND\n"
+                "Next action: configure it with swarm slack configure.\n"
+            )
+        plans, plan_error = slack_outbound_plans_from_state(state, workspace, target, message_ids, after_seq)
+        if plan_error is not None:
+            return write_stderr(plan_error)
+        assert plans is not None
+        token_env = config["bot_token_env"]
+        context["plans"] = deepcopy(plans)
+        context["token_env"] = token_env
+        if plans:
+            token_value = os.environ.get(token_env)
+            if not token_value:
+                return write_stderr(
+                    "Error: Slack bot token environment variable is not set\n"
+                    "Code: SLACK_TOKEN_MISSING\n"
+                    f"Next action: set {token_env} in the adapter process environment.\n"
+                )
+            context["token_value"] = token_value
+        return 0
+
+    result = with_read_state(plan_action)
+    if result != 0:
+        return result
+    plans = context.get("plans", [])
+    assert isinstance(plans, list)
+    if not plans:
+        return write_stdout("## Slack Send (0 requests)\n\nNo outbound messages.\n")
+
+    mock_responses, mock_error = read_slack_mock_responses(mock_response_file, len(plans))
+    if mock_error is not None:
+        return write_stderr(f"Error: {mock_error}\nCode: INVALID_ARG\n")
+
+    rows: list[str] = []
+    for index, plan in enumerate(plans):
+        message_id = str(plan["swarm_message_id"])
+
+        def preflight_action(state: dict[str, Any]) -> int:
+            if slack_mapping_by_message_id(state, workspace, message_id) is not None:
+                return write_stderr(
+                    "Error: swarm message was mapped before send; refusing duplicate Slack post\n"
+                    "Code: SLACK_MAPPING_CONFLICT\n"
+                )
+            return 0
+
+        preflight = with_read_state(preflight_action)
+        if preflight != 0:
+            return preflight
+
+        if mock_responses is not None:
+            response, response_error = parse_slack_send_response(mock_responses[index], plan)
+        else:
+            response, response_error = slack_web_post_message(context["token_value"], plan, timeout_seconds)
+        if response_error is not None:
+            return write_stderr(f"Error: {response_error}\nCode: SLACK_SEND_FAILED\n")
+        assert response is not None
+
+        record_context: dict[str, Any] = {}
+
+        def mark_action(state: dict[str, Any]) -> int:
+            mapping, record, status, mark_error = record_slack_sent_mapping(
+                state,
+                workspace,
+                message_id,
+                response["ts"],
+                response["channel"],
+            )
+            if mark_error is not None:
+                return write_stderr(mark_error)
+            assert mapping is not None and record is not None and status is not None
+            record_context["status"] = status
+            record_context["message_id"] = record["id"]
+            record_context["target"] = record["target"]
+            record_context["channel"] = mapping["channel_id"]
+            record_context["ts"] = mapping["slack_ts"]
+            return 0
+
+        marked = with_mutable_state(mark_action)
+        if marked != 0:
+            return marked
+        rows.append(
+            f"- {record_context['message_id']} {record_context['target']} -> "
+            f"{record_context['channel']} ts={record_context['ts']} ({record_context['status']})"
+        )
+
+    mode_line = "Mock Slack responses used; no network request was sent." if mock_responses is not None else "Slack Web API chat.postMessage was called."
+    return write_stdout(
+        f"## Slack Send ({len(rows)} requests)\n\n"
+        + "\n".join(rows)
+        + "\n\n"
+        f"Token source: {context['token_env']} (value not shown)\n"
+        f"{mode_line}\n"
+        "Successful responses were recorded through the mark-sent ledger.\n"
+    )
 
 
 def command_slack_mark_sent(argv: list[str]) -> int:
@@ -4443,59 +4742,19 @@ def command_slack_mark_sent(argv: list[str]) -> int:
         return write_stderr("Error: --ts must be a positive Slack timestamp\nCode: INVALID_ARG\n")
 
     def action(state: dict[str, Any]) -> int:
-        if slack_workspace_by_id(state, workspace) is None:
-            return write_stderr(
-                "Error: Slack workspace config not found\n"
-                "Code: NOT_FOUND\n"
-                "Next action: configure it with swarm slack configure.\n"
-            )
-        record, error = message_by_id(state, msg_id)
-        if error == "ambiguous":
-            return write_stderr(f"Error: ambiguous message id: {msg_id}\nCode: AMBIGUOUS_ID\n")
-        if record is None:
-            return write_stderr("Error: Message not found\nCode: NOT_FOUND\n")
-
-        existing_for_message = slack_mapping_by_message_id(state, workspace, str(record["id"]))
-        if existing_for_message is not None:
-            if existing_for_message["slack_ts"] == slack_ts:
-                return write_stdout(slack_mapping_output(existing_for_message, record, "Slack sent mapping already recorded."))
-            return write_stderr(
-                "Error: swarm message is already mapped to a different Slack ts\n"
-                "Code: SLACK_MAPPING_CONFLICT\n"
-            )
-
-        channel_mapping = known_slack_channel_mapping(state, workspace, str(record["target"]))
-        channel_id = explicit_channel_id
-        channel_name = explicit_channel_name
-        if channel_mapping is not None:
-            channel_id = channel_id or channel_mapping["channel_id"]
-            channel_name = channel_name or channel_mapping.get("channel_name")
-        if channel_id is None:
-            return write_stderr(
-                "Error: --channel-id is required when target has no existing Slack channel mapping\n"
-                "Code: INVALID_ARG\n"
-            )
-        existing_for_ts = slack_mapping_by_key(state, workspace, channel_id, slack_ts)
-        if existing_for_ts is not None:
-            return write_stderr(
-                "Error: Slack ts is already mapped to another swarm message\n"
-                "Code: SLACK_TS_CONFLICT\n"
-            )
-        thread_ts, thread_error = slack_thread_ts_for_target(state, workspace, str(record["target"]))
-        if thread_error is not None:
-            return write_stderr(f"Error: {thread_error}\nCode: NOT_FOUND\n")
-        mapping = slack_message_item(
+        mapping, record, status, error = record_slack_sent_mapping(
+            state,
             workspace,
-            channel_id,
-            channel_name,
+            msg_id,
             slack_ts,
-            thread_ts,
-            record["target"],
-            record["id"],
-            current_timestamp(),
+            explicit_channel_id,
+            explicit_channel_name,
         )
-        state.setdefault("slack_messages", []).append(mapping)
-        return write_stdout(slack_mapping_output(mapping, record, "Slack sent mapping recorded."))
+        if error is not None:
+            return write_stderr(error)
+        assert mapping is not None and record is not None
+        heading = "Slack sent mapping already recorded." if status == "already" else "Slack sent mapping recorded."
+        return write_stdout(slack_mapping_output(mapping, record, heading))
 
     return with_mutable_state(action)
 
@@ -4515,6 +4774,8 @@ def command_slack(argv: list[str]) -> int:
         return command_slack_resolve(rest)
     if subcommand == "outbound":
         return command_slack_outbound(rest)
+    if subcommand == "send":
+        return command_slack_send(rest)
     if subcommand == "mark-sent":
         return command_slack_mark_sent(rest)
     return write_stderr(f"Error: unknown slack subcommand: {subcommand}\nCode: INVALID_ARG\n")
