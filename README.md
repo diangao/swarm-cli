@@ -15,7 +15,7 @@ Current implemented surface:
 - `swarm message send --target ... [--attachment-id ...]` using stdin for channels, threads, and DMs
 - freshness-hold draft output across message targets with newer local context
 - `swarm task create --channel ... --title ... [--title ...]`
-- `swarm task list --channel ...`
+- `swarm task list --channel ... [--status ...] [--assignee ...|--mine|--unassigned]`
 - `swarm task claim --channel ... --number ... [--number ...]`
 - `swarm task unclaim --channel ... --number ... [--number ...]`
 - `swarm task update --channel ... --number ... --status ...`
