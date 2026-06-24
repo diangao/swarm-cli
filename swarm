@@ -2163,6 +2163,17 @@ def parse_search_limit(argv: list[str], default: int = 10) -> tuple[int, str | N
     return value, None
 
 
+def parse_search_sort(argv: list[str]) -> tuple[str, str | None]:
+    raw = arg_value(argv, "--sort")
+    if raw is None:
+        if "--sort" in argv:
+            return "", "--sort must be one of: relevance, recent"
+        return "relevance", None
+    if raw not in {"relevance", "recent"}:
+        return "", "--sort must be one of: relevance, recent"
+    return raw, None
+
+
 def sender_matches(record: dict[str, Any], sender: str | None) -> bool:
     if sender is None:
         return True
@@ -2231,7 +2242,9 @@ def command_message_search(argv: list[str]) -> int:
         return write_stderr("Error: --query is required\nCode: INVALID_ARG\n")
     channel = arg_value(argv, "--channel")
     sender = arg_value(argv, "--sender")
-    sort_mode = arg_value(argv, "--sort") or "relevance"
+    sort_mode, sort_error = parse_search_sort(argv)
+    if sort_error is not None:
+        return write_stderr(f"Error: {sort_error}\nCode: INVALID_ARG\n")
     before = arg_value(argv, "--before")
     after = arg_value(argv, "--after")
     limit, limit_error = parse_search_limit(argv)

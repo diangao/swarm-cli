@@ -441,6 +441,51 @@ def probe_search_and_resolve(cli: Path, state_dir: Path) -> None:
     require("bounded search body 4" in limited and "bounded search body 3" in limited, "bounded search did not include newest matching rows")
     require("bounded search body 0" not in limited and "bounded search body 2" not in limited, "bounded search leaked rows outside limit")
 
+    recent_sorted = run(
+        cli,
+        state_dir,
+        "message",
+        "search",
+        "--query",
+        limit_needle,
+        "--channel",
+        limit_target,
+        "--sort",
+        "recent",
+        "--limit",
+        "2",
+    ).stdout
+    require(f"Search results for: \"{limit_needle}\" (2 results, 2 of 5 total)" in recent_sorted, "recent search did not disclose total")
+    require("bounded search body 4" in recent_sorted and "bounded search body 3" in recent_sorted, "recent search did not return newest rows")
+
+    invalid_sort = run(
+        cli,
+        state_dir,
+        "message",
+        "search",
+        "--query",
+        limit_needle,
+        "--channel",
+        limit_target,
+        "--sort",
+        "alphabetical",
+        expected=1,
+    ).stderr
+    require("--sort must be one of: relevance, recent" in invalid_sort, "invalid search sort did not fail closed")
+    missing_sort = run(
+        cli,
+        state_dir,
+        "message",
+        "search",
+        "--query",
+        limit_needle,
+        "--channel",
+        limit_target,
+        "--sort",
+        expected=1,
+    ).stderr
+    require("--sort must be one of: relevance, recent" in missing_sort, "missing search sort value did not fail closed")
+
     invalid_limit = run(
         cli,
         state_dir,
