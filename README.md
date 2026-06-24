@@ -98,6 +98,11 @@ state, and records a returned Slack `ts` only after a successful response. The
 so plan rendering and ledger acknowledgement stay verifiable without network
 access. Failed Slack responses do not create `slack_messages` mappings.
 
+The sender assumes one adapter worker owns a given workspace/target stream. If
+multiple send workers are introduced, add an explicit "sending" reservation
+state before the Slack POST so two workers cannot both pass preflight and post
+the same swarm message before either one records Slack's returned timestamp.
+
 Together these commands define the process boundary for a later
 `swarm-slack-adapter` process to perform real Slack event subscription while
 swarm remains the state owner.
