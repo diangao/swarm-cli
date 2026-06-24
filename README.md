@@ -44,6 +44,7 @@ Current implemented surface:
 - `swarm slack ingest [--event-file ...]` to import a Slack message-event JSON payload into swarm state
 - `swarm slack resolve --workspace ... --channel-id ... --ts ...` to resolve a Slack message timestamp to its swarm target/message
 - `swarm slack outbound --workspace ... (--target ...|--message-id ...) [--after-seq ...]` to render Slack `chat.postMessage` request plans from canonical swarm messages
+- `swarm slack send --workspace ... (--target ...|--message-id ...) [--after-seq ...] [--mock-response-file ...]` to send rendered plans through Slack Web API and record successful returned timestamps
 - `swarm slack mark-sent --workspace ... --message-id ... --ts ... [--channel-id ...]` to persist the Slack timestamp returned by a later sender
 - `--content` rejection
 - local SQLite-backed persistence
@@ -61,9 +62,10 @@ remote execution backend.
 
 Slack is treated as an adapter input and UI surface, not as the canonical
 coordination store. The current seam accepts local Slack-style message-event
-JSON, stores workspace configuration by environment-variable name, and renders
-outbound request plans. It does not connect to Slack Web API, Events API, OAuth,
-Socket Mode, or real workspaces.
+JSON, stores workspace configuration by environment-variable name, renders
+outbound request plans, and includes a small Slack Web API sender for
+`chat.postMessage`. It does not implement Slack Events API subscription, OAuth,
+Socket Mode, or workspace provisioning.
 
 `swarm slack configure` persists only names such as `SLACK_BOT_TOKEN`; it never
 stores token or signing-secret values. `swarm slack env` shows the configured
@@ -88,9 +90,17 @@ acknowledgement seam for a future real sender: after Slack returns a `ts`, the
 adapter records that timestamp against the swarm message so later outbound
 plans skip messages that are already mapped.
 
-Together these commands define the local process boundary for a later
-`swarm-slack-adapter` process to perform real Slack authentication, event
-subscription, and message sending while swarm remains the state owner.
+`swarm slack send` is the real sender seam. It reads the bot token at call time
+from the configured environment-variable name, never writes the token value to
+state or output, calls Slack Web API only after rendering a plan from swarm
+state, and records a returned Slack `ts` only after a successful response. The
+`--mock-response-file` flag injects Slack-like JSON responses for offline tests,
+so plan rendering and ledger acknowledgement stay verifiable without network
+access. Failed Slack responses do not create `slack_messages` mappings.
+
+Together these commands define the process boundary for a later
+`swarm-slack-adapter` process to perform real Slack event subscription while
+swarm remains the state owner.
 
 ## Verify
 
@@ -133,5 +143,6 @@ persisted action-card preparation, and concurrent write serialization.
 It also checks Slack adapter root-message import, duplicate idempotence,
 thread-root fail-closed behavior, Slack-to-swarm resolve, inbox delivery,
 channel cataloging, workspace env-name configuration, outbound `chat.postMessage`
-plan rendering without network sends, mark-sent acknowledgement mapping, and
-persisted mapping rows.
+plan rendering without network sends, mocked Slack Web API send + mark-sent
+acknowledgement mapping, failed-send ledger protection, and persisted mapping
+rows.

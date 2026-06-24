@@ -41,6 +41,7 @@ def run(
     stdin: str | None = None,
     expected: int = 0,
     seed_fixtures: bool = True,
+    env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["SWARM_CANDIDATE_STATE_DIR"] = str(state_dir)
@@ -48,6 +49,8 @@ def run(
         env["SWARM_CANDIDATE_SEED_FIXTURES"] = "1"
     else:
         env.pop("SWARM_CANDIDATE_SEED_FIXTURES", None)
+    if env_overrides:
+        env.update(env_overrides)
     proc = subprocess.run(
         [str(cli), *args],
         input=stdin,
@@ -2092,6 +2095,111 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
     ).stdout
     require(f"Thread ts: {root_ts}" in thread_marked, "slack mark-sent thread did not persist root thread ts")
 
+    send_body = f"slack real-send seam {uuid.uuid4()}"
+    send_attempt = run(cli, state_dir, "message", "send", "--target", target, stdin=send_body).stdout
+    if "Freshness hold:" in send_attempt:
+        send_result = run(cli, state_dir, "message", "send", "--send-draft", "--target", target).stdout
+    else:
+        send_result = send_attempt
+    send_message_id = parse_message_id(send_result)
+    missing_token = run(
+        cli,
+        state_dir,
+        "slack",
+        "send",
+        "--workspace",
+        workspace,
+        "--message-id",
+        send_message_id,
+        expected=1,
+    ).stderr
+    require("SLACK_TOKEN_MISSING" in missing_token, "slack send without token did not fail closed")
+    require(bot_token_env in missing_token, "slack send missing-token error did not name env var")
+
+    send_ts = slack_ts(1762000060)
+    mock_ok_path = state_dir / "slack-send-ok.json"
+    mock_ok_path.write_text(json.dumps({"ok": True, "channel": channel_id, "ts": send_ts}))
+    fake_token = f"dummy-slack-token-{uuid.uuid4()}"
+    sent = run(
+        cli,
+        state_dir,
+        "slack",
+        "send",
+        "--workspace",
+        workspace,
+        "--message-id",
+        send_message_id,
+        "--mock-response-file",
+        str(mock_ok_path),
+        env_overrides={bot_token_env: fake_token},
+    ).stdout
+    require("## Slack Send (1 requests)" in sent, "slack send did not acknowledge one mocked send")
+    require("Mock Slack responses used; no network request was sent." in sent, "slack send did not report mock boundary")
+    require(f"Token source: {bot_token_env} (value not shown)" in sent, "slack send did not report token env name")
+    require(fake_token not in sent, "slack send leaked token value in stdout")
+    require(send_ts in sent and send_message_id in sent, "slack send did not report mapped message and ts")
+    after_send = run(
+        cli,
+        state_dir,
+        "slack",
+        "outbound",
+        "--workspace",
+        workspace,
+        "--message-id",
+        send_message_id,
+    ).stdout
+    require("## Slack Outbound Plan (0 requests)" in after_send, "slack send did not record mark-sent ledger")
+    send_resolved = run(
+        cli,
+        state_dir,
+        "slack",
+        "resolve",
+        "--workspace",
+        workspace,
+        "--channel-id",
+        channel_id,
+        "--ts",
+        send_ts,
+    ).stdout
+    require(send_message_id in send_resolved, "slack send mapping did not resolve by Slack ts")
+
+    failed_send_body = f"slack failed send seam {uuid.uuid4()}"
+    failed_attempt = run(cli, state_dir, "message", "send", "--target", target, stdin=failed_send_body).stdout
+    if "Freshness hold:" in failed_attempt:
+        failed_result = run(cli, state_dir, "message", "send", "--send-draft", "--target", target).stdout
+    else:
+        failed_result = failed_attempt
+    failed_send_id = parse_message_id(failed_result)
+    mock_fail_path = state_dir / "slack-send-fail.json"
+    mock_fail_path.write_text(json.dumps({"ok": False, "error": "ratelimited"}))
+    failed_send = run(
+        cli,
+        state_dir,
+        "slack",
+        "send",
+        "--workspace",
+        workspace,
+        "--message-id",
+        failed_send_id,
+        "--mock-response-file",
+        str(mock_fail_path),
+        expected=1,
+        env_overrides={bot_token_env: fake_token},
+    ).stderr
+    require("SLACK_SEND_FAILED" in failed_send and "ratelimited" in failed_send, "slack send failure did not surface Slack error")
+    require(fake_token not in failed_send, "slack send leaked token value in stderr")
+    failed_after = run(
+        cli,
+        state_dir,
+        "slack",
+        "outbound",
+        "--workspace",
+        workspace,
+        "--message-id",
+        failed_send_id,
+    ).stdout
+    require(len(outbound_plans(failed_after)) == 1, "failed slack send polluted mark-sent ledger")
+
     unmapped_target = f"#slack-unmapped-{uuid.uuid4().hex[:8]}"
     unmapped_body = f"unmapped slack outbound {uuid.uuid4()}"
     run(cli, state_dir, "channel", "join", unmapped_target)
@@ -2191,6 +2299,24 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
             any(row["thread_ts"] == root_ts and row["message_id"] == thread_outbound_id for row in outbound_mappings),
             "slack thread outbound mapping mismatch",
         )
+        send_mapping = conn.execute(
+            """
+            SELECT slack_ts, message_id
+            FROM slack_messages
+            WHERE workspace = ? AND channel_id = ? AND message_id = ?
+            """,
+            (workspace, channel_id, send_message_id),
+        ).fetchone()
+        require(send_mapping is not None and send_mapping["slack_ts"] == send_ts, "slack send did not persist successful mapping")
+        failed_mapping = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM slack_messages
+            WHERE workspace = ? AND message_id = ?
+            """,
+            (workspace, failed_send_id),
+        ).fetchone()
+        require(failed_mapping is not None and failed_mapping["count"] == 0, "failed slack send persisted a mapping")
         config = conn.execute(
             """
             SELECT bot_token_env, signing_secret_env
@@ -2237,7 +2363,7 @@ def main() -> int:
         probe_action_prepare(cli, state_dir)
         probe_slack_adapter(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, action prepare, and Slack adapter ingest/resolve/outbound")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, action prepare, and Slack adapter ingest/resolve/outbound/send")
     return 0
 
 
