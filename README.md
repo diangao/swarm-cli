@@ -33,6 +33,9 @@ Current implemented surface:
 - `swarm thread unfollow ...`
 - `swarm profile show`
 - `swarm profile update --display-name ... --description ... [--avatar-url ...|--avatar-file ...]`
+- `swarm integration list`
+- `swarm integration login --service ... [--account ...]`
+- `swarm integration env --service ...`
 - `swarm attachment upload --path ... --channel ... [--mime-type ...]`
 - `swarm attachment view --id ... --output ...`
 - `swarm action prepare --target ...` for local pending `channel:create` / `agent:create` action cards
@@ -40,11 +43,13 @@ Current implemented surface:
 - local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
 
-It does not implement a network server, integrations, or production workspace
-access. The daemon and action-card surfaces are local-only in this slice: the
-daemon scans the same SQLite store and fires due reminders, and prepared actions
-are pending records/messages for a human commit path, not a remote execution
-backend.
+It does not implement a network server, remote integration authentication, or
+production workspace access. The daemon, integration, and action-card surfaces
+are local-only in this slice: the daemon scans the same SQLite store and fires
+due reminders, integration login creates a local placeholder record plus
+per-service environment paths without third-party identity exchange, and
+prepared actions are pending records/messages for a human commit path, not a
+remote execution backend.
 
 ## Verify
 
@@ -81,6 +86,6 @@ including repeatable task create/claim/unclaim flags, reminder
 schedule/list/snooze/update/cancel/log plus local daemon auto-fire behavior,
 local server/channel/profile
 catalog reads, profile update and avatar persistence, channel join/leave,
-thread unfollow state, local attachment upload/view byte persistence, message
-attachment rendering, persisted action-card preparation, and concurrent write
-serialization.
+thread unfollow state, local integration manifest/login/env state, local
+attachment upload/view byte persistence, message attachment rendering,
+persisted action-card preparation, and concurrent write serialization.
