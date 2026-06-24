@@ -416,6 +416,77 @@ def probe_search_and_resolve(cli: Path, state_dir: Path) -> None:
     require("Next action:" in missing, "resolve missing id did not include recovery hint")
     require("doesnotexist" not in missing, "resolve missing id echoed unknown id")
 
+    limit_target = f"#search-limit-{uuid.uuid4().hex[:8]}"
+    limit_needle = f"searchlimit-{uuid.uuid4().hex}"
+    limit_bodies = [f"bounded search body {idx} {limit_needle} {uuid.uuid4()}" for idx in range(5)]
+    for body_text in limit_bodies:
+        run(cli, state_dir, "message", "send", "--target", limit_target, stdin=body_text)
+    with connect_state(state_dir) as conn:
+        before_invalid = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ?", (limit_target,)).fetchone()["count"]
+        require(before_invalid == 5, "search limit fixture did not persist all messages")
+
+    limited = run(
+        cli,
+        state_dir,
+        "message",
+        "search",
+        "--query",
+        limit_needle,
+        "--channel",
+        limit_target,
+        "--limit",
+        "2",
+    ).stdout
+    require(f"Search results for: \"{limit_needle}\" (2 results, 2 of 5 total)" in limited, "bounded search did not disclose total")
+    require("bounded search body 4" in limited and "bounded search body 3" in limited, "bounded search did not include newest matching rows")
+    require("bounded search body 0" not in limited and "bounded search body 2" not in limited, "bounded search leaked rows outside limit")
+
+    invalid_limit = run(
+        cli,
+        state_dir,
+        "message",
+        "search",
+        "--query",
+        limit_needle,
+        "--channel",
+        limit_target,
+        "--limit",
+        "0",
+        expected=1,
+    ).stderr
+    require("--limit must be a positive integer" in invalid_limit, "search limit 0 did not fail closed")
+    non_integer_limit = run(
+        cli,
+        state_dir,
+        "message",
+        "search",
+        "--query",
+        limit_needle,
+        "--channel",
+        limit_target,
+        "--limit",
+        "many",
+        expected=1,
+    ).stderr
+    require("--limit must be a positive integer" in non_integer_limit, "non-integer search limit did not fail closed")
+    too_large_limit = run(
+        cli,
+        state_dir,
+        "message",
+        "search",
+        "--query",
+        limit_needle,
+        "--channel",
+        limit_target,
+        "--limit",
+        "51",
+        expected=1,
+    ).stderr
+    require("--limit must be at most 50" in too_large_limit, "oversized search limit did not fail closed")
+    with connect_state(state_dir) as conn:
+        after_invalid = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ?", (limit_target,)).fetchone()["count"]
+        require(after_invalid == before_invalid, "invalid search limit mutated message rows")
+
 
 def probe_message_reactions(cli: Path, state_dir: Path) -> None:
     target = f"#react-{uuid.uuid4().hex[:8]}"
