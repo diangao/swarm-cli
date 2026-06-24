@@ -278,6 +278,7 @@ def probe_read_pagination(cli: Path, state_dir: Path) -> None:
     limited = run(cli, state_dir, "message", "read", "--channel", target, "--limit", "2").stdout
     require(bodies[2] in limited and bodies[3] in limited, "--limit 2 did not show the newest two records")
     require(bodies[0] not in limited and bodies[1] not in limited, "--limit 2 included records outside the window")
+    require("2 messages shown. 2 of 4 total." in limited, "--limit 2 did not disclose shown/total count")
 
     before = run(cli, state_dir, "message", "read", "--channel", target, "--before", sent_ids[2][:8]).stdout
     require(bodies[0] in before and bodies[1] in before, "--before short id did not show earlier records")
@@ -301,6 +302,7 @@ def probe_read_pagination(cli: Path, state_dir: Path) -> None:
     after = run(cli, state_dir, "message", "read", "--channel", target, "--after", sent_ids[1]).stdout
     require(bodies[2] in after and bodies[3] in after, "--after full id did not show later records")
     require(bodies[0] not in after and bodies[1] not in after, "--after included anchor or earlier records")
+    require("2 messages shown. 2 of 4 total." in after, "--after did not disclose shown/total count")
 
     around = run(cli, state_dir, "message", "read", "--channel", target, "--around", sent_ids[2]).stdout
     require(bodies[2] in around, "--around did not include anchor record")
@@ -311,6 +313,19 @@ def probe_read_pagination(cli: Path, state_dir: Path) -> None:
 
     invalid_limit = run(cli, state_dir, "message", "read", "--channel", target, "--limit", "0", expected=1).stderr
     require("--limit must be a positive integer" in invalid_limit, "invalid read limit did not fail closed")
+
+    overflow_target = f"#page-overflow-{uuid.uuid4().hex[:8]}"
+    overflow_bodies = [f"overflow body {idx:02d} {uuid.uuid4()}" for idx in range(23)]
+    for body in overflow_bodies:
+        run(cli, state_dir, "message", "send", "--target", overflow_target, stdin=body)
+    with connect_state(state_dir) as conn:
+        stored = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ?", (overflow_target,)).fetchone()["count"]
+        require(stored == 23, "overflow pagination fixture did not persist all messages")
+
+    default_window = run(cli, state_dir, "message", "read", "--channel", overflow_target).stdout
+    require("20 messages shown. 20 of 23 total." in default_window, "default read did not disclose truncated total")
+    require(overflow_bodies[0] not in default_window and overflow_bodies[2] not in default_window, "default read leaked older overflow records")
+    require(overflow_bodies[3] in default_window and overflow_bodies[22] in default_window, "default read did not show newest overflow window")
 
 
 def probe_read_known_empty_surfaces(cli: Path, state_dir: Path) -> None:

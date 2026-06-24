@@ -2095,8 +2095,9 @@ def command_message_read(argv: list[str]) -> int:
         if not known_surface(state, channel):
             return write_stderr(f"Error: Channel not found: {channel}\nCode: NOT_FOUND\n")
 
-        records = records_for_surface(state, channel)
-        records, anchor_error = bounded_records(records, argv, limit)
+        all_records = records_for_surface(state, channel)
+        total_records = len(all_records)
+        records, anchor_error = bounded_records(all_records, argv, limit)
         if anchor_error is not None:
             return write_stderr(f"Error: {anchor_error}\nCode: NOT_FOUND\n")
         if channel == "#general":
@@ -2112,7 +2113,8 @@ def command_message_read(argv: list[str]) -> int:
             header = f"## Message History for {channel} ({len(records)} messages)\n\n"
 
         if not records:
-            return write_stdout(f"## Message History for {channel} (0 messages)\n\n--- 0 messages shown. ---\n")
+            total_note = f" 0 of {total_records} total." if total_records else ""
+            return write_stdout(f"## Message History for {channel} (0 messages)\n\n--- 0 messages shown.{total_note} ---\n")
 
         before = records[0]["seq"]
         after = records[-1]["seq"]
@@ -2123,7 +2125,8 @@ def command_message_read(argv: list[str]) -> int:
                 int(after),
             )
         return write_stdout(
-            f"{header}{rows}\n\n--- {len(records)} messages shown. "
+            f"{header}{rows}\n\n--- {len(records)} messages shown."
+            f"{f' {len(records)} of {total_records} total.' if total_records != len(records) else ''} "
             f"Use before={before} to load older messages or after={after} to load newer messages. ---\n"
         )
 
