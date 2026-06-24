@@ -11,6 +11,7 @@ import hashlib
 import json
 import mimetypes
 import shutil
+import time
 from html import escape
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -1553,11 +1554,24 @@ def schedule_time_from_args(argv: list[str], absolute_flag: str = "--at", relati
     return None
 
 
+def parse_state_datetime(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        normalized = normalize_datetime_text(value)
+        try:
+            return datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+
 def append_message(
     state: dict[str, Any],
     target: str,
     body: str,
     attachments: list[dict[str, Any]] | None = None,
+    sender_type: str = "agent",
+    author: str = "candidate",
 ) -> dict[str, Any]:
     ensure_channel_catalog(state, target)
     attachments = attachments or []
@@ -1568,8 +1582,8 @@ def append_message(
         target,
         next_message_id(state),
         current_timestamp(),
-        "agent",
-        "candidate",
+        sender_type,
+        author,
         body.rstrip("\n"),
     )
     record["attachments"] = list(attachments)
@@ -1614,6 +1628,19 @@ def next_reminder_id(state: dict[str, Any]) -> str:
 def append_reminder_event(state: dict[str, Any], reminder_id: str, event: str, detail: str) -> None:
     state.setdefault("reminder_events", []).append(
         reminder_event_item(0, reminder_id, current_timestamp(), event, detail)
+    )
+
+
+def append_inbox_for_message(state: dict[str, Any], record: dict[str, Any]) -> None:
+    state.setdefault("local_inbox", []).append(
+        inbox_item(
+            record["target"],
+            record["id"],
+            record["time"],
+            record["type"],
+            record["author"],
+            record["body"],
+        )
     )
 
 
@@ -2508,6 +2535,120 @@ def command_reminder(argv: list[str]) -> int:
     return write_stderr(f"Error: unknown reminder subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
+def reminder_due(record: dict[str, Any], now_text: str) -> bool:
+    return record["status"] in {"scheduled", "snoozed"} and str(record["next_fire_at"]) <= now_text
+
+
+def fire_due_reminders(state: dict[str, Any]) -> int:
+    now = datetime.now()
+    now_text = now.strftime("%Y-%m-%d %H:%M:%S")
+    due = sorted(
+        [record for record in state.get("reminders", []) if reminder_due(record, now_text)],
+        key=lambda row: (str(row["next_fire_at"]), str(row["id"])),
+    )
+    fired = 0
+    for reminder in due:
+        detail_parts = [f"title={reminder['title']}"]
+        target = reminder.get("target")
+        if target:
+            body = f"Reminder {reminder['id']}: {reminder['title']}"
+            record = append_message(state, target, body, sender_type="system", author="system")
+            append_inbox_for_message(state, record)
+            detail_parts.append(f"target={target}")
+            detail_parts.append(f"message_id={record['id']}")
+        append_reminder_event(state, reminder["id"], "fired", " ".join(detail_parts))
+        fired += 1
+
+        recurrence = reminder.get("recurrence")
+        if recurrence:
+            delta = parse_duration(str(recurrence))
+            if delta is None or delta.total_seconds() <= 0:
+                reminder["status"] = "failed"
+                append_reminder_event(state, reminder["id"], "fire_failed", f"invalid recurrence={recurrence}")
+            else:
+                reminder["status"] = "scheduled"
+                anchor = parse_state_datetime(str(reminder["next_fire_at"])) or now
+                next_fire = anchor + delta
+                while next_fire <= now:
+                    next_fire += delta
+                reminder["next_fire_at"] = next_fire.strftime("%Y-%m-%d %H:%M:%S")
+                append_reminder_event(state, reminder["id"], "rescheduled", f"next={reminder['next_fire_at']}")
+        else:
+            reminder["status"] = "fired"
+        reminder["updated_at"] = current_timestamp()
+    return fired
+
+
+def process_due_reminders_once() -> int:
+    fired_count = 0
+
+    def action(state: dict[str, Any]) -> int:
+        nonlocal fired_count
+        fired_count = fire_due_reminders(state)
+        return 0
+
+    with_mutable_state(action)
+    return fired_count
+
+
+def parse_positive_int_arg(argv: list[str], flag: str) -> tuple[int | None, str | None]:
+    value = arg_value(argv, flag)
+    if value is None:
+        return None, None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None, f"{flag} must be a positive integer"
+    if parsed < 1:
+        return None, f"{flag} must be a positive integer"
+    return parsed, None
+
+
+def parse_poll_interval(argv: list[str]) -> tuple[float, str | None]:
+    value = arg_value(argv, "--poll-interval") or "5s"
+    delta = parse_duration(value)
+    if delta is None or delta.total_seconds() <= 0:
+        return 0.0, "--poll-interval must be a positive duration like 5s, 1m, 1h, or 1d"
+    return delta.total_seconds(), None
+
+
+def command_daemon_run(argv: list[str]) -> int:
+    interval_seconds, interval_error = parse_poll_interval(argv)
+    if interval_error is not None:
+        return write_stderr(f"Error: {interval_error}\nCode: INVALID_ARG\n")
+    max_iterations, max_error = parse_positive_int_arg(argv, "--max-iterations")
+    if max_error is not None:
+        return write_stderr(f"Error: {max_error}\nCode: INVALID_ARG\n")
+    if "--once" in argv:
+        max_iterations = 1
+
+    iterations = 0
+    total_fired = 0
+    try:
+        while True:
+            total_fired += process_due_reminders_once()
+            iterations += 1
+            if max_iterations is not None and iterations >= max_iterations:
+                return write_stdout(
+                    f"Daemon processed {total_fired} reminder(s) in {iterations} iteration(s).\n"
+                )
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        return write_stdout(
+            f"Daemon stopped. Processed {total_fired} reminder(s) in {iterations} iteration(s).\n"
+        )
+
+
+def command_daemon(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing daemon subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "run":
+        return command_daemon_run(rest)
+    return write_stderr(f"Error: unknown daemon subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def command_server_info() -> int:
     def action(state: dict[str, Any]) -> int:
         channels = sorted(state.get("channels", []), key=lambda row: row["name"])
@@ -2861,6 +3002,8 @@ def main(argv: list[str]) -> int:
         return command_task(argv[1:])
     if command == "reminder":
         return command_reminder(argv[1:])
+    if command == "daemon":
+        return command_daemon(argv[1:])
     if command == "server":
         return command_server(argv[1:])
     if command == "channel":
