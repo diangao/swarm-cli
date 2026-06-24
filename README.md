@@ -35,13 +35,16 @@ Current implemented surface:
 - `swarm profile update --display-name ... --description ... [--avatar-url ...|--avatar-file ...]`
 - `swarm attachment upload --path ... --channel ... [--mime-type ...]`
 - `swarm attachment view --id ... --output ...`
+- `swarm action prepare --target ...` for local pending `channel:create` / `agent:create` action cards
 - `--content` rejection
 - local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
 
 It does not implement a network server, integrations, or production workspace
-access. The daemon surface is local-only in this slice: it scans the same
-SQLite store and fires due reminders, but it is not a multi-machine backend.
+access. The daemon and action-card surfaces are local-only in this slice: the
+daemon scans the same SQLite store and fires due reminders, and prepared actions
+are pending records/messages for a human commit path, not a remote execution
+backend.
 
 ## Verify
 
@@ -79,4 +82,5 @@ schedule/list/snooze/update/cancel/log plus local daemon auto-fire behavior,
 local server/channel/profile
 catalog reads, profile update and avatar persistence, channel join/leave,
 thread unfollow state, local attachment upload/view byte persistence, message
-attachment rendering, and concurrent write serialization.
+attachment rendering, persisted action-card preparation, and concurrent write
+serialization.

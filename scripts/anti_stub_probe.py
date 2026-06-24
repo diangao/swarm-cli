@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -172,6 +173,12 @@ def parse_task_numbers(output: str) -> list[int]:
 def parse_reminder_id(output: str) -> str:
     match = re.search(r"Reminder (rem_[0-9a-f]{8})", output)
     require(match is not None, f"missing reminder id in output:\n{output}")
+    return match.group(1)
+
+
+def parse_action_id(output: str) -> str:
+    match = re.search(r"Action ID: (act_[0-9a-f]{8})", output)
+    require(match is not None, f"missing action id in output:\n{output}")
     return match.group(1)
 
 
@@ -796,10 +803,12 @@ def probe_daemon_reminder_fire(cli: Path, state_dir: Path) -> None:
             "--in",
             "0s",
         )
+    cli_target = f"#daemon-race-cli-{uuid.uuid4().hex[:8]}"
     cli_bodies = [f"daemon race cli body {index} {uuid.uuid4()}" for index in range(10)]
 
     def send_cli_body(body: str) -> None:
-        run(cli, state_dir, "message", "send", "--target", race_target, stdin=body)
+        sent = run(cli, state_dir, "message", "send", "--target", cli_target, stdin=body).stdout
+        require(f"Message sent to {cli_target}." in sent, "concurrent CLI send hit freshness hold or failed")
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(send_cli_body, body) for body in cli_bodies]
@@ -815,7 +824,7 @@ def probe_daemon_reminder_fire(cli: Path, state_dir: Path) -> None:
     conn = connect_state(state_dir)
     try:
         for body in cli_bodies:
-            row = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ? AND body = ?", (race_target, body)).fetchone()
+            row = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ? AND body = ?", (cli_target, body)).fetchone()
             require(row is not None and row["count"] == 1, "concurrent CLI write lost or duplicated a message")
         for title_item in race_titles:
             reminder_body = conn.execute(
@@ -823,8 +832,10 @@ def probe_daemon_reminder_fire(cli: Path, state_dir: Path) -> None:
                 (race_target, f"%{title_item}%"),
             ).fetchone()
             require(reminder_body is not None and reminder_body["count"] == 1, "concurrent daemon write lost or duplicated a reminder")
-        total = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ?", (race_target,)).fetchone()
-        require(total is not None and total["count"] == len(cli_bodies) + len(race_titles), "daemon/CLI concurrent total message count mismatch")
+        cli_total = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ?", (cli_target,)).fetchone()
+        reminder_total = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ?", (race_target,)).fetchone()
+        require(cli_total is not None and cli_total["count"] == len(cli_bodies), "daemon/CLI concurrent CLI total mismatch")
+        require(reminder_total is not None and reminder_total["count"] == len(race_titles), "daemon/CLI concurrent reminder total mismatch")
     finally:
         conn.close()
 
@@ -1068,6 +1079,121 @@ def probe_attachments(cli: Path, state_dir: Path) -> None:
     require("File not found" in missing_file, "missing upload path did not fail closed")
 
 
+def probe_action_prepare(cli: Path, state_dir: Path) -> None:
+    target = f"#actions-{uuid.uuid4().hex[:8]}"
+    channel_name = f"#prepared-{uuid.uuid4().hex[:8]}"
+    channel_payload = {
+        "type": "channel:create",
+        "name": channel_name,
+        "description": f"prepared channel {uuid.uuid4()}",
+        "private": False,
+    }
+    prepared = run(
+        cli,
+        state_dir,
+        "action",
+        "prepare",
+        "--target",
+        target,
+        stdin=json.dumps(channel_payload),
+    ).stdout
+    action_id = parse_action_id(prepared)
+    message_id = parse_message_id(prepared)
+    require(f"Action prepared in {target}." in prepared, "action prepare did not acknowledge target")
+
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(f"Action prepared {action_id} [channel:create]" in history, "action card message missing from history")
+    require(f"create public channel {channel_name}" in history, "action card summary missing channel target")
+    require("pending human commit" in history, "action card message missing pending status")
+
+    conn = connect_state(state_dir)
+    try:
+        row = conn.execute(
+            """
+            SELECT target, variant, payload_json, status, creator, message_id
+            FROM action_cards
+            WHERE id = ?
+            """,
+            (action_id,),
+        ).fetchone()
+        require(row is not None, "action card was not persisted")
+        require(row["target"] == target, "action card target mismatch")
+        require(row["variant"] == "channel:create", "action card variant mismatch")
+        require(row["status"] == "pending", "action card status mismatch")
+        require(row["creator"] == "candidate", "action card creator mismatch")
+        require(row["message_id"] == message_id, "action card message link mismatch")
+        payload = json.loads(row["payload_json"])
+        require(payload["type"] == "channel:create", "persisted action payload missing normalized type")
+        require(payload["name"] == channel_name, "persisted channel action payload name mismatch")
+        message = conn.execute("SELECT body FROM messages WHERE id = ?", (message_id,)).fetchone()
+        require(message is not None and action_id in message["body"], "action card message body was not persisted")
+        created_channel = conn.execute("SELECT name FROM channels WHERE name = ?", (channel_name,)).fetchone()
+        require(created_channel is None, "prepared channel:create action executed instead of staying pending")
+    finally:
+        conn.close()
+
+    agent_payload = {
+        "variant": "agent:create",
+        "name": "@artifact-bot",
+        "description": "state-backed action card probe",
+    }
+    agent_prepared = run(
+        cli,
+        state_dir,
+        "action",
+        "prepare",
+        "--target",
+        target,
+        stdin=json.dumps(agent_payload),
+    ).stdout
+    agent_action_id = parse_action_id(agent_prepared)
+    agent_history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(f"Action prepared {agent_action_id} [agent:create]" in agent_history, "agent action card missing from history")
+    require("create agent @artifact-bot" in agent_history, "agent action summary missing normalized agent name")
+    conn = connect_state(state_dir)
+    try:
+        row = conn.execute("SELECT payload_json FROM action_cards WHERE id = ?", (agent_action_id,)).fetchone()
+        require(row is not None, "agent action card was not persisted")
+        payload = json.loads(row["payload_json"])
+        require(payload["type"] == "agent:create", "agent action payload missing normalized type")
+        require(payload["name"] == "artifact-bot", "agent action payload did not strip @ prefix")
+        created_agent = conn.execute("SELECT name FROM profiles WHERE name = 'artifact-bot'").fetchone()
+        require(created_agent is None, "prepared agent:create action executed instead of staying pending")
+    finally:
+        conn.close()
+
+    invalid_variant = run(
+        cli,
+        state_dir,
+        "action",
+        "prepare",
+        "--target",
+        target,
+        stdin=json.dumps({"type": "workspace:delete", "name": "bad"}),
+        expected=1,
+    ).stderr
+    require("action type must be channel:create or agent:create" in invalid_variant, "invalid action variant did not fail closed")
+    invalid_json = run(
+        cli,
+        state_dir,
+        "action",
+        "prepare",
+        "--target",
+        target,
+        stdin="{not json",
+        expected=1,
+    ).stderr
+    require("invalid action JSON" in invalid_json, "invalid action JSON did not fail closed")
+    conn = connect_state(state_dir)
+    try:
+        bad_rows = conn.execute(
+            "SELECT COUNT(*) AS count FROM action_cards WHERE payload_json LIKE '%workspace:delete%'"
+        ).fetchone()
+        require(bad_rows is not None and bad_rows["count"] == 0, "invalid action prepare persisted a rejected card")
+    finally:
+        conn.close()
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -1089,8 +1215,9 @@ def main() -> int:
         probe_navigation_surfaces(cli, state_dir)
         probe_membership_attention(cli, state_dir)
         probe_attachments(cli, state_dir)
+        probe_action_prepare(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders/daemon fire, navigation, profile avatars, membership, and attachments")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders/daemon fire, navigation, profile avatars, membership, attachments, and action prepare")
     return 0
 
 
