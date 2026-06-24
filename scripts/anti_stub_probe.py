@@ -461,6 +461,50 @@ def probe_freshness_cursor(cli: Path, state_dir: Path) -> None:
     fresh_history = run(cli, state_dir, "message", "read", "--channel", fresh_target).stdout
     require(held_any_body in fresh_history, "any-channel send-draft did not append saved draft")
 
+    left_target = f"#left-draft-{uuid.uuid4().hex[:8]}"
+    run(cli, state_dir, "channel", "join", left_target)
+    left_fresh_body = f"left-channel fresh incoming {uuid.uuid4()}"
+    insert_freshness_blocker(state_dir, left_target, left_fresh_body)
+    left_draft_body = f"left-channel saved draft {uuid.uuid4()}"
+    left_hold = run(cli, state_dir, "message", "send", "--target", left_target, stdin=left_draft_body).stdout
+    require("Freshness hold:" in left_hold and "saved as a draft" in left_hold, "left-channel setup did not save draft")
+    run(cli, state_dir, "channel", "leave", left_target)
+    conn = connect_state(state_dir)
+    try:
+        before_left_draft_send = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE target = ? AND body = ?",
+            (left_target, left_draft_body),
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+    rejected_left_draft = run(
+        cli,
+        state_dir,
+        "message",
+        "send",
+        "--send-draft",
+        "--target",
+        left_target,
+        expected=1,
+    ).stderr
+    require("Not joined to target" in rejected_left_draft, "send-draft to left channel did not fail closed")
+    conn = connect_state(state_dir)
+    try:
+        after_left_draft_send = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE target = ? AND body = ?",
+            (left_target, left_draft_body),
+        ).fetchone()["count"]
+        draft_row = conn.execute("SELECT draft FROM freshness WHERE target = ?", (left_target,)).fetchone()
+        require(after_left_draft_send == before_left_draft_send, "failed send-draft appended message while channel was left")
+        require(draft_row is not None and draft_row["draft"], "failed send-draft cleared the saved draft")
+    finally:
+        conn.close()
+    run(cli, state_dir, "channel", "join", left_target)
+    sent_left_draft = run(cli, state_dir, "message", "send", "--send-draft", "--target", left_target).stdout
+    require(f"Message sent to {left_target}." in sent_left_draft, "send-draft after rejoin did not succeed")
+    left_history = run(cli, state_dir, "message", "read", "--channel", left_target).stdout
+    require(left_draft_body in left_history, "saved draft was not preserved after failed send-draft")
+
 
 def probe_wall_clock_timestamps(cli: Path, state_dir: Path) -> None:
     target = f"#timestamp-{uuid.uuid4().hex[:8]}"
@@ -1678,7 +1722,7 @@ def main() -> int:
         probe_attachments(cli, state_dir)
         probe_action_prepare(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
     return 0
 
 

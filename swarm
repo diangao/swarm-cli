@@ -2416,6 +2416,10 @@ def command_message_send(argv: list[str]) -> int:
 
     def action(state: dict[str, Any]) -> int:
         if "--send-draft" in argv:
+            if not target_allowed:
+                return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
+            if not target_joined_for_write(state, target):
+                return write_stderr(f"Error: Not joined to target: {target}\nCode: NOT_JOINED\n")
             draft = state.get("freshness", {}).get(target, {}).get("draft")
             if not draft:
                 return write_stderr("Error: No draft saved for target\nCode: NOT_FOUND\n")
