@@ -1625,6 +1625,14 @@ def task_by_message_id(state: dict[str, Any], channel: str, msg_id: str) -> dict
     return None
 
 
+def message_by_id_for_channel(state: dict[str, Any], channel: str, msg_id: str) -> dict[str, Any] | None:
+    for record in state.get("messages", []):
+        full_id = str(record["id"])
+        if record["target"] == channel and (full_id == msg_id or short_id(full_id) == msg_id):
+            return record
+    return None
+
+
 def channel_has_task_surface(state: dict[str, Any], channel: str) -> bool:
     if channel == "#missing-fixture":
         return False
@@ -1931,6 +1939,26 @@ def append_task(state: dict[str, Any], channel: str, title: str) -> dict[str, An
     state.setdefault("tasks", []).append(task)
     freshness = state.setdefault("freshness", {}).setdefault(channel, {"cursor": 0, "draft": None})
     freshness["cursor"] = record["seq"]
+    return task
+
+
+def append_task_from_message(state: dict[str, Any], channel: str, record: dict[str, Any]) -> dict[str, Any]:
+    number = int(state.get("next_task_number", 1))
+    state["next_task_number"] = number + 1
+    now = current_timestamp()
+    title = record["body"].strip() or "(empty message)"
+    task = task_item(
+        number,
+        channel,
+        title,
+        "todo",
+        record["author"],
+        None,
+        record["id"],
+        now,
+        now,
+    )
+    state.setdefault("tasks", []).append(task)
     return task
 
 
@@ -2517,13 +2545,18 @@ def resolve_task_arg(state: dict[str, Any], channel: str, argv: list[str]) -> di
     return None
 
 
-def resolve_task_args(
-    state: dict[str, Any], channel: str, argv: list[str]
-) -> tuple[list[dict[str, Any]], str | None]:
+def resolve_task_args(state: dict[str, Any], channel: str, argv: list[str]) -> tuple[list[dict[str, Any]], str | None]:
     tasks: list[dict[str, Any]] = []
     seen: set[int] = set()
     number_values = arg_values(argv, "--number")
     message_ids = arg_values(argv, "--message-id")
+
+    def add_task(task: dict[str, Any]) -> None:
+        number = int(task["number"])
+        if number not in seen:
+            tasks.append(task)
+            seen.add(number)
+
     if not number_values and not message_ids:
         task = resolve_task_arg(state, channel, argv)
         return ([task], None) if task is not None else ([], "Task not found")
@@ -2534,21 +2567,58 @@ def resolve_task_args(
             return [], "Task not found"
         if task is None:
             return [], "Task not found"
-        number = int(task["number"])
-        if number not in seen:
-            tasks.append(task)
-            seen.add(number)
+        add_task(task)
     for msg_id in message_ids:
         task = task_by_message_id(state, channel, msg_id)
         if task is None:
             return [], "Task not found"
-        number = int(task["number"])
-        if number not in seen:
-            tasks.append(task)
-            seen.add(number)
+        add_task(task)
     if not tasks:
         return [], "Task not found"
     return tasks, None
+
+
+def resolve_task_claim_targets(
+    state: dict[str, Any], channel: str, argv: list[str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+    tasks: list[dict[str, Any]] = []
+    pending_messages: list[dict[str, Any]] = []
+    seen_task_numbers: set[int] = set()
+    seen_message_ids: set[str] = set()
+    number_values = arg_values(argv, "--number")
+    message_ids = arg_values(argv, "--message-id")
+    if not number_values and not message_ids:
+        return [], [], "Task not found"
+
+    def add_task(task: dict[str, Any]) -> None:
+        number = int(task["number"])
+        if number not in seen_task_numbers:
+            tasks.append(task)
+            seen_task_numbers.add(number)
+
+    for value in number_values:
+        try:
+            task = task_by_number(state, channel, int(value))
+        except ValueError:
+            return [], [], "Task not found"
+        if task is None:
+            return [], [], "Task not found"
+        add_task(task)
+    for msg_id in message_ids:
+        task = task_by_message_id(state, channel, msg_id)
+        if task is not None:
+            add_task(task)
+            continue
+        record = message_by_id_for_channel(state, channel, msg_id)
+        if record is None:
+            return [], [], "Task not found"
+        record_id = str(record["id"])
+        if record_id not in seen_message_ids:
+            pending_messages.append(record)
+            seen_message_ids.add(record_id)
+    if not tasks and not pending_messages:
+        return [], [], "Task not found"
+    return tasks, pending_messages, None
 
 
 def command_task_claim(argv: list[str]) -> int:
@@ -2559,17 +2629,19 @@ def command_task_claim(argv: list[str]) -> int:
     def action(state: dict[str, Any]) -> int:
         if not channel_has_task_surface(state, channel):
             return write_stderr("Error: Agent or channel not found\nCode: CLAIM_FAILED\n")
-        tasks, error = resolve_task_args(state, channel, argv)
-        if error is not None:
-            return write_stderr(f"Error: {error}\nCode: NOT_FOUND\n")
         if freshness_blockers(state, channel):
             return render_task_freshness_hold(state, channel)
+        tasks, pending_messages, error = resolve_task_claim_targets(state, channel, argv)
+        if error is not None:
+            return write_stderr(f"Error: {error}\nCode: NOT_FOUND\n")
         for task in tasks:
             if task.get("assignee") and task["assignee"] != "candidate":
                 return write_stderr(
                     f"Error: task #{task['number']} is already claimed by @{task['assignee']}\n"
                     "Code: CLAIM_CONFLICT\n"
                 )
+        for record in pending_messages:
+            tasks.append(append_task_from_message(state, channel, record))
         for task in tasks:
             task["assignee"] = "candidate"
             if task["status"] == "todo":

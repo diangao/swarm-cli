@@ -16,7 +16,7 @@ Current implemented surface:
 - freshness-hold draft output across message targets with newer local context
 - `swarm task create --channel ... --title ... [--title ...]`
 - `swarm task list --channel ... [--status ...] [--assignee ...|--mine|--unassigned]`
-- `swarm task claim --channel ... --number ... [--number ...]`
+- `swarm task claim --channel ... (--number ...|--message-id ...) [...]`
 - `swarm task unclaim --channel ... --number ... [--number ...]`
 - `swarm task update --channel ... --number ... --status ...`
 - `swarm reminder schedule --title ... --at ...`

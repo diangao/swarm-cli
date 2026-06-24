@@ -791,6 +791,164 @@ def probe_task_lifecycle(cli: Path, state_dir: Path) -> None:
     finally:
         conn.close()
 
+    regular_body = f"claim this regular message {uuid.uuid4()}"
+    regular_id = parse_message_id(run(cli, state_dir, "message", "send", "--target", target, stdin=regular_body).stdout)
+    conn = connect_state(state_dir)
+    try:
+        before_message_claim_messages = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE target = ?",
+            (target,),
+        ).fetchone()["count"]
+        before_message_claim_tasks = conn.execute(
+            "SELECT COUNT(*) AS count FROM tasks WHERE channel = ?",
+            (target,),
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+
+    claimed_from_message = run(
+        cli,
+        state_dir,
+        "task",
+        "claim",
+        "--channel",
+        target,
+        "--message-id",
+        regular_id[:8],
+    ).stdout
+    message_task_number = parse_task_number(claimed_from_message)
+    require(
+        f"Task #{message_task_number} claimed by @candidate." in claimed_from_message,
+        "claiming a regular message did not acknowledge the created task",
+    )
+    converted_board = run(cli, state_dir, "task", "list", "--channel", target, "--mine").stdout
+    require(
+        f"#{message_task_number} [in_progress] {regular_body} → @candidate" in converted_board,
+        "task converted from regular message did not appear as claimed in board",
+    )
+    conn = connect_state(state_dir)
+    try:
+        after_message_claim_messages = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE target = ?",
+            (target,),
+        ).fetchone()["count"]
+        after_message_claim_tasks = conn.execute(
+            "SELECT COUNT(*) AS count FROM tasks WHERE channel = ?",
+            (target,),
+        ).fetchone()["count"]
+        converted = conn.execute(
+            """
+            SELECT number, title, status, creator, assignee, message_id
+            FROM tasks
+            WHERE channel = ? AND message_id = ?
+            """,
+            (target, regular_id),
+        ).fetchone()
+        require(
+            after_message_claim_messages == before_message_claim_messages,
+            "claiming a regular message appended an extra message instead of reusing the source message",
+        )
+        require(
+            after_message_claim_tasks == before_message_claim_tasks + 1,
+            "claiming a regular message did not create exactly one task row",
+        )
+        require(converted is not None, "converted task row missing from SQLite")
+        require(converted["number"] == message_task_number, "converted task number did not match acknowledgement")
+        require(converted["title"] == regular_body, "converted task title did not come from message body")
+        require(converted["status"] == "in_progress", "converted task was not claimed into in_progress")
+        require(converted["creator"] == "candidate", "converted task creator did not preserve message author")
+        require(converted["assignee"] == "candidate", "converted task assignee missing candidate")
+    finally:
+        conn.close()
+
+    duplicate_message_claim = run(
+        cli,
+        state_dir,
+        "task",
+        "claim",
+        "--channel",
+        target,
+        "--message-id",
+        regular_id,
+    ).stdout
+    require(
+        f"Task #{message_task_number} claimed by @candidate." in duplicate_message_claim,
+        "reclaiming converted message did not resolve existing task",
+    )
+    conn = connect_state(state_dir)
+    try:
+        duplicate_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM tasks WHERE channel = ? AND message_id = ?",
+            (target, regular_id),
+        ).fetchone()
+        require(duplicate_count["count"] == 1, "reclaiming converted message duplicated the task row")
+    finally:
+        conn.close()
+
+    thread_body = f"thread message should not become task {uuid.uuid4()}"
+    thread_target = f"{target}:{regular_id[:8]}"
+    thread_id = parse_message_id(run(cli, state_dir, "message", "send", "--target", thread_target, stdin=thread_body).stdout)
+    conn = connect_state(state_dir)
+    try:
+        before_thread_claim_tasks = conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE channel = ?", (target,)).fetchone()["count"]
+    finally:
+        conn.close()
+    rejected_thread_claim = run(
+        cli,
+        state_dir,
+        "task",
+        "claim",
+        "--channel",
+        target,
+        "--message-id",
+        thread_id,
+        expected=1,
+    ).stderr
+    require("Task not found" in rejected_thread_claim, "thread message claim did not fail closed")
+    conn = connect_state(state_dir)
+    try:
+        after_thread_claim_tasks = conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE channel = ?", (target,)).fetchone()["count"]
+        thread_task = conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE message_id = ?", (thread_id,)).fetchone()
+        require(after_thread_claim_tasks == before_thread_claim_tasks, "thread message claim changed task count")
+        require(thread_task["count"] == 0, "thread message claim created a task row")
+    finally:
+        conn.close()
+
+    conflict_body = f"conflict conversion must stay atomic {uuid.uuid4()}"
+    conflict_msg_id = parse_message_id(run(cli, state_dir, "message", "send", "--target", target, stdin=conflict_body).stdout)
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET assignee = 'alice' WHERE channel = ? AND number = ?",
+                (target, batch_number_1),
+            )
+        before_conflict_tasks = conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE channel = ?", (target,)).fetchone()["count"]
+    finally:
+        conn.close()
+    rejected_conflict_claim = run(
+        cli,
+        state_dir,
+        "task",
+        "claim",
+        "--channel",
+        target,
+        "--message-id",
+        conflict_msg_id,
+        "--number",
+        str(batch_number_1),
+        expected=1,
+    ).stderr
+    require("already claimed by @alice" in rejected_conflict_claim, "conflicting batch claim did not fail on existing assignee")
+    conn = connect_state(state_dir)
+    try:
+        after_conflict_tasks = conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE channel = ?", (target,)).fetchone()["count"]
+        conflict_task = conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE message_id = ?", (conflict_msg_id,)).fetchone()
+        require(after_conflict_tasks == before_conflict_tasks, "conflicting batch claim converted a message before failing")
+        require(conflict_task["count"] == 0, "conflicting batch claim left a converted task row")
+    finally:
+        conn.close()
+
 
 def probe_reminder_lifecycle(cli: Path, state_dir: Path) -> None:
     empty = run(cli, state_dir, "reminder", "list").stdout
@@ -1503,7 +1661,7 @@ def main() -> int:
         probe_attachments(cli, state_dir)
         probe_action_prepare(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks/task filters, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
     return 0
 
 
