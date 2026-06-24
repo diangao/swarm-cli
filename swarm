@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -165,6 +165,28 @@ def message_reaction_item(message_id: str, emoji: str, author: str, created_at: 
     }
 
 
+def action_card_item(
+    action_id: str,
+    target: str,
+    variant: str,
+    payload_json: str,
+    status: str,
+    creator: str,
+    message_id: str,
+    created_at: str,
+) -> dict[str, Any]:
+    return {
+        "id": action_id,
+        "target": target,
+        "variant": variant,
+        "payload_json": payload_json,
+        "status": status,
+        "creator": creator,
+        "message_id": message_id,
+        "created_at": created_at,
+    }
+
+
 def channel_item(name: str, private: bool, joined: bool, description: str) -> dict[str, Any]:
     return {
         "name": name,
@@ -259,6 +281,7 @@ EMPTY_STATE: dict[str, Any] = {
     "attachments": [],
     "message_attachments": [],
     "message_reactions": [],
+    "action_cards": [],
     "channels": [],
     "channel_members": [],
     "profiles": BASE_PROFILES,
@@ -377,6 +400,7 @@ SEED_STATE: dict[str, Any] = {
     "attachments": [],
     "message_attachments": [],
     "message_reactions": [],
+    "action_cards": [],
     "channels": SEED_CHANNELS,
     "channel_members": SEED_CHANNEL_MEMBERS,
     "profiles": SEED_PROFILES,
@@ -532,6 +556,20 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_message_reactions_message
             ON message_reactions(message_id);
+        CREATE TABLE IF NOT EXISTS action_cards (
+            id TEXT PRIMARY KEY,
+            target TEXT NOT NULL,
+            variant TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            creator TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_action_cards_target_created
+            ON action_cards(target, created_at);
+        CREATE INDEX IF NOT EXISTS idx_action_cards_message
+            ON action_cards(message_id);
         CREATE TABLE IF NOT EXISTS channels (
             name TEXT PRIMARY KEY,
             private INTEGER NOT NULL,
@@ -586,6 +624,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM reminders")
     conn.execute("DELETE FROM message_attachments")
     conn.execute("DELETE FROM message_reactions")
+    conn.execute("DELETE FROM action_cards")
     conn.execute("DELETE FROM attachments")
     conn.execute("DELETE FROM channel_members")
     conn.execute("DELETE FROM channels")
@@ -751,6 +790,25 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 reaction["created_at"],
             )
             for reaction in state.get("message_reactions", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO action_cards(id, target, variant, payload_json, status, creator, message_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                card["id"],
+                card["target"],
+                card["variant"],
+                card["payload_json"],
+                card["status"],
+                card["creator"],
+                card["message_id"],
+                card["created_at"],
+            )
+            for card in state.get("action_cards", [])
         ],
     )
     conn.executemany(
@@ -1000,6 +1058,25 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         reactions_by_message.setdefault(reaction["message_id"], []).append(reaction)
     for record in messages:
         record["reactions"] = reactions_by_message.get(record["id"], [])
+    action_cards = [
+        action_card_item(
+            row["id"],
+            row["target"],
+            row["variant"],
+            row["payload_json"],
+            row["status"],
+            row["creator"],
+            row["message_id"],
+            row["created_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT id, target, variant, payload_json, status, creator, message_id, created_at
+            FROM action_cards
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+    ]
     channels = [
         channel_item(
             row["name"],
@@ -1062,6 +1139,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "attachments": attachments,
         "message_attachments": message_attachments,
         "message_reactions": message_reactions,
+        "action_cards": action_cards,
         "channels": channels,
         "channel_members": channel_members,
         "profiles": profiles,
@@ -1623,6 +1701,14 @@ def next_reminder_id(state: dict[str, Any]) -> str:
         reminder_id = f"rem_{uuid.uuid4().hex[:8]}"
         if reminder_id not in existing:
             return reminder_id
+
+
+def next_action_id(state: dict[str, Any]) -> str:
+    existing = {record["id"] for record in state.get("action_cards", [])}
+    while True:
+        action_id = f"act_{uuid.uuid4().hex[:8]}"
+        if action_id not in existing:
+            return action_id
 
 
 def append_reminder_event(state: dict[str, Any], reminder_id: str, event: str, detail: str) -> None:
@@ -2887,6 +2973,117 @@ def command_profile(argv: list[str]) -> int:
     return write_stderr(f"Error: unknown profile subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
+def normalize_action_payload(raw_text: str) -> tuple[str, str, dict[str, Any] | None, str | None]:
+    if not raw_text.strip():
+        return "", "", None, "action JSON is required on stdin"
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return "", "", None, "invalid action JSON"
+    if not isinstance(payload, dict):
+        return "", "", None, "action JSON must be an object"
+
+    variant = payload.get("type") or payload.get("variant") or payload.get("action")
+    if variant not in {"channel:create", "agent:create"}:
+        return "", "", None, "action type must be channel:create or agent:create"
+
+    normalized = dict(payload)
+    normalized["type"] = variant
+    if variant == "channel:create":
+        channel_name = normalized.get("name") or normalized.get("channel")
+        if not isinstance(channel_name, str) or not channel_name.strip():
+            return "", "", None, "channel:create requires name"
+        channel_name = channel_name.strip()
+        if not channel_name.startswith("#") or ":" in channel_name:
+            return "", "", None, "channel:create name must be a top-level #channel"
+        normalized["name"] = channel_name
+        if "private" in normalized and not isinstance(normalized["private"], bool):
+            return "", "", None, "channel:create private must be boolean"
+        if "description" in normalized and not isinstance(normalized["description"], str):
+            return "", "", None, "channel:create description must be a string"
+    if variant == "agent:create":
+        agent_name = normalized.get("name") or normalized.get("agent")
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            return "", "", None, "agent:create requires name"
+        agent_name = agent_name.strip().removeprefix("@")
+        if any(char.isspace() for char in agent_name):
+            return "", "", None, "agent:create name must not contain whitespace"
+        normalized["name"] = agent_name
+        if "description" in normalized and not isinstance(normalized["description"], str):
+            return "", "", None, "agent:create description must be a string"
+
+    payload_json = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return str(variant), payload_json, normalized, None
+
+
+def action_summary(variant: str, payload: dict[str, Any]) -> str:
+    if variant == "channel:create":
+        visibility = "private" if payload.get("private") else "public"
+        description = payload.get("description")
+        suffix = f" - {description}" if isinstance(description, str) and description.strip() else ""
+        return f"create {visibility} channel {payload['name']}{suffix}"
+    if variant == "agent:create":
+        description = payload.get("description")
+        suffix = f" - {description}" if isinstance(description, str) and description.strip() else ""
+        return f"create agent @{payload['name']}{suffix}"
+    return variant
+
+
+def command_action_prepare(argv: list[str]) -> int:
+    target = arg_value(argv, "--target")
+    if target is None:
+        return write_stderr("Error: --target is required\nCode: INVALID_ARG\n")
+    if not (target.startswith("#") or target.startswith("dm:@")):
+        return write_stderr("Error: action target must be a channel, thread, or DM\nCode: INVALID_TARGET\n")
+
+    raw_text = sys.stdin.read()
+    variant, payload_json, payload, error = normalize_action_payload(raw_text)
+    if error is not None or payload is None:
+        return write_stderr(f"Error: {error}\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if not target_joined_for_write(state, target):
+            return write_stderr(f"Error: Not joined to target: {target}\nCode: NOT_JOINED\n")
+        ensure_channel_catalog(state, target)
+        action_id = next_action_id(state)
+        body = (
+            f"Action prepared {action_id} [{variant}]\n"
+            f"Summary: {action_summary(variant, payload)}\n"
+            "Status: pending human commit"
+        )
+        record = append_message(state, target, body)
+        created_at = current_timestamp()
+        state.setdefault("action_cards", []).append(
+            action_card_item(
+                action_id,
+                target,
+                variant,
+                payload_json,
+                "pending",
+                "candidate",
+                record["id"],
+                created_at,
+            )
+        )
+        if target in state.get("freshness", {}):
+            state["freshness"][target]["cursor"] = record["seq"]
+        return write_stdout(
+            f"Action prepared in {target}. Action ID: {action_id}. Message ID: {record['id']}\n"
+        )
+
+    return with_mutable_state(action)
+
+
+def command_action(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing action subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "prepare":
+        return command_action_prepare(rest)
+    return write_stderr(f"Error: unknown action subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def command_attachment_upload(argv: list[str]) -> int:
     path_text = arg_value(argv, "--path")
     channel = arg_value(argv, "--channel")
@@ -3012,6 +3209,8 @@ def main(argv: list[str]) -> int:
         return command_thread(argv[1:])
     if command == "profile":
         return command_profile(argv[1:])
+    if command == "action":
+        return command_action(argv[1:])
     if command == "attachment":
         return command_attachment(argv[1:])
     return write_stderr(f"Error: unknown command: {command}\nCode: INVALID_ARG\n")
