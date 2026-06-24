@@ -1194,6 +1194,136 @@ def probe_action_prepare(cli: Path, state_dir: Path) -> None:
         conn.close()
 
 
+def probe_integration_local_login(cli: Path, state_dir: Path) -> None:
+    initial = run(cli, state_dir, "integration", "list").stdout
+    require("github" in initial, "integration list did not render registered services")
+    require("no local record" in initial, "initial integration list did not show missing local login state")
+    require("remote authentication" in initial, "integration list did not state local-only auth boundary")
+
+    missing_env = run(
+        cli,
+        state_dir,
+        "integration",
+        "env",
+        "--service",
+        "github",
+        expected=1,
+    ).stderr
+    require("Local integration record not found for github" in missing_env, "env before login did not fail closed")
+
+    before_unknown_rows = None
+    conn = connect_state(state_dir)
+    try:
+        before_unknown_rows = conn.execute("SELECT COUNT(*) AS count FROM integration_logins").fetchone()["count"]
+    finally:
+        conn.close()
+
+    unknown = run(
+        cli,
+        state_dir,
+        "integration",
+        "login",
+        "--service",
+        "unknown-service",
+        expected=1,
+    ).stderr
+    require("Unknown integration service" in unknown, "unknown integration login did not fail closed")
+    conn = connect_state(state_dir)
+    try:
+        after_unknown_rows = conn.execute("SELECT COUNT(*) AS count FROM integration_logins").fetchone()["count"]
+        require(after_unknown_rows == before_unknown_rows, "unknown integration login persisted state")
+    finally:
+        conn.close()
+
+    missing_service = run(cli, state_dir, "integration", "login", expected=1).stderr
+    require("--service is required" in missing_service, "missing integration service did not fail closed")
+
+    account = f"acct-{uuid.uuid4().hex[:8]}"
+    login = run(
+        cli,
+        state_dir,
+        "integration",
+        "login",
+        "--service",
+        "github",
+        "--account",
+        account,
+    ).stdout
+    require("Local integration record created for github" in login, "login did not create local integration record")
+    require("Remote authentication was not performed" in login, "login output did not state no remote auth")
+    require("login ready" not in login.lower(), "login output implied real auth readiness")
+    require("logged in" not in login.lower(), "login output implied real auth happened")
+
+    listed = run(cli, state_dir, "integration", "list").stdout
+    require(f"github (third_party, local record present, account={account}" in listed, "list did not read login state")
+    require("no local record" in listed, "list should still show unlogged services distinctly")
+
+    env = run(cli, state_dir, "integration", "env", "--service", "github").stdout
+    require("no remote credentials are provisioned" in env, "env output did not state local-only boundary")
+    require("SWARM_INTEGRATION_SERVICE=github" in env, "env did not read service login state")
+    require("SWARM_INTEGRATION_STATUS=local_placeholder" in env, "env did not read login status")
+    require(f"SWARM_INTEGRATION_ACCOUNT={account}" in env, "env did not read login account")
+    require("XDG_CONFIG_HOME=" in env and "XDG_DATA_HOME=" in env, "env missing isolated XDG paths")
+
+    conn = connect_state(state_dir)
+    try:
+        row = conn.execute(
+            """
+            SELECT service, status, account, local_home, created_at, updated_at
+            FROM integration_logins
+            WHERE service = 'github'
+            """
+        ).fetchone()
+        require(row is not None, "integration login row was not persisted")
+        require(row["status"] == "local_placeholder", "integration login status mismatch")
+        require(row["account"] == account, "integration login account mismatch")
+        require(Path(row["local_home"]).is_dir(), "integration local HOME directory was not created")
+        require((Path(row["local_home"]).parent / "config").is_dir(), "integration config directory missing")
+        first_created = row["created_at"]
+    finally:
+        conn.close()
+
+    repeat = run(
+        cli,
+        state_dir,
+        "integration",
+        "login",
+        "--service",
+        "github",
+        "--account",
+        account,
+    ).stdout
+    require("already exists" in repeat, "repeat login was not idempotent")
+    conn = connect_state(state_dir)
+    try:
+        rows = conn.execute(
+            "SELECT COUNT(*) AS count, MIN(created_at) AS created FROM integration_logins WHERE service = 'github'"
+        ).fetchone()
+        require(rows["count"] == 1, "repeat login duplicated integration state")
+        require(rows["created"] == first_created, "repeat login rewrote created_at")
+    finally:
+        conn.close()
+
+    conflict = run(
+        cli,
+        state_dir,
+        "integration",
+        "login",
+        "--service",
+        "github",
+        "--account",
+        f"other-{uuid.uuid4().hex[:6]}",
+        expected=1,
+    ).stderr
+    require("already exists for github" in conflict, "conflicting relogin did not fail closed")
+    conn = connect_state(state_dir)
+    try:
+        rows = conn.execute("SELECT COUNT(*) AS count FROM integration_logins WHERE service = 'github'").fetchone()
+        require(rows["count"] == 1, "conflicting relogin changed integration row count")
+    finally:
+        conn.close()
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -1214,10 +1344,11 @@ def main() -> int:
         probe_daemon_reminder_fire(cli, state_dir)
         probe_navigation_surfaces(cli, state_dir)
         probe_membership_attention(cli, state_dir)
+        probe_integration_local_login(cli, state_dir)
         probe_attachments(cli, state_dir)
         probe_action_prepare(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders/daemon fire, navigation, profile avatars, membership, attachments, and action prepare")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
     return 0
 
 

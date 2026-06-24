@@ -11,6 +11,7 @@ import hashlib
 import json
 import mimetypes
 import shutil
+import shlex
 import time
 from html import escape
 from copy import deepcopy
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -187,6 +188,40 @@ def action_card_item(
     }
 
 
+def integration_service_item(
+    name: str,
+    kind: str,
+    description: str,
+    manifest_json: str,
+    requires_local_env: bool,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "kind": kind,
+        "description": description,
+        "manifest_json": manifest_json,
+        "requires_local_env": requires_local_env,
+    }
+
+
+def integration_login_item(
+    service: str,
+    status: str,
+    account: str,
+    local_home: str,
+    created_at: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    return {
+        "service": service,
+        "status": status,
+        "account": account,
+        "local_home": local_home,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
 def channel_item(name: str, private: bool, joined: bool, description: str) -> dict[str, Any]:
     return {
         "name": name,
@@ -265,6 +300,31 @@ BASE_PROFILES = [
 ]
 
 
+BASE_INTEGRATION_SERVICES = [
+    integration_service_item(
+        "github",
+        "third_party",
+        "Local manifest entry for GitHub-oriented CLI experiments",
+        json.dumps({"remote_auth": False, "local_env": True}, sort_keys=True, separators=(",", ":")),
+        True,
+    ),
+    integration_service_item(
+        "calendar",
+        "builtin",
+        "Local manifest entry for calendar-oriented CLI experiments",
+        json.dumps({"remote_auth": False, "local_env": True}, sort_keys=True, separators=(",", ":")),
+        True,
+    ),
+    integration_service_item(
+        "drive",
+        "builtin",
+        "Local manifest entry for drive-oriented CLI experiments",
+        json.dumps({"remote_auth": False, "local_env": True}, sort_keys=True, separators=(",", ":")),
+        True,
+    ),
+]
+
+
 EMPTY_STATE: dict[str, Any] = {
     "schema_version": SCHEMA_VERSION,
     "next_seq": 1,
@@ -282,6 +342,8 @@ EMPTY_STATE: dict[str, Any] = {
     "message_attachments": [],
     "message_reactions": [],
     "action_cards": [],
+    "integration_services": BASE_INTEGRATION_SERVICES,
+    "integration_logins": [],
     "channels": [],
     "channel_members": [],
     "profiles": BASE_PROFILES,
@@ -401,6 +463,8 @@ SEED_STATE: dict[str, Any] = {
     "message_attachments": [],
     "message_reactions": [],
     "action_cards": [],
+    "integration_services": BASE_INTEGRATION_SERVICES,
+    "integration_logins": [],
     "channels": SEED_CHANNELS,
     "channel_members": SEED_CHANNEL_MEMBERS,
     "profiles": SEED_PROFILES,
@@ -570,6 +634,21 @@ def create_schema(conn: sqlite3.Connection) -> None:
             ON action_cards(target, created_at);
         CREATE INDEX IF NOT EXISTS idx_action_cards_message
             ON action_cards(message_id);
+        CREATE TABLE IF NOT EXISTS integration_services (
+            name TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            description TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            requires_local_env INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS integration_logins (
+            service TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            account TEXT NOT NULL,
+            local_home TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS channels (
             name TEXT PRIMARY KEY,
             private INTEGER NOT NULL,
@@ -625,6 +704,8 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM message_attachments")
     conn.execute("DELETE FROM message_reactions")
     conn.execute("DELETE FROM action_cards")
+    conn.execute("DELETE FROM integration_logins")
+    conn.execute("DELETE FROM integration_services")
     conn.execute("DELETE FROM attachments")
     conn.execute("DELETE FROM channel_members")
     conn.execute("DELETE FROM channels")
@@ -813,6 +894,39 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     )
     conn.executemany(
         """
+        INSERT INTO integration_services(name, kind, description, manifest_json, requires_local_env)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                service["name"],
+                service["kind"],
+                service["description"],
+                service["manifest_json"],
+                1 if service.get("requires_local_env") else 0,
+            )
+            for service in state.get("integration_services", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO integration_logins(service, status, account, local_home, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                login["service"],
+                login["status"],
+                login["account"],
+                login["local_home"],
+                login["created_at"],
+                login["updated_at"],
+            )
+            for login in state.get("integration_logins", [])
+        ],
+    )
+    conn.executemany(
+        """
         INSERT INTO channels(name, private, joined, description)
         VALUES (?, ?, ?, ?)
         """,
@@ -890,6 +1004,21 @@ def ensure_base_catalog(conn: sqlite3.Connection) -> None:
                 row["description"],
                 row.get("avatar_url"),
                 row.get("avatar_file"),
+            ),
+        )
+    for row in BASE_INTEGRATION_SERVICES:
+        conn.execute(
+            """
+            INSERT INTO integration_services(name, kind, description, manifest_json, requires_local_env)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO NOTHING
+            """,
+            (
+                row["name"],
+                row["kind"],
+                row["description"],
+                row["manifest_json"],
+                1 if row.get("requires_local_env") else 0,
             ),
         )
 
@@ -1077,6 +1206,39 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    integration_services = [
+        integration_service_item(
+            row["name"],
+            row["kind"],
+            row["description"],
+            row["manifest_json"],
+            bool(row["requires_local_env"]),
+        )
+        for row in conn.execute(
+            """
+            SELECT name, kind, description, manifest_json, requires_local_env
+            FROM integration_services
+            ORDER BY name
+            """
+        ).fetchall()
+    ]
+    integration_logins = [
+        integration_login_item(
+            row["service"],
+            row["status"],
+            row["account"],
+            row["local_home"],
+            row["created_at"],
+            row["updated_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT service, status, account, local_home, created_at, updated_at
+            FROM integration_logins
+            ORDER BY service
+            """
+        ).fetchall()
+    ]
     channels = [
         channel_item(
             row["name"],
@@ -1140,6 +1302,8 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "message_attachments": message_attachments,
         "message_reactions": message_reactions,
         "action_cards": action_cards,
+        "integration_services": integration_services,
+        "integration_logins": integration_logins,
         "channels": channels,
         "channel_members": channel_members,
         "profiles": profiles,
@@ -1269,6 +1433,20 @@ def format_channel_row(record: dict[str, Any]) -> str:
     return f"- {record['name']} ({visibility}, {joined}){description}"
 
 
+def format_integration_row(service: dict[str, Any], login: dict[str, Any] | None) -> str:
+    if login is None:
+        status = "no local record"
+        suffix = ""
+    else:
+        status = f"local record present, account={login['account']}"
+        suffix = f" local_home={login['local_home']}"
+    env_label = "local env" if service.get("requires_local_env") else "no local env"
+    return (
+        f"- {service['name']} ({service['kind']}, {status}, {env_label})"
+        f" - {service['description']}{suffix}"
+    )
+
+
 def member_display(record: dict[str, Any]) -> str:
     parts = [f"@{record['name']}"]
     if record.get("role"):
@@ -1369,6 +1547,44 @@ def profile_by_name(state: dict[str, Any], name: str) -> dict[str, Any] | None:
         if record["name"] == normalized:
             return record
     return None
+
+
+def valid_service_name(name: str) -> bool:
+    if not name:
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+    return name[0].islower() and all(char in allowed for char in name)
+
+
+def integration_service_by_name(state: dict[str, Any], name: str) -> dict[str, Any] | None:
+    for record in state.get("integration_services", []):
+        if record["name"] == name:
+            return record
+    return None
+
+
+def integration_login_by_service(state: dict[str, Any], service: str) -> dict[str, Any] | None:
+    for record in state.get("integration_logins", []):
+        if record["service"] == service:
+            return record
+    return None
+
+
+def integration_profile_root(service: str) -> Path:
+    return state_dir() / "integrations" / service
+
+
+def ensure_integration_profile_dirs(service: str) -> dict[str, str]:
+    root = integration_profile_root(service)
+    paths = {
+        "HOME": root / "home",
+        "XDG_CONFIG_HOME": root / "config",
+        "XDG_DATA_HOME": root / "data",
+        "XDG_CACHE_HOME": root / "cache",
+    }
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return {key: str(path) for key, path in paths.items()}
 
 
 def tasks_for_channel(state: dict[str, Any], channel: str) -> list[dict[str, Any]]:
@@ -2973,6 +3189,138 @@ def command_profile(argv: list[str]) -> int:
     return write_stderr(f"Error: unknown profile subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
+def service_from_args(argv: list[str]) -> str | None:
+    service = arg_value(argv, "--service")
+    if service is None and argv and not argv[0].startswith("--"):
+        service = argv[0]
+    if service is None:
+        return None
+    return service.strip()
+
+
+def command_integration_list(argv: list[str]) -> int:
+    def action(state: dict[str, Any]) -> int:
+        logins = {login["service"]: login for login in state.get("integration_logins", [])}
+        services = sorted(state.get("integration_services", []), key=lambda row: row["name"])
+        rows = "\n".join(format_integration_row(service, logins.get(service["name"])) for service in services)
+        if not rows:
+            rows = "No integration manifests registered."
+        return write_stdout(
+            "## Integrations\n\n"
+            "Local manifests only; remote authentication and third-party identity exchange are not implemented.\n\n"
+            f"{rows}\n"
+        )
+
+    return with_read_state(action)
+
+
+def command_integration_login(argv: list[str]) -> int:
+    service_name = service_from_args(argv)
+    if service_name is None:
+        return write_stderr("Error: --service is required\nCode: INVALID_ARG\n")
+    if not valid_service_name(service_name):
+        return write_stderr("Error: invalid service name\nCode: INVALID_ARG\n")
+    account = arg_value(argv, "--account") or "local-placeholder"
+    if not account.strip():
+        return write_stderr("Error: --account must be non-empty\nCode: INVALID_ARG\n")
+    account = account.strip()
+
+    def action(state: dict[str, Any]) -> int:
+        service = integration_service_by_name(state, service_name)
+        if service is None:
+            return write_stderr(f"Error: Unknown integration service: {service_name}\nCode: NOT_FOUND\n")
+        existing = integration_login_by_service(state, service_name)
+        if existing is not None:
+            if existing["account"] != account and account != "local-placeholder":
+                return write_stderr(
+                    f"Error: Local integration record already exists for {service_name} "
+                    f"with account {existing['account']}\n"
+                    "Code: UPDATE_FAILED\n"
+                )
+            return write_stdout(
+                f"Local integration record already exists for {service_name}.\n"
+                "Remote authentication was not performed.\n"
+                f"Status: {existing['status']}\n"
+            )
+
+        env_paths = ensure_integration_profile_dirs(service_name)
+        now = current_timestamp()
+        state.setdefault("integration_logins", []).append(
+            integration_login_item(
+                service_name,
+                "local_placeholder",
+                account,
+                env_paths["HOME"],
+                now,
+                now,
+            )
+        )
+        return write_stdout(
+            f"Local integration record created for {service_name}.\n"
+            "Remote authentication was not performed.\n"
+            "Status: local_placeholder\n"
+            f"Local home: {env_paths['HOME']}\n"
+        )
+
+    return with_mutable_state(action)
+
+
+def command_integration_env(argv: list[str]) -> int:
+    service_name = service_from_args(argv)
+    if service_name is None:
+        return write_stderr("Error: --service is required\nCode: INVALID_ARG\n")
+    if not valid_service_name(service_name):
+        return write_stderr("Error: invalid service name\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        service = integration_service_by_name(state, service_name)
+        if service is None:
+            return write_stderr(f"Error: Unknown integration service: {service_name}\nCode: NOT_FOUND\n")
+        login = integration_login_by_service(state, service_name)
+        if login is None:
+            return write_stderr(
+                f"Error: Local integration record not found for {service_name}\n"
+                "Code: NOT_FOUND\n"
+                f"Next action: create one with swarm integration login --service {service_name}\n"
+            )
+        if not service.get("requires_local_env"):
+            return write_stdout(
+                f"No local environment is required for {service_name}.\n"
+                f"Status: {login['status']}\n"
+            )
+        root = Path(login["local_home"]).parent
+        env = {
+            "SWARM_INTEGRATION_SERVICE": service_name,
+            "SWARM_INTEGRATION_STATUS": login["status"],
+            "SWARM_INTEGRATION_ACCOUNT": login["account"],
+            "HOME": str(root / "home"),
+            "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_DATA_HOME": str(root / "data"),
+            "XDG_CACHE_HOME": str(root / "cache"),
+        }
+        lines = [
+            "# Local integration environment only; no remote credentials are provisioned.",
+            *[f"export {key}={shlex.quote(value)}" for key, value in env.items()],
+        ]
+        return write_stdout("\n".join(lines) + "\n")
+
+    return with_read_state(action)
+
+
+def command_integration(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing integration subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "list":
+        return command_integration_list(rest)
+    if subcommand == "login":
+        return command_integration_login(rest)
+    if subcommand == "env":
+        return command_integration_env(rest)
+    return write_stderr(f"Error: unknown integration subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def normalize_action_payload(raw_text: str) -> tuple[str, str, dict[str, Any] | None, str | None]:
     if not raw_text.strip():
         return "", "", None, "action JSON is required on stdin"
@@ -3209,6 +3557,8 @@ def main(argv: list[str]) -> int:
         return command_thread(argv[1:])
     if command == "profile":
         return command_profile(argv[1:])
+    if command == "integration":
+        return command_integration(argv[1:])
     if command == "action":
         return command_action(argv[1:])
     if command == "attachment":
