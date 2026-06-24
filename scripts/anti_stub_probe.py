@@ -636,6 +636,161 @@ def probe_task_lifecycle(cli: Path, state_dir: Path) -> None:
         "batch unclaim did not clear second assignee",
     )
 
+    conn = connect_state(state_dir)
+    try:
+        before_filter_rows = [
+            (row["number"], row["status"], row["assignee"])
+            for row in conn.execute(
+                "SELECT number, status, assignee FROM tasks WHERE channel = ? ORDER BY number",
+                (target,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    done_filter = run(cli, state_dir, "task", "list", "--channel", target, "--status", "done").stdout
+    require(f"#{number} [done] {title} → @candidate" in done_filter, "status=done filter missed done task")
+    require(batch_title_1 not in done_filter and batch_title_2 not in done_filter, "status=done filter leaked in-progress tasks")
+
+    unassigned_filter = run(
+        cli,
+        state_dir,
+        "task",
+        "list",
+        "--channel",
+        target,
+        "--status",
+        "in_progress",
+        "--unassigned",
+    ).stdout
+    require(
+        f"#{batch_number_1} [in_progress] {batch_title_1} (by @candidate)" in unassigned_filter,
+        "unassigned filter missed first unassigned in-progress task",
+    )
+    require(
+        f"#{batch_number_2} [in_progress] {batch_title_2} (by @candidate)" in unassigned_filter,
+        "unassigned filter missed second unassigned in-progress task",
+    )
+    require(title not in unassigned_filter, "unassigned filter leaked assigned task")
+
+    mine_filter = run(cli, state_dir, "task", "list", "--channel", target, "--mine").stdout
+    require(f"#{number} [done] {title} → @candidate" in mine_filter, "mine filter missed candidate task")
+    require(batch_title_1 not in mine_filter and batch_title_2 not in mine_filter, "mine filter leaked unassigned tasks")
+
+    assignee_filter = run(cli, state_dir, "task", "list", "--channel", target, "--assignee", "@candidate").stdout
+    require(assignee_filter == mine_filter, "assignee @candidate filter did not match --mine")
+
+    repeated_status_filter = run(
+        cli,
+        state_dir,
+        "task",
+        "list",
+        "--channel",
+        target,
+        "--status",
+        "done",
+        "--status",
+        "in_progress",
+    ).stdout
+    require(f"## Task Board for {target} (3 tasks)" in repeated_status_filter, "repeated status filter did not union statuses")
+    require(title in repeated_status_filter and batch_title_1 in repeated_status_filter and batch_title_2 in repeated_status_filter, "repeated status filter omitted a matching task")
+
+    no_match_filter = run(cli, state_dir, "task", "list", "--channel", target, "--status", "todo", "--mine").stdout
+    require("## Task Board" in no_match_filter and "No matching tasks." in no_match_filter, "filtered empty board did not distinguish no matches")
+
+    invalid_filter = run(
+        cli,
+        state_dir,
+        "task",
+        "list",
+        "--channel",
+        target,
+        "--status",
+        "blocked",
+        expected=1,
+    ).stderr
+    require("--status must be one of" in invalid_filter, "invalid task list status did not fail closed")
+
+    missing_status_value = run(
+        cli,
+        state_dir,
+        "task",
+        "list",
+        "--channel",
+        target,
+        "--status",
+        expected=1,
+    ).stderr
+    require("--status must be one of" in missing_status_value, "missing task list status value did not fail closed")
+
+    missing_assignee_value = run(
+        cli,
+        state_dir,
+        "task",
+        "list",
+        "--channel",
+        target,
+        "--assignee",
+        expected=1,
+    ).stderr
+    require("--assignee requires a value" in missing_assignee_value, "missing task list assignee value did not fail closed")
+
+    conflicting_filter = run(
+        cli,
+        state_dir,
+        "task",
+        "list",
+        "--channel",
+        target,
+        "--mine",
+        "--unassigned",
+        expected=1,
+    ).stderr
+    require("--mine cannot be combined with --unassigned" in conflicting_filter, "conflicting task list filters did not fail closed")
+
+    conflicting_assignee_filter = run(
+        cli,
+        state_dir,
+        "task",
+        "list",
+        "--channel",
+        target,
+        "--assignee",
+        "@candidate",
+        "--unassigned",
+        expected=1,
+    ).stderr
+    require(
+        "--assignee cannot be combined with --unassigned" in conflicting_assignee_filter,
+        "assignee/unassigned task list filters did not fail closed",
+    )
+
+    conn = connect_state(state_dir)
+    try:
+        after_filter_rows = [
+            (row["number"], row["status"], row["assignee"])
+            for row in conn.execute(
+                "SELECT number, status, assignee FROM tasks WHERE channel = ? ORDER BY number",
+                (target,),
+            ).fetchall()
+        ]
+        require(after_filter_rows == before_filter_rows, "task list filters mutated task rows")
+        rows = conn.execute(
+            """
+            SELECT status, assignee, COUNT(*) AS count
+            FROM tasks
+            WHERE channel = ?
+            GROUP BY status, assignee
+            ORDER BY status, assignee
+            """,
+            (target,),
+        ).fetchall()
+        counts = {(row["status"], row["assignee"]): row["count"] for row in rows}
+        require(counts.get(("done", "candidate")) == 1, "SQLite ground truth missing one done candidate task")
+        require(counts.get(("in_progress", None)) == 2, "SQLite ground truth missing two unassigned in-progress tasks")
+    finally:
+        conn.close()
+
 
 def probe_reminder_lifecycle(cli: Path, state_dir: Path) -> None:
     empty = run(cli, state_dir, "reminder", "list").stdout
@@ -1348,7 +1503,7 @@ def main() -> int:
         probe_attachments(cli, state_dir)
         probe_action_prepare(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks/task filters, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
     return 0
 
 

@@ -1594,6 +1594,22 @@ def tasks_for_channel(state: dict[str, Any], channel: str) -> list[dict[str, Any
     )
 
 
+def filtered_task_rows(
+    rows: list[dict[str, Any]],
+    statuses: set[str] | None = None,
+    assignee: str | None = None,
+    unassigned: bool = False,
+) -> list[dict[str, Any]]:
+    filtered = rows
+    if statuses is not None:
+        filtered = [record for record in filtered if record["status"] in statuses]
+    if assignee is not None:
+        filtered = [record for record in filtered if record.get("assignee") == assignee]
+    if unassigned:
+        filtered = [record for record in filtered if not record.get("assignee")]
+    return filtered
+
+
 def task_by_number(state: dict[str, Any], channel: str, number: int) -> dict[str, Any] | None:
     for record in tasks_for_channel(state, channel):
         if int(record["number"]) == number:
@@ -1715,6 +1731,13 @@ def arg_values(argv: list[str], flag: str) -> list[str]:
         if value == flag and idx + 1 < len(argv):
             values.append(argv[idx + 1])
     return values
+
+
+def flag_missing_value(argv: list[str], flag: str) -> bool:
+    for idx, value in enumerate(argv):
+        if value == flag and (idx + 1 >= len(argv) or argv[idx + 1].startswith("--")):
+            return True
+    return False
 
 
 def attachment_by_id(state: dict[str, Any], attachment_id: str) -> dict[str, Any] | None:
@@ -2386,13 +2409,39 @@ def command_task_list(argv: list[str]) -> int:
     channel = arg_value(argv, "--channel")
     if channel is None:
         return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
+    status_values = arg_values(argv, "--status")
+    if flag_missing_value(argv, "--status"):
+        return write_stderr("Error: --status must be one of todo, in_progress, in_review, done\nCode: INVALID_ARG\n")
+    invalid_statuses = [status for status in status_values if status not in TASK_STATUSES]
+    if invalid_statuses:
+        return write_stderr("Error: --status must be one of todo, in_progress, in_review, done\nCode: INVALID_ARG\n")
+    statuses = set(status_values) if status_values else None
+    assignee = arg_value(argv, "--assignee")
+    if flag_missing_value(argv, "--assignee"):
+        return write_stderr("Error: --assignee requires a value\nCode: INVALID_ARG\n")
+    if assignee is not None:
+        assignee = assignee.removeprefix("@")
+        if not assignee:
+            return write_stderr("Error: --assignee requires a value\nCode: INVALID_ARG\n")
+    mine = "--mine" in argv
+    unassigned = "--unassigned" in argv
+    if mine and unassigned:
+        return write_stderr("Error: --mine cannot be combined with --unassigned\nCode: INVALID_ARG\n")
+    if assignee is not None and unassigned:
+        return write_stderr("Error: --assignee cannot be combined with --unassigned\nCode: INVALID_ARG\n")
+    if mine:
+        if assignee is not None and assignee != "candidate":
+            return write_stderr("Error: --mine cannot be combined with another --assignee\nCode: INVALID_ARG\n")
+        assignee = "candidate"
 
     def action(state: dict[str, Any]) -> int:
         if not channel_has_task_surface(state, channel):
             return write_stderr("Error: Agent or channel not found\nCode: LIST_FAILED\n")
-        rows = tasks_for_channel(state, channel)
+        all_rows = tasks_for_channel(state, channel)
+        rows = filtered_task_rows(all_rows, statuses=statuses, assignee=assignee, unassigned=unassigned)
         if not rows:
-            return write_stdout(f"## Task Board for {channel} (0 tasks)\n\nNo tasks.\n")
+            empty_label = "No tasks." if not all_rows else "No matching tasks."
+            return write_stdout(f"## Task Board for {channel} (0 tasks)\n\n{empty_label}\n")
         rendered = "\n".join(format_task_row(record) for record in rows)
         return write_stdout(f"## Task Board for {channel} ({len(rows)} tasks)\n\n{rendered}\n")
 
