@@ -1869,14 +1869,49 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
     channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
     channel_name = f"probe-{uuid.uuid4().hex[:6]}"
     target = f"#slack-{channel_id.lower()}"
+    bot_token_env = f"SWARM_SLACK_BOT_{uuid.uuid4().hex[:8].upper()}"
+    signing_env = f"SWARM_SLACK_SIGNING_{uuid.uuid4().hex[:8].upper()}"
 
     def slack_ts(seconds: int) -> str:
         return f"{seconds}.{uuid.uuid4().int % 1_000_000:06d}"
+
+    def outbound_plans(output: str) -> list[dict[str, object]]:
+        return [json.loads(line) for line in output.splitlines() if line.startswith("{")]
 
     root_ts = slack_ts(1762000000)
     reply_ts = slack_ts(1762000010)
     root_body = f"slack adapter root {uuid.uuid4()}"
     reply_body = f"slack adapter reply {uuid.uuid4()}"
+
+    configured = run(
+        cli,
+        state_dir,
+        "slack",
+        "configure",
+        "--workspace",
+        workspace,
+        "--bot-token-env",
+        bot_token_env,
+        "--signing-secret-env",
+        signing_env,
+    ).stdout
+    require("Slack workspace configured." in configured, "slack configure did not acknowledge workspace")
+    require("No Slack secret values were stored." in configured, "slack configure did not state secret boundary")
+    env = run(cli, state_dir, "slack", "env", "--workspace", workspace).stdout
+    require(bot_token_env in env and signing_env in env, "slack env did not render configured env names")
+    require("secret values are never stored" in env, "slack env did not state secret boundary")
+    invalid_config = run(
+        cli,
+        state_dir,
+        "slack",
+        "configure",
+        "--workspace",
+        f"T{uuid.uuid4().hex[:6].upper()}",
+        "--bot-token-env",
+        "1BAD_ENV",
+        expected=1,
+    ).stderr
+    require("valid environment variable name" in invalid_config, "invalid Slack env var did not fail closed")
 
     root_event = {
         "team_id": workspace,
@@ -1962,6 +1997,118 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
     require(reply_body in reply_inbox, "slack reply ingest did not enqueue inbox delivery")
     require(f"[target={thread_target} msg={reply_id[:8]}" in reply_inbox, "slack reply inbox row missing thread target/id")
 
+    top_outbound_body = f"slack outbound top {uuid.uuid4()}"
+    top_hold = run(cli, state_dir, "message", "send", "--target", target, stdin=top_outbound_body).stdout
+    require("Freshness hold:" in top_hold, "slack outbound top setup should first hit freshness hold")
+    top_sent = run(cli, state_dir, "message", "send", "--send-draft", "--target", target).stdout
+    top_outbound_id = parse_message_id(top_sent)
+    rendered_top = run(cli, state_dir, "slack", "outbound", "--workspace", workspace, "--target", target).stdout
+    top_plans = outbound_plans(rendered_top)
+    require(len(top_plans) == 1, f"slack outbound top rendered wrong plan count:\n{rendered_top}")
+    top_plan = top_plans[0]
+    require(top_plan["method"] == "chat.postMessage", "slack outbound top method mismatch")
+    require(top_plan["channel"] == channel_id, "slack outbound top channel mismatch")
+    require(top_plan["text"] == top_outbound_body, "slack outbound top text mismatch")
+    require(top_plan["client_msg_id"] == top_outbound_id, "slack outbound top client_msg_id mismatch")
+    require("thread_ts" not in top_plan, "top-level outbound plan unexpectedly included thread_ts")
+    require("No network request was sent" in rendered_top, "slack outbound did not state no-network boundary")
+
+    top_sent_ts = slack_ts(1762000040)
+    top_marked = run(
+        cli,
+        state_dir,
+        "slack",
+        "mark-sent",
+        "--workspace",
+        workspace,
+        "--message-id",
+        top_outbound_id[:8],
+        "--ts",
+        top_sent_ts,
+    ).stdout
+    require("Slack sent mapping recorded." in top_marked, "slack mark-sent did not acknowledge top mapping")
+    resolved_outbound = run(
+        cli,
+        state_dir,
+        "slack",
+        "resolve",
+        "--workspace",
+        workspace,
+        "--channel-id",
+        channel_id,
+        "--ts",
+        top_sent_ts,
+    ).stdout
+    require(top_outbound_id in resolved_outbound, "slack resolve did not find marked sent top message")
+    rendered_after_mark = run(cli, state_dir, "slack", "outbound", "--workspace", workspace, "--target", target).stdout
+    require("## Slack Outbound Plan (0 requests)" in rendered_after_mark, "mark-sent top message was still rendered outbound")
+    repeated_mark = run(
+        cli,
+        state_dir,
+        "slack",
+        "mark-sent",
+        "--workspace",
+        workspace,
+        "--message-id",
+        top_outbound_id,
+        "--ts",
+        top_sent_ts,
+    ).stdout
+    require("already recorded" in repeated_mark, "slack mark-sent repeat was not idempotent")
+
+    thread_outbound_body = f"slack outbound thread {uuid.uuid4()}"
+    thread_hold = run(cli, state_dir, "message", "send", "--target", thread_target, stdin=thread_outbound_body).stdout
+    require("Freshness hold:" in thread_hold, "slack outbound thread setup should first hit freshness hold")
+    thread_sent = run(cli, state_dir, "message", "send", "--send-draft", "--target", thread_target).stdout
+    thread_outbound_id = parse_message_id(thread_sent)
+    rendered_thread = run(
+        cli,
+        state_dir,
+        "slack",
+        "outbound",
+        "--workspace",
+        workspace,
+        "--message-id",
+        thread_outbound_id,
+    ).stdout
+    thread_plans = outbound_plans(rendered_thread)
+    require(len(thread_plans) == 1, f"slack outbound thread rendered wrong plan count:\n{rendered_thread}")
+    thread_plan = thread_plans[0]
+    require(thread_plan["channel"] == channel_id, "slack outbound thread channel mismatch")
+    require(thread_plan["thread_ts"] == root_ts, "slack outbound thread did not use root Slack ts")
+    require(thread_plan["text"] == thread_outbound_body, "slack outbound thread text mismatch")
+    thread_sent_ts = slack_ts(1762000050)
+    thread_marked = run(
+        cli,
+        state_dir,
+        "slack",
+        "mark-sent",
+        "--workspace",
+        workspace,
+        "--message-id",
+        thread_outbound_id,
+        "--ts",
+        thread_sent_ts,
+    ).stdout
+    require(f"Thread ts: {root_ts}" in thread_marked, "slack mark-sent thread did not persist root thread ts")
+
+    unmapped_target = f"#slack-unmapped-{uuid.uuid4().hex[:8]}"
+    unmapped_body = f"unmapped slack outbound {uuid.uuid4()}"
+    run(cli, state_dir, "channel", "join", unmapped_target)
+    run(cli, state_dir, "message", "send", "--target", unmapped_target, stdin=unmapped_body)
+    unmapped = run(
+        cli,
+        state_dir,
+        "slack",
+        "outbound",
+        "--workspace",
+        workspace,
+        "--target",
+        unmapped_target,
+        expected=1,
+    ).stderr
+    require("Slack channel mapping not found" in unmapped, "slack outbound without channel mapping did not fail closed")
+
     missing_root_body = f"missing root should not persist {uuid.uuid4()}"
     missing_root_event = {
         "team_id": workspace,
@@ -2012,14 +2159,49 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
             """
             SELECT slack_ts, thread_ts, target, message_id
             FROM slack_messages
-            WHERE workspace = ? AND channel_id = ?
+            WHERE workspace = ? AND channel_id = ? AND message_id IN (?, ?)
             ORDER BY slack_ts
             """,
-            (workspace, channel_id),
+            (workspace, channel_id, root_id, reply_id),
         ).fetchall()
         require(len(mappings) == 2, "slack mapping table did not persist root and reply only")
-        require(mappings[0]["slack_ts"] == root_ts and mappings[0]["message_id"] == root_id, "slack root mapping mismatch")
-        require(mappings[1]["thread_ts"] == root_ts and mappings[1]["message_id"] == reply_id, "slack reply mapping mismatch")
+        require(
+            any(row["slack_ts"] == root_ts and row["message_id"] == root_id for row in mappings),
+            "slack root mapping mismatch",
+        )
+        require(
+            any(row["thread_ts"] == root_ts and row["message_id"] == reply_id for row in mappings),
+            "slack reply mapping mismatch",
+        )
+        outbound_mappings = conn.execute(
+            """
+            SELECT slack_ts, thread_ts, message_id
+            FROM slack_messages
+            WHERE workspace = ? AND channel_id = ? AND message_id IN (?, ?)
+            ORDER BY message_id
+            """,
+            (workspace, channel_id, top_outbound_id, thread_outbound_id),
+        ).fetchall()
+        require(len(outbound_mappings) == 2, "slack mark-sent did not persist two outbound mappings")
+        require(
+            any(row["slack_ts"] == top_sent_ts and row["message_id"] == top_outbound_id for row in outbound_mappings),
+            "slack top outbound mapping mismatch",
+        )
+        require(
+            any(row["thread_ts"] == root_ts and row["message_id"] == thread_outbound_id for row in outbound_mappings),
+            "slack thread outbound mapping mismatch",
+        )
+        config = conn.execute(
+            """
+            SELECT bot_token_env, signing_secret_env
+            FROM slack_workspaces
+            WHERE workspace = ?
+            """,
+            (workspace,),
+        ).fetchone()
+        require(config is not None, "slack workspace config was not persisted")
+        require(config["bot_token_env"] == bot_token_env, "slack workspace bot env mismatch")
+        require(config["signing_secret_env"] == signing_env, "slack workspace signing env mismatch")
         missing_rows = conn.execute(
             "SELECT COUNT(*) AS count FROM messages WHERE body = ?",
             (missing_root_body,),
@@ -2055,7 +2237,7 @@ def main() -> int:
         probe_action_prepare(cli, state_dir)
         probe_slack_adapter(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, action prepare, and Slack adapter ingest/resolve")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, action prepare, and Slack adapter ingest/resolve/outbound")
     return 0
 
 

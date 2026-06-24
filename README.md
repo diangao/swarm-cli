@@ -39,8 +39,12 @@ Current implemented surface:
 - `swarm attachment upload --path ... --channel ... [--mime-type ...]`
 - `swarm attachment view --id ... --output ...`
 - `swarm action prepare --target ...` for local pending `channel:create` / `agent:create` action cards
+- `swarm slack configure --workspace ... --bot-token-env ... [--signing-secret-env ...] [--app-token-env ...]`
+- `swarm slack env --workspace ...`
 - `swarm slack ingest [--event-file ...]` to import a Slack message-event JSON payload into swarm state
 - `swarm slack resolve --workspace ... --channel-id ... --ts ...` to resolve a Slack message timestamp to its swarm target/message
+- `swarm slack outbound --workspace ... (--target ...|--message-id ...) [--after-seq ...]` to render Slack `chat.postMessage` request plans from canonical swarm messages
+- `swarm slack mark-sent --workspace ... --message-id ... --ts ... [--channel-id ...]` to persist the Slack timestamp returned by a later sender
 - `--content` rejection
 - local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
@@ -57,8 +61,13 @@ remote execution backend.
 
 Slack is treated as an adapter input and UI surface, not as the canonical
 coordination store. The current seam accepts local Slack-style message-event
-JSON only; it does not connect to Slack Web API, Events API, OAuth, Socket Mode,
-or real workspaces.
+JSON, stores workspace configuration by environment-variable name, and renders
+outbound request plans. It does not connect to Slack Web API, Events API, OAuth,
+Socket Mode, or real workspaces.
+
+`swarm slack configure` persists only names such as `SLACK_BOT_TOKEN`; it never
+stores token or signing-secret values. `swarm slack env` shows the configured
+names a real adapter process would need in its environment.
 
 `swarm slack ingest` maps a Slack root message to a swarm channel target derived
 from the Slack channel id (`C123` -> `#slack-c123`), stores a durable
@@ -69,9 +78,19 @@ derived from the root swarm message id. Duplicate Slack events are idempotent
 and resolve back to the original swarm message instead of appending another row.
 
 This keeps task, reminder, claim, read/search/resolve, and freshness semantics
-owned by swarm's SQLite state while leaving room for a later
+owned by swarm's SQLite state.
+
+`swarm slack outbound` reads canonical swarm messages and renders newline-
+delimited `chat.postMessage` request plans with Slack channel ids, text,
+`client_msg_id`, and thread timestamps when a swarm thread maps to a Slack
+thread. It sends no network request. `swarm slack mark-sent` is the durable
+acknowledgement seam for a future real sender: after Slack returns a `ts`, the
+adapter records that timestamp against the swarm message so later outbound
+plans skip messages that are already mapped.
+
+Together these commands define the local process boundary for a later
 `swarm-slack-adapter` process to perform real Slack authentication, event
-subscription, and outbound rendering.
+subscription, and message sending while swarm remains the state owner.
 
 ## Verify
 
@@ -113,4 +132,6 @@ attachment upload/view byte persistence, message attachment rendering,
 persisted action-card preparation, and concurrent write serialization.
 It also checks Slack adapter root-message import, duplicate idempotence,
 thread-root fail-closed behavior, Slack-to-swarm resolve, inbox delivery,
-channel cataloging, and persisted mapping rows.
+channel cataloging, workspace env-name configuration, outbound `chat.postMessage`
+plan rendering without network sends, mark-sent acknowledgement mapping, and
+persisted mapping rows.

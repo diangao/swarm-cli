@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -84,6 +84,26 @@ def slack_message_item(
         "target": target,
         "message_id": message_id,
         "created_at": created_at,
+    }
+
+
+def slack_workspace_item(
+    workspace: str,
+    bot_token_env: str,
+    signing_secret_env: str | None,
+    app_token_env: str | None,
+    mode: str,
+    created_at: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    return {
+        "workspace": workspace,
+        "bot_token_env": bot_token_env,
+        "signing_secret_env": signing_secret_env,
+        "app_token_env": app_token_env,
+        "mode": mode,
+        "created_at": created_at,
+        "updated_at": updated_at,
     }
 
 
@@ -354,6 +374,7 @@ EMPTY_STATE: dict[str, Any] = {
     "next_task_number": 1,
     "last_read": {},
     "messages": [],
+    "slack_workspaces": [],
     "slack_messages": [],
     "remote_inbox": [],
     "local_inbox": [],
@@ -427,6 +448,7 @@ SEED_STATE: dict[str, Any] = {
             "later channel message",
         ),
     ],
+    "slack_workspaces": [],
     "slack_messages": [],
     "remote_inbox": [
         inbox_item(
@@ -574,6 +596,15 @@ def create_schema(conn: sqlite3.Connection) -> None:
             body TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_inbox_kind_ordinal ON inbox(kind, ordinal);
+        CREATE TABLE IF NOT EXISTS slack_workspaces (
+            workspace TEXT PRIMARY KEY,
+            bot_token_env TEXT NOT NULL,
+            signing_secret_env TEXT,
+            app_token_env TEXT,
+            mode TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS slack_messages (
             workspace TEXT NOT NULL,
             channel_id TEXT NOT NULL,
@@ -734,6 +765,7 @@ def ensure_profile_columns(conn: sqlite3.Connection) -> None:
 
 def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM inbox")
+    conn.execute("DELETE FROM slack_workspaces")
     conn.execute("DELETE FROM slack_messages")
     conn.execute("DELETE FROM messages")
     conn.execute("DELETE FROM freshness")
@@ -796,6 +828,24 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 record["created_at"],
             )
             for record in state.get("slack_messages", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO slack_workspaces(workspace, bot_token_env, signing_secret_env, app_token_env, mode, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                record["workspace"],
+                record["bot_token_env"],
+                record.get("signing_secret_env"),
+                record.get("app_token_env"),
+                record["mode"],
+                record["created_at"],
+                record["updated_at"],
+            )
+            for record in state.get("slack_workspaces", [])
         ],
     )
     inbox_rows = []
@@ -1149,6 +1199,24 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    slack_workspaces = [
+        slack_workspace_item(
+            row["workspace"],
+            row["bot_token_env"],
+            row["signing_secret_env"],
+            row["app_token_env"],
+            row["mode"],
+            row["created_at"],
+            row["updated_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT workspace, bot_token_env, signing_secret_env, app_token_env, mode, created_at, updated_at
+            FROM slack_workspaces
+            ORDER BY workspace
+            """
+        ).fetchall()
+    ]
     freshness = {
         row["target"]: {"cursor": row["cursor"], "draft": row["draft"]}
         for row in conn.execute("SELECT target, cursor, draft FROM freshness ORDER BY target").fetchall()
@@ -1370,6 +1438,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "next_task_number": meta_int(conn, "next_task_number", 1),
         "last_read": last_read,
         "messages": messages,
+        "slack_workspaces": slack_workspaces,
         "slack_messages": slack_messages,
         "remote_inbox": inbox_rows(conn, "remote"),
         "local_inbox": inbox_rows(conn, "local"),
@@ -2136,6 +2205,102 @@ def slack_mapping_by_key(
         ):
             return record
     return None
+
+
+def slack_mapping_by_message_id(
+    state: dict[str, Any],
+    workspace: str,
+    message_id: str,
+) -> dict[str, Any] | None:
+    for record in state.get("slack_messages", []):
+        if record["workspace"] == workspace and record["message_id"] == message_id:
+            return record
+    return None
+
+
+def slack_workspace_by_id(state: dict[str, Any], workspace: str) -> dict[str, Any] | None:
+    for record in state.get("slack_workspaces", []):
+        if record["workspace"] == workspace:
+            return record
+    return None
+
+
+def valid_env_var_name(value: str) -> bool:
+    if not value:
+        return False
+    first = value[0]
+    if not (first == "_" or "A" <= first <= "Z" or "a" <= first <= "z"):
+        return False
+    return all(char == "_" or "A" <= char <= "Z" or "a" <= char <= "z" or "0" <= char <= "9" for char in value)
+
+
+def known_slack_channel_mapping(
+    state: dict[str, Any],
+    workspace: str,
+    target: str,
+) -> dict[str, Any] | None:
+    channel = channel_for_target(target)
+    matches = [
+        record
+        for record in state.get("slack_messages", [])
+        if record["workspace"] == workspace
+        and channel_for_target(str(record["target"])) == channel
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda row: str(row["created_at"]))[0]
+
+
+def slack_thread_ts_for_target(
+    state: dict[str, Any],
+    workspace: str,
+    target: str,
+) -> tuple[str | None, str | None]:
+    if ":" not in target:
+        return None, None
+    parent = parent_message_for_thread(state, target)
+    if parent is None:
+        return None, "thread root message not found"
+    root_mapping = slack_mapping_by_message_id(state, workspace, str(parent["id"]))
+    if root_mapping is None:
+        return None, "thread root is not mapped to Slack"
+    return str(root_mapping["slack_ts"]), None
+
+
+def slack_record_needs_outbound(
+    state: dict[str, Any],
+    workspace: str,
+    record: dict[str, Any],
+) -> bool:
+    if str(record["author"]).startswith("slack:") or str(record["author"]).startswith("slack-bot:"):
+        return False
+    if slack_mapping_by_message_id(state, workspace, str(record["id"])) is not None:
+        return False
+    return record["type"] in {"agent", "system"}
+
+
+def slack_outbound_plan_item(
+    state: dict[str, Any],
+    workspace: str,
+    channel_mapping: dict[str, Any],
+    record: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    thread_ts, thread_error = slack_thread_ts_for_target(state, workspace, str(record["target"]))
+    if thread_error is not None:
+        return None, thread_error
+    request = {
+        "method": "chat.postMessage",
+        "workspace": workspace,
+        "channel": channel_mapping["channel_id"],
+        "text": record["body"],
+        "client_msg_id": record["id"],
+        "swarm_message_id": record["id"],
+        "swarm_target": record["target"],
+        "swarm_seq": record["seq"],
+    }
+    if thread_ts is not None:
+        request["thread_ts"] = thread_ts
+    return request, None
 
 
 def slack_event_envelope(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3978,6 +4143,99 @@ def read_slack_event_payload(argv: list[str]) -> tuple[dict[str, Any] | None, st
     return payload, None
 
 
+def command_slack_configure(argv: list[str]) -> int:
+    if (
+        flag_missing_value(argv, "--workspace")
+        or flag_missing_value(argv, "--bot-token-env")
+        or flag_missing_value(argv, "--signing-secret-env")
+        or flag_missing_value(argv, "--app-token-env")
+        or flag_missing_value(argv, "--mode")
+    ):
+        return write_stderr("Error: Slack config flags require values\nCode: INVALID_ARG\n")
+    workspace = arg_value(argv, "--workspace")
+    bot_token_env = arg_value(argv, "--bot-token-env")
+    signing_secret_env = arg_value(argv, "--signing-secret-env")
+    app_token_env = arg_value(argv, "--app-token-env")
+    mode = arg_value(argv, "--mode") or "events_api"
+    if not workspace or not workspace.strip():
+        return write_stderr("Error: --workspace is required\nCode: INVALID_ARG\n")
+    if not bot_token_env or not valid_env_var_name(bot_token_env):
+        return write_stderr("Error: --bot-token-env must be a valid environment variable name\nCode: INVALID_ARG\n")
+    if signing_secret_env is not None and not valid_env_var_name(signing_secret_env):
+        return write_stderr("Error: --signing-secret-env must be a valid environment variable name\nCode: INVALID_ARG\n")
+    if app_token_env is not None and not valid_env_var_name(app_token_env):
+        return write_stderr("Error: --app-token-env must be a valid environment variable name\nCode: INVALID_ARG\n")
+    if mode not in {"events_api", "socket_mode"}:
+        return write_stderr("Error: --mode must be events_api or socket_mode\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        now = current_timestamp()
+        existing = slack_workspace_by_id(state, workspace.strip())
+        if existing is None:
+            state.setdefault("slack_workspaces", []).append(
+                slack_workspace_item(
+                    workspace.strip(),
+                    bot_token_env,
+                    signing_secret_env,
+                    app_token_env,
+                    mode,
+                    now,
+                    now,
+                )
+            )
+        else:
+            existing["bot_token_env"] = bot_token_env
+            existing["signing_secret_env"] = signing_secret_env
+            existing["app_token_env"] = app_token_env
+            existing["mode"] = mode
+            existing["updated_at"] = now
+        secret_lines = [
+            f"bot_token_env: {bot_token_env}",
+            f"signing_secret_env: {signing_secret_env or '(none)'}",
+            f"app_token_env: {app_token_env or '(none)'}",
+        ]
+        return write_stdout(
+            "Slack workspace configured.\n"
+            f"Workspace: {workspace.strip()}\n"
+            f"Mode: {mode}\n"
+            + "\n".join(secret_lines)
+            + "\nNo Slack secret values were stored.\n"
+        )
+
+    return with_mutable_state(action)
+
+
+def command_slack_env(argv: list[str]) -> int:
+    if flag_missing_value(argv, "--workspace"):
+        return write_stderr("Error: --workspace requires a value\nCode: INVALID_ARG\n")
+    workspace = arg_value(argv, "--workspace")
+    if not workspace:
+        return write_stderr("Error: --workspace is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        config = slack_workspace_by_id(state, workspace)
+        if config is None:
+            return write_stderr(
+                "Error: Slack workspace config not found\n"
+                "Code: NOT_FOUND\n"
+                "Next action: configure it with swarm slack configure.\n"
+            )
+        env_names = [config["bot_token_env"]]
+        if config.get("signing_secret_env"):
+            env_names.append(config["signing_secret_env"])
+        if config.get("app_token_env"):
+            env_names.append(config["app_token_env"])
+        lines = [
+            "# Slack adapter environment names only; secret values are never stored in swarm state.",
+            f"SWARM_SLACK_WORKSPACE={config['workspace']}",
+            f"SWARM_SLACK_MODE={config['mode']}",
+            *[f"requires_env={name}" for name in env_names],
+        ]
+        return write_stdout("\n".join(lines) + "\n")
+
+    return with_read_state(action)
+
+
 def command_slack_ingest(argv: list[str]) -> int:
     payload, payload_error = read_slack_event_payload(argv)
     if payload_error is not None:
@@ -4071,15 +4329,194 @@ def command_slack_resolve(argv: list[str]) -> int:
     return with_read_state(action)
 
 
+def parse_after_seq(argv: list[str]) -> tuple[int, str | None]:
+    raw = arg_value(argv, "--after-seq")
+    if raw is None:
+        return 0, None
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0, "--after-seq must be a non-negative integer"
+    if value < 0:
+        return 0, "--after-seq must be a non-negative integer"
+    return value, None
+
+
+def command_slack_outbound(argv: list[str]) -> int:
+    if (
+        flag_missing_value(argv, "--workspace")
+        or flag_missing_value(argv, "--target")
+        or flag_missing_value(argv, "--message-id")
+        or flag_missing_value(argv, "--after-seq")
+    ):
+        return write_stderr("Error: Slack outbound flags require values\nCode: INVALID_ARG\n")
+    workspace = arg_value(argv, "--workspace")
+    target = arg_value(argv, "--target")
+    message_ids = arg_values(argv, "--message-id")
+    after_seq, seq_error = parse_after_seq(argv)
+    if seq_error is not None:
+        return write_stderr(f"Error: {seq_error}\nCode: INVALID_ARG\n")
+    if not workspace:
+        return write_stderr("Error: --workspace is required\nCode: INVALID_ARG\n")
+    if target is None and not message_ids:
+        return write_stderr("Error: --target or --message-id is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if slack_workspace_by_id(state, workspace) is None:
+            return write_stderr(
+                "Error: Slack workspace config not found\n"
+                "Code: NOT_FOUND\n"
+                "Next action: configure it with swarm slack configure.\n"
+            )
+        records: list[dict[str, Any]] = []
+        if message_ids:
+            seen: set[str] = set()
+            for msg_id in message_ids:
+                record, error = message_by_id(state, msg_id)
+                if error == "ambiguous":
+                    return write_stderr(f"Error: ambiguous message id: {msg_id}\nCode: AMBIGUOUS_ID\n")
+                if record is None:
+                    return write_stderr("Error: Message not found\nCode: NOT_FOUND\n")
+                if target is not None and record["target"] != target:
+                    return write_stderr("Error: message target does not match --target\nCode: INVALID_TARGET\n")
+                if record["id"] not in seen:
+                    records.append(record)
+                    seen.add(record["id"])
+        else:
+            assert target is not None
+            if not known_surface(state, target):
+                return write_stderr(f"Error: Channel not found: {target}\nCode: NOT_FOUND\n")
+            records = [
+                record
+                for record in state.get("messages", [])
+                if record["target"] == target and int(record["seq"]) > after_seq
+            ]
+        if not records:
+            return write_stdout("## Slack Outbound Plan (0 requests)\n\nNo outbound messages.\n")
+
+        plans: list[dict[str, Any]] = []
+        for record in sorted(records, key=lambda row: int(row["seq"])):
+            if not slack_record_needs_outbound(state, workspace, record):
+                continue
+            channel_mapping = known_slack_channel_mapping(state, workspace, str(record["target"]))
+            if channel_mapping is None:
+                return write_stderr(
+                    f"Error: Slack channel mapping not found for target {channel_for_target(str(record['target']))}\n"
+                    "Code: NOT_FOUND\n"
+                    "Next action: ingest a Slack message from that channel or mark a sent root with --channel-id.\n"
+                )
+            plan, plan_error = slack_outbound_plan_item(state, workspace, channel_mapping, record)
+            if plan_error is not None:
+                return write_stderr(f"Error: {plan_error}\nCode: NOT_FOUND\n")
+            assert plan is not None
+            plans.append(plan)
+
+        if not plans:
+            return write_stdout("## Slack Outbound Plan (0 requests)\n\nNo outbound messages.\n")
+        rendered = "\n".join(json.dumps(plan, sort_keys=True, separators=(",", ":")) for plan in plans)
+        return write_stdout(
+            f"## Slack Outbound Plan ({len(plans)} requests)\n\n"
+            f"{rendered}\n\n"
+            "No network request was sent; this is a render plan from canonical swarm state.\n"
+        )
+
+    return with_read_state(action)
+
+
+def command_slack_mark_sent(argv: list[str]) -> int:
+    if (
+        flag_missing_value(argv, "--workspace")
+        or flag_missing_value(argv, "--message-id")
+        or flag_missing_value(argv, "--ts")
+        or flag_missing_value(argv, "--channel-id")
+        or flag_missing_value(argv, "--channel-name")
+    ):
+        return write_stderr("Error: Slack mark-sent flags require values\nCode: INVALID_ARG\n")
+    workspace = arg_value(argv, "--workspace")
+    msg_id = arg_value(argv, "--message-id")
+    slack_ts = arg_value(argv, "--ts")
+    explicit_channel_id = arg_value(argv, "--channel-id")
+    explicit_channel_name = arg_value(argv, "--channel-name")
+    if not workspace or not msg_id or not slack_ts:
+        return write_stderr("Error: --workspace, --message-id, and --ts are required\nCode: INVALID_ARG\n")
+    if state_time_from_slack_ts(slack_ts) is None:
+        return write_stderr("Error: --ts must be a positive Slack timestamp\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if slack_workspace_by_id(state, workspace) is None:
+            return write_stderr(
+                "Error: Slack workspace config not found\n"
+                "Code: NOT_FOUND\n"
+                "Next action: configure it with swarm slack configure.\n"
+            )
+        record, error = message_by_id(state, msg_id)
+        if error == "ambiguous":
+            return write_stderr(f"Error: ambiguous message id: {msg_id}\nCode: AMBIGUOUS_ID\n")
+        if record is None:
+            return write_stderr("Error: Message not found\nCode: NOT_FOUND\n")
+
+        existing_for_message = slack_mapping_by_message_id(state, workspace, str(record["id"]))
+        if existing_for_message is not None:
+            if existing_for_message["slack_ts"] == slack_ts:
+                return write_stdout(slack_mapping_output(existing_for_message, record, "Slack sent mapping already recorded."))
+            return write_stderr(
+                "Error: swarm message is already mapped to a different Slack ts\n"
+                "Code: SLACK_MAPPING_CONFLICT\n"
+            )
+
+        channel_mapping = known_slack_channel_mapping(state, workspace, str(record["target"]))
+        channel_id = explicit_channel_id
+        channel_name = explicit_channel_name
+        if channel_mapping is not None:
+            channel_id = channel_id or channel_mapping["channel_id"]
+            channel_name = channel_name or channel_mapping.get("channel_name")
+        if channel_id is None:
+            return write_stderr(
+                "Error: --channel-id is required when target has no existing Slack channel mapping\n"
+                "Code: INVALID_ARG\n"
+            )
+        existing_for_ts = slack_mapping_by_key(state, workspace, channel_id, slack_ts)
+        if existing_for_ts is not None:
+            return write_stderr(
+                "Error: Slack ts is already mapped to another swarm message\n"
+                "Code: SLACK_TS_CONFLICT\n"
+            )
+        thread_ts, thread_error = slack_thread_ts_for_target(state, workspace, str(record["target"]))
+        if thread_error is not None:
+            return write_stderr(f"Error: {thread_error}\nCode: NOT_FOUND\n")
+        mapping = slack_message_item(
+            workspace,
+            channel_id,
+            channel_name,
+            slack_ts,
+            thread_ts,
+            record["target"],
+            record["id"],
+            current_timestamp(),
+        )
+        state.setdefault("slack_messages", []).append(mapping)
+        return write_stdout(slack_mapping_output(mapping, record, "Slack sent mapping recorded."))
+
+    return with_mutable_state(action)
+
+
 def command_slack(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing slack subcommand\nCode: INVALID_ARG\n")
     subcommand = argv[0]
     rest = argv[1:]
+    if subcommand == "configure":
+        return command_slack_configure(rest)
+    if subcommand == "env":
+        return command_slack_env(rest)
     if subcommand == "ingest":
         return command_slack_ingest(rest)
     if subcommand == "resolve":
         return command_slack_resolve(rest)
+    if subcommand == "outbound":
+        return command_slack_outbound(rest)
+    if subcommand == "mark-sent":
+        return command_slack_mark_sent(rest)
     return write_stderr(f"Error: unknown slack subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
