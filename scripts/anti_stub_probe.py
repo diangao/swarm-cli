@@ -313,6 +313,41 @@ def probe_read_pagination(cli: Path, state_dir: Path) -> None:
     require("--limit must be a positive integer" in invalid_limit, "invalid read limit did not fail closed")
 
 
+def probe_read_known_empty_surfaces(cli: Path, state_dir: Path) -> None:
+    empty_target = f"#empty-{uuid.uuid4().hex[:8]}"
+    run(cli, state_dir, "channel", "join", "--target", empty_target)
+    with connect_state(state_dir) as conn:
+        row = conn.execute("SELECT joined FROM channels WHERE name = ?", (empty_target,)).fetchone()
+        require(row is not None and row["joined"] == 1, "joined empty channel was not persisted")
+
+    empty_history = run(cli, state_dir, "message", "read", "--channel", empty_target).stdout
+    require(f"## Message History for {empty_target} (0 messages)" in empty_history, "empty known channel did not render zero history")
+    require("--- 0 messages shown. ---" in empty_history, "empty known channel missing zero-history footer")
+
+    missing_target = f"#missing-{uuid.uuid4().hex[:8]}"
+    missing = run(cli, state_dir, "message", "read", "--channel", missing_target, expected=1).stderr
+    require("Channel not found" in missing, "unknown channel read did not fail closed")
+
+    thread_channel = f"#parentonly-{uuid.uuid4().hex[:8]}"
+    parent_body = f"parent-only thread root {uuid.uuid4()}"
+    parent_id = parse_message_id(run(cli, state_dir, "message", "send", "--target", thread_channel, stdin=parent_body).stdout)
+    parent_thread = f"{thread_channel}:{parent_id[:8]}"
+    parent_thread_history = run(cli, state_dir, "message", "read", "--channel", parent_thread).stdout
+    require(parent_body in parent_thread_history, "parent-only thread read did not include parent message")
+    require(f"## Message History for {parent_thread} (1 messages)" in parent_thread_history, "parent-only thread count was not one")
+
+    missing_thread = run(
+        cli,
+        state_dir,
+        "message",
+        "read",
+        "--channel",
+        f"{thread_channel}:deadbeef",
+        expected=1,
+    ).stderr
+    require("Channel not found" in missing_thread, "thread without a parent did not fail closed")
+
+
 def probe_search_and_resolve(cli: Path, state_dir: Path) -> None:
     target = f"#search-{uuid.uuid4().hex[:8]}"
     needle = f"needle-{uuid.uuid4().hex}"
@@ -1708,6 +1743,7 @@ def main() -> int:
         probe_inbox(cli, state_dir)
         probe_send_read_and_routes(cli, state_dir)
         probe_read_pagination(cli, state_dir)
+        probe_read_known_empty_surfaces(cli, state_dir)
         probe_search_and_resolve(cli, state_dir)
         probe_message_reactions(cli, state_dir)
         probe_freshness_cursor(cli, state_dir)
@@ -1722,7 +1758,7 @@ def main() -> int:
         probe_attachments(cli, state_dir)
         probe_action_prepare(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
     return 0
 
 

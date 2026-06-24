@@ -2076,6 +2076,10 @@ def known_surface(state: dict[str, Any], target: str) -> bool:
         return True
     if target.startswith("dm:@"):
         return True
+    if target_is_thread(target) and parent_message_for_thread(state, target) is not None:
+        return True
+    if ":" not in target and top_level_channel_record(state, target) is not None:
+        return True
     return any(record["target"] == target for record in state["messages"])
 
 
