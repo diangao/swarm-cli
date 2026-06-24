@@ -15,12 +15,12 @@ import shlex
 import time
 from html import escape
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -62,6 +62,28 @@ def inbox_item(
         "type": sender_type,
         "author": author,
         "body": body,
+    }
+
+
+def slack_message_item(
+    workspace: str,
+    channel_id: str,
+    channel_name: str | None,
+    slack_ts: str,
+    thread_ts: str | None,
+    target: str,
+    message_id: str,
+    created_at: str,
+) -> dict[str, Any]:
+    return {
+        "workspace": workspace,
+        "channel_id": channel_id,
+        "channel_name": channel_name,
+        "slack_ts": slack_ts,
+        "thread_ts": thread_ts,
+        "target": target,
+        "message_id": message_id,
+        "created_at": created_at,
     }
 
 
@@ -332,6 +354,7 @@ EMPTY_STATE: dict[str, Any] = {
     "next_task_number": 1,
     "last_read": {},
     "messages": [],
+    "slack_messages": [],
     "remote_inbox": [],
     "local_inbox": [],
     "freshness": {},
@@ -404,6 +427,7 @@ SEED_STATE: dict[str, Any] = {
             "later channel message",
         ),
     ],
+    "slack_messages": [],
     "remote_inbox": [
         inbox_item(
             "#general",
@@ -550,6 +574,21 @@ def create_schema(conn: sqlite3.Connection) -> None:
             body TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_inbox_kind_ordinal ON inbox(kind, ordinal);
+        CREATE TABLE IF NOT EXISTS slack_messages (
+            workspace TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            channel_name TEXT,
+            slack_ts TEXT NOT NULL,
+            thread_ts TEXT,
+            target TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (workspace, channel_id, slack_ts)
+        );
+        CREATE INDEX IF NOT EXISTS idx_slack_messages_message
+            ON slack_messages(message_id);
+        CREATE INDEX IF NOT EXISTS idx_slack_messages_thread
+            ON slack_messages(workspace, channel_id, thread_ts);
         CREATE TABLE IF NOT EXISTS freshness (
             target TEXT PRIMARY KEY,
             cursor INTEGER NOT NULL,
@@ -695,6 +734,7 @@ def ensure_profile_columns(conn: sqlite3.Connection) -> None:
 
 def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM inbox")
+    conn.execute("DELETE FROM slack_messages")
     conn.execute("DELETE FROM messages")
     conn.execute("DELETE FROM freshness")
     conn.execute("DELETE FROM last_read")
@@ -737,6 +777,25 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 record["body"],
             )
             for record in state.get("messages", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO slack_messages(workspace, channel_id, channel_name, slack_ts, thread_ts, target, message_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                record["workspace"],
+                record["channel_id"],
+                record.get("channel_name"),
+                record["slack_ts"],
+                record.get("thread_ts"),
+                record["target"],
+                record["message_id"],
+                record["created_at"],
+            )
+            for record in state.get("slack_messages", [])
         ],
     )
     inbox_rows = []
@@ -1071,6 +1130,25 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             "SELECT seq, target, id, time, type, author, body FROM messages ORDER BY seq"
         ).fetchall()
     ]
+    slack_messages = [
+        slack_message_item(
+            row["workspace"],
+            row["channel_id"],
+            row["channel_name"],
+            row["slack_ts"],
+            row["thread_ts"],
+            row["target"],
+            row["message_id"],
+            row["created_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT workspace, channel_id, channel_name, slack_ts, thread_ts, target, message_id, created_at
+            FROM slack_messages
+            ORDER BY workspace, channel_id, slack_ts
+            """
+        ).fetchall()
+    ]
     freshness = {
         row["target"]: {"cursor": row["cursor"], "draft": row["draft"]}
         for row in conn.execute("SELECT target, cursor, draft FROM freshness ORDER BY target").fetchall()
@@ -1292,6 +1370,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "next_task_number": meta_int(conn, "next_task_number", 1),
         "last_read": last_read,
         "messages": messages,
+        "slack_messages": slack_messages,
         "remote_inbox": inbox_rows(conn, "remote"),
         "local_inbox": inbox_rows(conn, "local"),
         "freshness": freshness,
@@ -1481,6 +1560,44 @@ def ensure_channel_catalog(state: dict[str, Any], target: str) -> None:
     if any(channel["name"] == target for channel in state.get("channels", [])):
         return
     state.setdefault("channels", []).append(channel_item(target, False, True, "Local channel"))
+    ensure_candidate_member(state, target)
+
+
+def normalize_slack_id(value: str) -> str:
+    normalized = []
+    for char in value.lower():
+        if char.isalnum():
+            normalized.append(char)
+        elif char in {"-", "_"}:
+            normalized.append("-")
+    return "".join(normalized).strip("-")
+
+
+def slack_channel_target(channel_id: str) -> str | None:
+    normalized = normalize_slack_id(channel_id)
+    if not normalized:
+        return None
+    return f"#slack-{normalized}"
+
+
+def ensure_slack_channel_catalog(
+    state: dict[str, Any],
+    target: str,
+    channel_id: str,
+    channel_name: str | None,
+) -> None:
+    if not target.startswith("#") or ":" in target:
+        return
+    label = f"Slack channel {channel_id}"
+    if channel_name:
+        label += f" ({channel_name})"
+    record = top_level_channel_record(state, target)
+    if record is None:
+        state.setdefault("channels", []).append(channel_item(target, False, True, label))
+    else:
+        record["joined"] = True
+        if not record.get("description") or record.get("description") == "Local channel":
+            record["description"] = label
     ensure_candidate_member(state, target)
 
 
@@ -1897,6 +2014,7 @@ def append_message(
     attachments: list[dict[str, Any]] | None = None,
     sender_type: str = "agent",
     author: str = "candidate",
+    timestamp: str | None = None,
 ) -> dict[str, Any]:
     ensure_channel_catalog(state, target)
     attachments = attachments or []
@@ -1906,7 +2024,7 @@ def append_message(
         seq,
         target,
         next_message_id(state),
-        current_timestamp(),
+        timestamp or current_timestamp(),
         sender_type,
         author,
         body.rstrip("\n"),
@@ -1994,6 +2112,155 @@ def append_inbox_for_message(state: dict[str, Any], record: dict[str, Any]) -> N
             record["author"],
             record["body"],
         )
+    )
+
+
+def message_by_full_id(state: dict[str, Any], msg_id: str) -> dict[str, Any] | None:
+    for record in state.get("messages", []):
+        if str(record["id"]) == msg_id:
+            return record
+    return None
+
+
+def slack_mapping_by_key(
+    state: dict[str, Any],
+    workspace: str,
+    channel_id: str,
+    slack_ts: str,
+) -> dict[str, Any] | None:
+    for record in state.get("slack_messages", []):
+        if (
+            record["workspace"] == workspace
+            and record["channel_id"] == channel_id
+            and record["slack_ts"] == slack_ts
+        ):
+            return record
+    return None
+
+
+def slack_event_envelope(payload: dict[str, Any]) -> dict[str, Any]:
+    event = payload.get("event")
+    return event if isinstance(event, dict) else payload
+
+
+def slack_workspace_id(payload: dict[str, Any], event: dict[str, Any]) -> str | None:
+    for value in (
+        payload.get("team_id"),
+        payload.get("team"),
+        event.get("team"),
+        payload.get("enterprise_id"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    authorizations = payload.get("authorizations")
+    if isinstance(authorizations, list):
+        for authorization in authorizations:
+            if not isinstance(authorization, dict):
+                continue
+            team_id = authorization.get("team_id")
+            if isinstance(team_id, str) and team_id.strip():
+                return team_id.strip()
+    return None
+
+
+def slack_event_text(event: dict[str, Any]) -> str:
+    text = event.get("text")
+    if isinstance(text, str):
+        return text
+    return ""
+
+
+def state_time_from_slack_ts(slack_ts: str) -> str | None:
+    try:
+        seconds = float(slack_ts)
+    except ValueError:
+        return None
+    if seconds <= 0:
+        return None
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalized_slack_event(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    event = slack_event_envelope(payload)
+    if event.get("type") != "message":
+        return None, "only Slack message events are supported"
+    subtype = event.get("subtype")
+    if subtype not in (None, "", "bot_message"):
+        return None, f"unsupported Slack message subtype: {subtype}"
+
+    workspace = slack_workspace_id(payload, event)
+    channel_id = event.get("channel")
+    slack_ts = event.get("ts")
+    if not isinstance(workspace, str) or not workspace.strip():
+        return None, "Slack workspace/team id is required"
+    if not isinstance(channel_id, str) or not channel_id.strip():
+        return None, "Slack channel id is required"
+    if not isinstance(slack_ts, str) or not slack_ts.strip():
+        return None, "Slack message ts is required"
+    event_time = state_time_from_slack_ts(slack_ts.strip())
+    if event_time is None:
+        return None, "Slack message ts must be a positive timestamp"
+
+    user = event.get("user")
+    bot_id = event.get("bot_id")
+    if isinstance(user, str) and user.strip():
+        author = f"slack:{user.strip()}"
+        sender_type = "human"
+    elif isinstance(bot_id, str) and bot_id.strip():
+        author = f"slack-bot:{bot_id.strip()}"
+        sender_type = "agent"
+    else:
+        return None, "Slack message author is required"
+
+    channel_name = event.get("channel_name") or payload.get("channel_name")
+    if not isinstance(channel_name, str) or not channel_name.strip():
+        channel_name = None
+    else:
+        channel_name = channel_name.strip()
+
+    thread_ts = event.get("thread_ts")
+    if not isinstance(thread_ts, str) or not thread_ts.strip() or thread_ts.strip() == slack_ts.strip():
+        thread_ts = None
+    else:
+        thread_ts = thread_ts.strip()
+
+    return {
+        "workspace": workspace.strip(),
+        "channel_id": channel_id.strip(),
+        "channel_name": channel_name,
+        "slack_ts": slack_ts.strip(),
+        "thread_ts": thread_ts,
+        "time": event_time,
+        "sender_type": sender_type,
+        "author": author,
+        "body": slack_event_text(event),
+    }, None
+
+
+def slack_mapping_output(
+    mapping: dict[str, Any],
+    record: dict[str, Any] | None,
+    status_line: str,
+) -> str:
+    body = record["body"] if record is not None else ""
+    body_line = f"Body: {body}\n" if body else ""
+    channel_name = mapping.get("channel_name")
+    channel_label = (
+        f"{mapping['channel_id']} ({channel_name})"
+        if channel_name
+        else mapping["channel_id"]
+    )
+    thread_line = f"Thread ts: {mapping['thread_ts']}\n" if mapping.get("thread_ts") else ""
+    return (
+        f"{status_line}\n"
+        f"Workspace: {mapping['workspace']}\n"
+        f"Channel: {channel_label} -> {channel_for_target(mapping['target'])}\n"
+        f"Slack ts: {mapping['slack_ts']}\n"
+        f"{thread_line}"
+        f"Target: {mapping['target']}\n"
+        f"Message ID: {mapping['message_id']}\n"
+        f"{body_line}"
+        "Source of truth: swarm SQLite state; Slack is adapter input/UI, not canonical storage.\n"
     )
 
 
@@ -3688,6 +3955,134 @@ def command_attachment(argv: list[str]) -> int:
     return write_stderr(f"Error: unknown attachment subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
+def read_slack_event_payload(argv: list[str]) -> tuple[dict[str, Any] | None, str | None]:
+    if flag_missing_value(argv, "--event-file"):
+        return None, "--event-file requires a value"
+    event_file = arg_value(argv, "--event-file")
+    if event_file is not None:
+        path = Path(event_file).expanduser()
+        try:
+            raw = path.read_text()
+        except OSError:
+            return None, f"Slack event file not found: {event_file}"
+    else:
+        raw = sys.stdin.read()
+    if not raw.strip():
+        return None, "Slack event JSON is required on stdin or --event-file"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "invalid Slack event JSON"
+    if not isinstance(payload, dict):
+        return None, "Slack event JSON must be an object"
+    return payload, None
+
+
+def command_slack_ingest(argv: list[str]) -> int:
+    payload, payload_error = read_slack_event_payload(argv)
+    if payload_error is not None:
+        return write_stderr(f"Error: {payload_error}\nCode: INVALID_ARG\n")
+    assert payload is not None
+    event, event_error = normalized_slack_event(payload)
+    if event_error is not None:
+        return write_stderr(f"Error: {event_error}\nCode: INVALID_SLACK_EVENT\n")
+    assert event is not None
+
+    base_target = slack_channel_target(event["channel_id"])
+    if base_target is None:
+        return write_stderr("Error: Slack channel id did not map to a swarm channel target\nCode: INVALID_SLACK_EVENT\n")
+
+    def action(state: dict[str, Any]) -> int:
+        existing = slack_mapping_by_key(state, event["workspace"], event["channel_id"], event["slack_ts"])
+        if existing is not None:
+            record = message_by_full_id(state, existing["message_id"])
+            if record is None:
+                return write_stderr("Error: Slack mapping points to a missing swarm message\nCode: STATE_CORRUPT\n")
+            return write_stdout(slack_mapping_output(existing, record, "Slack event already imported."))
+
+        target = base_target
+        if event.get("thread_ts"):
+            root_mapping = slack_mapping_by_key(state, event["workspace"], event["channel_id"], event["thread_ts"])
+            if root_mapping is None:
+                return write_stderr(
+                    "Error: Slack thread root has not been imported; ingest the root message first\n"
+                    "Code: SLACK_THREAD_ROOT_MISSING\n"
+                )
+            root_record = message_by_full_id(state, root_mapping["message_id"])
+            if root_record is None:
+                return write_stderr("Error: Slack thread root mapping points to a missing swarm message\nCode: STATE_CORRUPT\n")
+            target = f"{channel_for_target(root_mapping['target'])}:{short_id(str(root_record['id']))}"
+
+        ensure_slack_channel_catalog(state, base_target, event["channel_id"], event.get("channel_name"))
+        record = append_message(
+            state,
+            target,
+            event["body"],
+            sender_type=event["sender_type"],
+            author=event["author"],
+            timestamp=event["time"],
+        )
+        mapping = slack_message_item(
+            event["workspace"],
+            event["channel_id"],
+            event.get("channel_name"),
+            event["slack_ts"],
+            event.get("thread_ts"),
+            target,
+            record["id"],
+            current_timestamp(),
+        )
+        state.setdefault("slack_messages", []).append(mapping)
+        append_inbox_for_message(state, record)
+        return write_stdout(slack_mapping_output(mapping, record, "Slack event imported."))
+
+    return with_mutable_state(action)
+
+
+def command_slack_resolve(argv: list[str]) -> int:
+    if (
+        flag_missing_value(argv, "--workspace")
+        or flag_missing_value(argv, "--team")
+        or flag_missing_value(argv, "--team-id")
+        or flag_missing_value(argv, "--channel-id")
+        or flag_missing_value(argv, "--channel")
+        or flag_missing_value(argv, "--ts")
+    ):
+        return write_stderr("Error: --workspace, --channel-id, and --ts require values\nCode: INVALID_ARG\n")
+    workspace = arg_value(argv, "--workspace") or arg_value(argv, "--team-id") or arg_value(argv, "--team")
+    channel_id = arg_value(argv, "--channel-id") or arg_value(argv, "--channel")
+    slack_ts = arg_value(argv, "--ts")
+    if not workspace or not channel_id or not slack_ts:
+        return write_stderr("Error: --workspace, --channel-id, and --ts are required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        mapping = slack_mapping_by_key(state, workspace, channel_id, slack_ts)
+        if mapping is None:
+            return write_stderr(
+                "Error: Slack message mapping not found\n"
+                "Code: NOT_FOUND\n"
+                "Next action: Ingest the Slack event before resolving it.\n"
+            )
+        record = message_by_full_id(state, mapping["message_id"])
+        if record is None:
+            return write_stderr("Error: Slack mapping points to a missing swarm message\nCode: STATE_CORRUPT\n")
+        return write_stdout(slack_mapping_output(mapping, record, "Slack message mapping."))
+
+    return with_read_state(action)
+
+
+def command_slack(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing slack subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "ingest":
+        return command_slack_ingest(rest)
+    if subcommand == "resolve":
+        return command_slack_resolve(rest)
+    return write_stderr(f"Error: unknown slack subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def command_message(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing message subcommand\nCode: INVALID_ARG\n")
@@ -3734,6 +4129,8 @@ def main(argv: list[str]) -> int:
         return command_action(argv[1:])
     if command == "attachment":
         return command_attachment(argv[1:])
+    if command == "slack":
+        return command_slack(argv[1:])
     return write_stderr(f"Error: unknown command: {command}\nCode: INVALID_ARG\n")
 
 
