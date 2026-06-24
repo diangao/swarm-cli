@@ -25,6 +25,7 @@ Current implemented surface:
 - `swarm reminder update --id ...`
 - `swarm reminder cancel --id ...`
 - `swarm reminder log --id ...`
+- `swarm daemon run [--once] [--poll-interval ...]` for local reminder auto-fire
 - `swarm server info`
 - `swarm channel members ...`
 - `swarm channel join ...`
@@ -38,8 +39,9 @@ Current implemented surface:
 - local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
 
-It does not implement a daemon, server, automatic reminder firing,
-integrations, or production workspace access.
+It does not implement a network server, integrations, or production workspace
+access. The daemon surface is local-only in this slice: it scans the same
+SQLite store and fires due reminders, but it is not a multi-machine backend.
 
 ## Verify
 
@@ -73,7 +75,8 @@ persistence, target-generic freshness, and wall-clock sent timestamps. It also
 checks SQLite-backed message reaction add/remove rendering, task lifecycle
 create/list/claim/unclaim/update behavior,
 including repeatable task create/claim/unclaim flags, reminder
-schedule/list/snooze/update/cancel/log behavior, local server/channel/profile
+schedule/list/snooze/update/cancel/log plus local daemon auto-fire behavior,
+local server/channel/profile
 catalog reads, profile update and avatar persistence, channel join/leave,
 thread unfollow state, local attachment upload/view byte persistence, message
 attachment rendering, and concurrent write serialization.

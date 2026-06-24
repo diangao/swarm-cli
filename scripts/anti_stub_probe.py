@@ -697,6 +697,138 @@ def probe_reminder_lifecycle(cli: Path, state_dir: Path) -> None:
     require("canceled reminders cannot be snoozed" in rejected, "canceled snooze was not rejected")
 
 
+def probe_daemon_reminder_fire(cli: Path, state_dir: Path) -> None:
+    target = f"#daemon-{uuid.uuid4().hex[:8]}"
+    title = f"daemon reminder {uuid.uuid4()}"
+    scheduled = run(
+        cli,
+        state_dir,
+        "reminder",
+        "schedule",
+        "--target",
+        target,
+        "--title",
+        title,
+        "--in",
+        "0s",
+    ).stdout
+    reminder_id = parse_reminder_id(scheduled)
+
+    first = run(cli, state_dir, "daemon", "run", "--once").stdout
+    require("Daemon processed 1 reminder(s) in 1 iteration(s)." in first, "daemon did not fire due reminder")
+
+    log = run(cli, state_dir, "reminder", "log", "--id", reminder_id).stdout
+    require("fired:" in log, "daemon fire did not append reminder log event")
+    require(f"{reminder_id} [fired]" in log, "fired reminder status missing from log")
+
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(f"Reminder {reminder_id}: {title}" in history, "daemon did not append reminder target message")
+    require("type=system" in history and "@system" in history, "daemon reminder message was not a system message")
+
+    inbox = run(cli, state_dir, "message", "check").stdout
+    require(f"Reminder {reminder_id}: {title}" in inbox, "daemon reminder did not enqueue local inbox delivery")
+
+    second = run(cli, state_dir, "daemon", "run", "--once").stdout
+    require("Daemon processed 0 reminder(s) in 1 iteration(s)." in second, "daemon fired one-shot reminder twice")
+
+    conn = connect_state(state_dir)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE body = ?",
+            (f"Reminder {reminder_id}: {title}",),
+        ).fetchone()
+        fire_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM reminder_events WHERE reminder_id = ? AND event = 'fired'",
+            (reminder_id,),
+        ).fetchone()
+        require(message_count is not None and message_count["count"] == 1, "daemon duplicated reminder message")
+        require(fire_count is not None and fire_count["count"] == 1, "daemon duplicated fired event")
+    finally:
+        conn.close()
+
+    recurring_title = f"recurring daemon reminder {uuid.uuid4()}"
+    recurring = run(
+        cli,
+        state_dir,
+        "reminder",
+        "schedule",
+        "--target",
+        target,
+        "--title",
+        recurring_title,
+        "--at",
+        "2001-01-01T00:00:00",
+        "--every",
+        "1d",
+    ).stdout
+    recurring_id = parse_reminder_id(recurring)
+    catch_up = run(cli, state_dir, "daemon", "run", "--once").stdout
+    require("Daemon processed 1 reminder(s) in 1 iteration(s)." in catch_up, "daemon did not catch up overdue recurring reminder")
+    recurring_list = run(cli, state_dir, "reminder", "list").stdout
+    require(f"{recurring_id} [scheduled]" in recurring_list, "recurring reminder was not rescheduled")
+    require("every=1d" in recurring_list, "recurring reminder lost recurrence")
+    conn = connect_state(state_dir)
+    try:
+        row = conn.execute("SELECT next_fire_at FROM reminders WHERE id = ?", (recurring_id,)).fetchone()
+        require(row is not None, "recurring reminder missing after daemon fire")
+        next_fire = datetime.strptime(row["next_fire_at"], "%Y-%m-%d %H:%M:%S")
+        require(next_fire > datetime.now(), "recurring reminder next fire did not advance past now")
+        fire_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM reminder_events WHERE reminder_id = ? AND event = 'fired'",
+            (recurring_id,),
+        ).fetchone()
+        require(fire_count is not None and fire_count["count"] == 1, "recurring daemon fire count mismatch")
+    finally:
+        conn.close()
+
+    race_target = f"#daemon-race-{uuid.uuid4().hex[:8]}"
+    race_titles = [f"daemon race reminder {index} {uuid.uuid4()}" for index in range(5)]
+    for title_item in race_titles:
+        run(
+            cli,
+            state_dir,
+            "reminder",
+            "schedule",
+            "--target",
+            race_target,
+            "--title",
+            title_item,
+            "--in",
+            "0s",
+        )
+    cli_bodies = [f"daemon race cli body {index} {uuid.uuid4()}" for index in range(10)]
+
+    def send_cli_body(body: str) -> None:
+        run(cli, state_dir, "message", "send", "--target", race_target, stdin=body)
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(send_cli_body, body) for body in cli_bodies]
+        futures.append(executor.submit(run, cli, state_dir, "daemon", "run", "--once"))
+        for future in as_completed(futures):
+            result = future.result()
+            if isinstance(result, subprocess.CompletedProcess):
+                require(
+                    "Daemon processed 5 reminder(s) in 1 iteration(s)." in result.stdout,
+                    "concurrent daemon run did not fire all race reminders",
+                )
+
+    conn = connect_state(state_dir)
+    try:
+        for body in cli_bodies:
+            row = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ? AND body = ?", (race_target, body)).fetchone()
+            require(row is not None and row["count"] == 1, "concurrent CLI write lost or duplicated a message")
+        for title_item in race_titles:
+            reminder_body = conn.execute(
+                "SELECT COUNT(*) AS count FROM messages WHERE target = ? AND body LIKE ?",
+                (race_target, f"%{title_item}%"),
+            ).fetchone()
+            require(reminder_body is not None and reminder_body["count"] == 1, "concurrent daemon write lost or duplicated a reminder")
+        total = conn.execute("SELECT COUNT(*) AS count FROM messages WHERE target = ?", (race_target,)).fetchone()
+        require(total is not None and total["count"] == len(cli_bodies) + len(race_titles), "daemon/CLI concurrent total message count mismatch")
+    finally:
+        conn.close()
+
+
 def probe_navigation_surfaces(cli: Path, state_dir: Path) -> None:
     server_info = run(cli, state_dir, "server", "info").stdout
     require("### Channels" in server_info, "server info missing Channels section")
@@ -953,11 +1085,12 @@ def main() -> int:
         probe_cross_process_locking(cli, state_dir)
         probe_task_lifecycle(cli, state_dir)
         probe_reminder_lifecycle(cli, state_dir)
+        probe_daemon_reminder_fire(cli, state_dir)
         probe_navigation_surfaces(cli, state_dir)
         probe_membership_attention(cli, state_dir)
         probe_attachments(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders, navigation, profile avatars, membership, and attachments")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks, reminders/daemon fire, navigation, profile avatars, membership, and attachments")
     return 0
 
 
