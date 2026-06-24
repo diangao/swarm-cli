@@ -1864,6 +1864,171 @@ def probe_integration_local_login(cli: Path, state_dir: Path) -> None:
         conn.close()
 
 
+def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
+    workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    channel_name = f"probe-{uuid.uuid4().hex[:6]}"
+    target = f"#slack-{channel_id.lower()}"
+
+    def slack_ts(seconds: int) -> str:
+        return f"{seconds}.{uuid.uuid4().int % 1_000_000:06d}"
+
+    root_ts = slack_ts(1762000000)
+    reply_ts = slack_ts(1762000010)
+    root_body = f"slack adapter root {uuid.uuid4()}"
+    reply_body = f"slack adapter reply {uuid.uuid4()}"
+
+    root_event = {
+        "team_id": workspace,
+        "event": {
+            "type": "message",
+            "channel": channel_id,
+            "channel_name": channel_name,
+            "user": "U123ROOT",
+            "text": root_body,
+            "ts": root_ts,
+        },
+    }
+    imported = run(cli, state_dir, "slack", "ingest", stdin=json.dumps(root_event)).stdout
+    root_id = parse_message_id(imported)
+    require("Slack event imported." in imported, "slack root ingest did not acknowledge import")
+    require(f"Workspace: {workspace}" in imported, "slack root ingest missing workspace")
+    require(f"Channel: {channel_id} ({channel_name}) -> {target}" in imported, "slack root ingest did not map channel")
+    require(f"Target: {target}" in imported, "slack root ingest missing swarm target")
+    require(root_body in imported, "slack root ingest missing message body")
+    require("Source of truth: swarm SQLite state" in imported, "slack ingest did not state source-of-truth boundary")
+
+    inbox = run(cli, state_dir, "message", "check").stdout
+    require(root_body in inbox, "slack root ingest did not enqueue inbox delivery")
+    require(f"[target={target} msg={root_id[:8]}" in inbox, "slack root inbox row missing mapped target/id")
+
+    duplicate = run(cli, state_dir, "slack", "ingest", stdin=json.dumps(root_event)).stdout
+    duplicate_id = parse_message_id(duplicate)
+    require("Slack event already imported." in duplicate, "duplicate slack ingest was not idempotent")
+    require(duplicate_id == root_id, "duplicate slack ingest returned a different swarm message id")
+    drained = run(cli, state_dir, "message", "check").stdout
+    require(drained == "No new messages.\n", "duplicate slack ingest enqueued another inbox delivery")
+
+    resolved = run(
+        cli,
+        state_dir,
+        "slack",
+        "resolve",
+        "--workspace",
+        workspace,
+        "--channel-id",
+        channel_id,
+        "--ts",
+        root_ts,
+    ).stdout
+    require("Slack message mapping." in resolved, "slack resolve missing mapping heading")
+    require(root_id in resolved and f"Target: {target}" in resolved, "slack resolve did not return persisted root mapping")
+    require(root_body in resolved, "slack resolve did not read canonical swarm message body")
+
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(root_body in history, "slack root message was not visible in swarm channel history")
+    require(history.count(root_body) == 1, "duplicate slack ingest created multiple root messages")
+    require(f"@slack:U123ROOT" in history, "slack user was not preserved as message author")
+
+    server_info = run(cli, state_dir, "server", "info").stdout
+    require(f"{target} (public, joined) - Slack channel {channel_id} ({channel_name})" in server_info, "slack ingest did not catalog mapped channel")
+
+    reply_event = {
+        "team_id": workspace,
+        "event": {
+            "type": "message",
+            "channel": channel_id,
+            "channel_name": channel_name,
+            "user": "U456REPLY",
+            "text": reply_body,
+            "ts": reply_ts,
+            "thread_ts": root_ts,
+        },
+    }
+    reply_imported = run(cli, state_dir, "slack", "ingest", stdin=json.dumps(reply_event)).stdout
+    reply_id = parse_message_id(reply_imported)
+    thread_target = f"{target}:{root_id[:8]}"
+    require("Slack event imported." in reply_imported, "slack thread reply ingest did not acknowledge import")
+    require(f"Thread ts: {root_ts}" in reply_imported, "slack thread reply output missing thread root ts")
+    require(f"Target: {thread_target}" in reply_imported, "slack reply did not map to swarm thread target")
+
+    thread_history = run(cli, state_dir, "message", "read", "--channel", thread_target).stdout
+    require(root_body in thread_history and reply_body in thread_history, "slack thread history did not include root and reply")
+    parent_history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(root_body in parent_history, "slack parent history lost root message")
+    require(reply_body not in parent_history, "slack thread reply leaked into parent channel history")
+
+    reply_inbox = run(cli, state_dir, "message", "check").stdout
+    require(reply_body in reply_inbox, "slack reply ingest did not enqueue inbox delivery")
+    require(f"[target={thread_target} msg={reply_id[:8]}" in reply_inbox, "slack reply inbox row missing thread target/id")
+
+    missing_root_body = f"missing root should not persist {uuid.uuid4()}"
+    missing_root_event = {
+        "team_id": workspace,
+        "event": {
+            "type": "message",
+            "channel": channel_id,
+            "user": "U789MISS",
+            "text": missing_root_body,
+            "ts": slack_ts(1762000020),
+            "thread_ts": slack_ts(1761999999),
+        },
+    }
+    rejected_missing_root = run(
+        cli,
+        state_dir,
+        "slack",
+        "ingest",
+        stdin=json.dumps(missing_root_event),
+        expected=1,
+    ).stderr
+    require("Slack thread root has not been imported" in rejected_missing_root, "slack missing thread root did not fail closed")
+
+    invalid_event = {
+        "team_id": workspace,
+        "event": {
+            "type": "reaction_added",
+            "channel": channel_id,
+            "user": "UINVALID",
+            "ts": slack_ts(1762000030),
+        },
+    }
+    invalid = run(cli, state_dir, "slack", "ingest", stdin=json.dumps(invalid_event), expected=1).stderr
+    require("only Slack message events are supported" in invalid, "unsupported Slack event did not fail closed")
+
+    conn = connect_state(state_dir)
+    try:
+        root_rows = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE id = ? AND target = ? AND body = ?",
+            (root_id, target, root_body),
+        ).fetchone()
+        require(root_rows is not None and root_rows["count"] == 1, "slack root message was not persisted exactly once")
+        reply_rows = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE id = ? AND target = ? AND body = ?",
+            (reply_id, thread_target, reply_body),
+        ).fetchone()
+        require(reply_rows is not None and reply_rows["count"] == 1, "slack reply message was not persisted exactly once")
+        mappings = conn.execute(
+            """
+            SELECT slack_ts, thread_ts, target, message_id
+            FROM slack_messages
+            WHERE workspace = ? AND channel_id = ?
+            ORDER BY slack_ts
+            """,
+            (workspace, channel_id),
+        ).fetchall()
+        require(len(mappings) == 2, "slack mapping table did not persist root and reply only")
+        require(mappings[0]["slack_ts"] == root_ts and mappings[0]["message_id"] == root_id, "slack root mapping mismatch")
+        require(mappings[1]["thread_ts"] == root_ts and mappings[1]["message_id"] == reply_id, "slack reply mapping mismatch")
+        missing_rows = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE body = ?",
+            (missing_root_body,),
+        ).fetchone()
+        require(missing_rows is not None and missing_rows["count"] == 0, "failed slack ingest persisted a missing-root message")
+    finally:
+        conn.close()
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -1888,8 +2053,9 @@ def main() -> int:
         probe_integration_local_login(cli, state_dir)
         probe_attachments(cli, state_dir)
         probe_action_prepare(cli, state_dir)
+        probe_slack_adapter(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, action prepare, and Slack adapter ingest/resolve")
     return 0
 
 

@@ -39,6 +39,8 @@ Current implemented surface:
 - `swarm attachment upload --path ... --channel ... [--mime-type ...]`
 - `swarm attachment view --id ... --output ...`
 - `swarm action prepare --target ...` for local pending `channel:create` / `agent:create` action cards
+- `swarm slack ingest [--event-file ...]` to import a Slack message-event JSON payload into swarm state
+- `swarm slack resolve --workspace ... --channel-id ... --ts ...` to resolve a Slack message timestamp to its swarm target/message
 - `--content` rejection
 - local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
@@ -50,6 +52,26 @@ due reminders, integration login creates a local placeholder record plus
 per-service environment paths without third-party identity exchange, and
 prepared actions are pending records/messages for a human commit path, not a
 remote execution backend.
+
+## Slack Adapter Boundary
+
+Slack is treated as an adapter input and UI surface, not as the canonical
+coordination store. The current seam accepts local Slack-style message-event
+JSON only; it does not connect to Slack Web API, Events API, OAuth, Socket Mode,
+or real workspaces.
+
+`swarm slack ingest` maps a Slack root message to a swarm channel target derived
+from the Slack channel id (`C123` -> `#slack-c123`), stores a durable
+`slack_messages` mapping row, appends the canonical swarm message, and enqueues
+normal local inbox delivery. Slack thread replies require the root Slack message
+to have been ingested first; replies map to the canonical swarm thread target
+derived from the root swarm message id. Duplicate Slack events are idempotent
+and resolve back to the original swarm message instead of appending another row.
+
+This keeps task, reminder, claim, read/search/resolve, and freshness semantics
+owned by swarm's SQLite state while leaving room for a later
+`swarm-slack-adapter` process to perform real Slack authentication, event
+subscription, and outbound rendering.
 
 ## Verify
 
@@ -89,3 +111,6 @@ catalog reads, profile update and avatar persistence, channel join/leave,
 thread unfollow state, local integration manifest/login/env state, local
 attachment upload/view byte persistence, message attachment rendering,
 persisted action-card preparation, and concurrent write serialization.
+It also checks Slack adapter root-message import, duplicate idempotence,
+thread-root fail-closed behavior, Slack-to-swarm resolve, inbox delivery,
+channel cataloging, and persisted mapping rows.
