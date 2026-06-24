@@ -211,9 +211,22 @@ def probe_inbox(cli: Path, state_dir: Path) -> None:
 
 
 def probe_send_read_and_routes(cli: Path, state_dir: Path) -> None:
+    channel_target = f"#replyhint-{uuid.uuid4().hex[:8]}"
+    channel_body = f"top-level reply hint body {uuid.uuid4()}"
+    channel_sent = run(cli, state_dir, "message", "send", "--target", channel_target, stdin=channel_body).stdout
+    channel_id = parse_message_id(channel_sent)
+    require(
+        f'use target "{channel_target}:{channel_id[:8]}"' in channel_sent,
+        "top-level channel send did not render message-root thread target hint",
+    )
+
     thread_body = f"anti-stub thread body {uuid.uuid4()}\nline two"
     sent = run(cli, state_dir, "message", "send", "--target", "#general:00000000", stdin=thread_body).stdout
     sent_id = parse_message_id(sent)
+    require(
+        'use target "#general:00000000"' in sent,
+        "thread send rendered nested thread target hint instead of staying in thread",
+    )
 
     thread_history = run(cli, state_dir, "message", "read", "--channel", "#general:00000000").stdout
     require(thread_body in thread_history, "thread send body was not read back verbatim")
@@ -241,6 +254,10 @@ def probe_send_read_and_routes(cli: Path, state_dir: Path) -> None:
     dm_sent = run(cli, state_dir, "message", "send", "--target", dm_target, stdin=dm_body).stdout
     dm_id = parse_message_id(dm_sent)
     require(f"Message sent to {dm_target}." in dm_sent, "DM send did not succeed")
+    require(
+        f'use target "{dm_target}:{dm_id[:8]}"' in dm_sent,
+        "top-level DM send did not render DM thread target hint",
+    )
     dm_history = run(cli, state_dir, "message", "read", "--channel", dm_target).stdout
     require(dm_body in dm_history, "DM body was not read back")
     require(dm_id in dm_history, "DM read did not include generated message id")
@@ -1661,7 +1678,7 @@ def main() -> int:
         probe_attachments(cli, state_dir)
         probe_action_prepare(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, search/resolve, reactions, routing, freshness cursor, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, and action prepare")
     return 0
 
 

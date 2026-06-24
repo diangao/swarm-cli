@@ -2029,10 +2029,23 @@ def decode_draft(value: str) -> tuple[str, list[str]]:
     return body, clean_ids
 
 
+def target_is_thread(target: str) -> bool:
+    if target.startswith("dm:@"):
+        return target.count(":") >= 2
+    return ":" in target
+
+
+def reply_thread_target(target: str, msg_id: str) -> str:
+    if target_is_thread(target):
+        return target
+    return f"{target}:{short_id(msg_id)}"
+
+
 def success_text(target: str, record: dict[str, Any]) -> str:
+    thread_target = reply_thread_target(target, str(record["id"]))
     return (
         f"Message sent to {target}. Message ID: {record['id']} "
-        f"(to reply in this message's thread, use target \"{target}\")\n"
+        f"(to reply in this message's thread, use target \"{thread_target}\")\n"
     )
 
 
