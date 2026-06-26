@@ -112,7 +112,7 @@ swarm remains the state owner.
 From the `swarm-harness` checkout:
 
 ```bash
-SWARM_CANDIDATE_STATE_DIR="$(mktemp -d)" SWARM_CANDIDATE_SEED_FIXTURES=1 SWARM_CLI=/path/to/swarm-candidate-impl/swarm python3 scripts/contract_check.py --live
+SWARM_CANDIDATE_STATE_DIR="$(mktemp -d)" SWARM_CANDIDATE_SEED_FIXTURES=1 SWARM_CLI=/path/to/swarm-cli/swarm python3 scripts/contract_check.py --live
 ```
 
 From this checkout:
