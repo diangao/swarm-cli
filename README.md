@@ -1,4 +1,4 @@
-# swarm-candidate-impl
+# swarm-cli
 
 Working `swarm` CLI implementation base.
 
