@@ -1883,6 +1883,16 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
     name = "curator"
     display_name = f"Curator {uuid.uuid4().hex[:6]}"
     avatar_url = f"https://example.com/avatar/{uuid.uuid4().hex}.png"
+
+    def registered_agent_count() -> int:
+        conn = connect_state(state_dir)
+        try:
+            row = conn.execute("SELECT COUNT(*) AS total FROM agents").fetchone()
+            require(row is not None, "agent count query returned no row")
+            return int(row["total"])
+        finally:
+            conn.close()
+
     registered = run(
         cli,
         state_dir,
@@ -1908,12 +1918,76 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
     listed = run(cli, state_dir, "agent", "list").stdout
     require(f"@{name} ({display_name}) runtime=codex" in listed, "agent list did not render registered agent")
     require("capabilities=triage,write" in listed, "agent list did not render capabilities")
+    list_unknown = run(cli, state_dir, "agent", "list", "--bogus", expected=1).stderr
+    require("unknown agent list flag: --bogus" in list_unknown, "agent list did not reject unknown flags")
     server_info = run(cli, state_dir, "server", "info").stdout
     require(f"@{name} ({display_name})" in server_info, "server info did not include registered agent profile")
+
+    count_after_register = registered_agent_count()
+    register_bogus = run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        "bogus",
+        "--display-name",
+        "Bogus",
+        "--runtime",
+        "codex",
+        "--totally-bogus-flag",
+        "value",
+        expected=1,
+    ).stderr
+    require(
+        "unknown agent register flag: --totally-bogus-flag" in register_bogus,
+        "agent register did not reject arbitrary unknown flag",
+    )
+    register_capabilities = run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        "typo-caps",
+        "--display-name",
+        "Typo Caps",
+        "--runtime",
+        "codex",
+        "--capabilities",
+        "triage",
+        expected=1,
+    ).stderr
+    require(
+        "unknown agent register flag: --capabilities" in register_capabilities,
+        "agent register did not reject --capabilities typo",
+    )
+    register_avatar = run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        "typo-avatar",
+        "--display-name",
+        "Typo Avatar",
+        "--runtime",
+        "codex",
+        "--avatar",
+        avatar_url,
+        expected=1,
+    ).stderr
+    require(
+        "unknown agent register flag: --avatar" in register_avatar,
+        "agent register did not reject --avatar typo",
+    )
+    require(registered_agent_count() == count_after_register, "unknown register flags mutated agent registry")
 
     seed_dir = state_dir / "agent-seed"
     seeded = run(cli, state_dir, "agent", "seed", "--name", name, "--output-dir", str(seed_dir)).stdout
     require("Seed workspace skeleton written" in seeded, "agent seed did not acknowledge skeleton write")
+    seed_unknown = run(cli, state_dir, "agent", "seed", "--name", name, "--output-dir", str(seed_dir), "--bogus", expected=1).stderr
+    require("unknown agent seed flag: --bogus" in seed_unknown, "agent seed did not reject unknown flags")
     required_files = ["seed.json", "MEMORY.md", "README.md", ".gitignore"]
     for filename in required_files:
         require((seed_dir / filename).exists(), f"agent seed missing {filename}")
@@ -1961,11 +2035,18 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
         "ready",
     ).stdout
     require(f"Heartbeat recorded for @{name}: alive" in heartbeat, "agent heartbeat did not acknowledge update")
+    heartbeat_unknown = run(cli, state_dir, "agent", "heartbeat", "--name", name, "--bogus", expected=1).stderr
+    require("unknown agent heartbeat flag: --bogus" in heartbeat_unknown, "agent heartbeat did not reject unknown flags")
     supervisor = run(cli, state_dir, "agent", "supervisor-plan").stdout
     plans = [json.loads(line) for line in supervisor.splitlines() if line.startswith("{")]
     require(len(plans) == 1, "agent supervisor plan did not render one plan")
     require(plans[0]["agent"] == name and plans[0]["workspace"] == f"agents/{name}", "agent supervisor plan fields mismatch")
     require("No worker process was started" in supervisor, "agent supervisor plan did not state no-start boundary")
+    supervisor_unknown = run(cli, state_dir, "agent", "supervisor-plan", "--bogus", expected=1).stderr
+    require(
+        "unknown agent supervisor-plan flag: --bogus" in supervisor_unknown,
+        "agent supervisor-plan did not reject unknown flags",
+    )
 
     target = f"#agent-author-{uuid.uuid4().hex[:8]}"
     body = f"registered author body {uuid.uuid4()}"
