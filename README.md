@@ -39,6 +39,9 @@ Current implemented surface:
 - `swarm attachment upload --path ... --channel ... [--mime-type ...]`
 - `swarm attachment view --id ... --output ...`
 - `swarm action prepare --target ...` for local pending `channel:create` / `agent:create` action cards
+- `swarm agent register/list/heartbeat/seed/supervisor-plan`
+- `swarm agent worker --name ... [--once] [--require-seed]` for a persistent heartbeat loop backed by an agent workspace seed
+- `swarm agent collab-smoke --channel ... --task-author ... --worker ... --verifier ...` to exercise the A→B→C task/report/verify path in canonical state
 - `swarm slack configure --workspace ... --bot-token-env ... [--signing-secret-env ...] [--app-token-env ...]`
 - `swarm slack env --workspace ...`
 - `swarm slack export-history --workspace ... --channel-id ... [--channel-name ...] [--include-replies]` to export Slack channel history as ingest-compatible event JSON rows
