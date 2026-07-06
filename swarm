@@ -14,6 +14,7 @@ import shutil
 import shlex
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from html import escape
 from copy import deepcopy
@@ -2370,10 +2371,10 @@ def slack_web_api_call(
 ) -> tuple[dict[str, Any] | None, str | None]:
     request = urllib.request.Request(
         f"https://slack.com/api/{method_name}",
-        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        data=urllib.parse.urlencode(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8",
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
         },
         method="POST",
     )

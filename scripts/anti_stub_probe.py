@@ -11,9 +11,12 @@ import sys
 import tempfile
 import uuid
 import json
+import importlib.machinery
+import importlib.util
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qs
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +35,15 @@ def fail(message: str) -> None:
 def require(condition: bool, message: str) -> None:
     if not condition:
         fail(message)
+
+
+def load_cli_module(cli: Path) -> object:
+    loader = importlib.machinery.SourceFileLoader("swarm_under_probe", str(cli))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    require(spec is not None, "could not load swarm CLI module spec")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 def run(
@@ -1915,6 +1927,49 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
         expected=1,
     ).stderr
     require("valid environment variable name" in invalid_config, "invalid Slack env var did not fail closed")
+
+    cli_module = load_cli_module(cli)
+    captured_requests: list[object] = []
+
+    class FakeSlackResponse:
+        def __enter__(self) -> "FakeSlackResponse":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"ok":true,"messages":[],"has_more":false}'
+
+    def fake_urlopen(request: object, timeout: float) -> FakeSlackResponse:
+        captured_requests.append(request)
+        return FakeSlackResponse()
+
+    original_urlopen = cli_module.urllib.request.urlopen
+    try:
+        cli_module.urllib.request.urlopen = fake_urlopen
+        response, response_error = cli_module.slack_web_api_call(
+            "test-token",
+            "conversations.replies",
+            {"channel": "CEXPORT", "ts": "1761999900.000001", "limit": 200},
+            3.0,
+        )
+    finally:
+        cli_module.urllib.request.urlopen = original_urlopen
+    require(response_error is None and response is not None, "slack history transport probe failed")
+    require(len(captured_requests) == 1, "slack history transport did not issue one request")
+    request = captured_requests[0]
+    require(request.get_method() == "POST", "slack history transport did not use POST")
+    content_type = request.get_header("Content-type") or request.get_header("Content-Type")
+    require(
+        content_type == "application/x-www-form-urlencoded; charset=utf-8",
+        f"slack history transport used wrong content type: {content_type}",
+    )
+    encoded = request.data.decode("utf-8")
+    parsed = parse_qs(encoded)
+    require(parsed.get("channel") == ["CEXPORT"], "slack history transport did not encode channel")
+    require(parsed.get("ts") == ["1761999900.000001"], "slack history transport did not encode ts")
+    require(not encoded.startswith("{"), "slack history transport still used JSON body")
 
     export_channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
     export_channel_name = f"export-{uuid.uuid4().hex[:6]}"
