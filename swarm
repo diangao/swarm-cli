@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -310,6 +310,46 @@ def profile_item(
     }
 
 
+def agent_item(
+    name: str,
+    display_name: str,
+    runtime: str,
+    workspace_path: str,
+    capabilities: list[str],
+    avatar_url: str | None,
+    created_at: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "display_name": display_name,
+        "runtime": runtime,
+        "workspace_path": workspace_path,
+        "capabilities": capabilities,
+        "avatar_url": avatar_url,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def agent_heartbeat_item(
+    name: str,
+    status: str,
+    pid: str | None,
+    session_id: str | None,
+    detail: str | None,
+    updated_at: str,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": status,
+        "pid": pid,
+        "session_id": session_id,
+        "detail": detail,
+        "updated_at": updated_at,
+    }
+
+
 def thread_attention_item(target: str, followed: bool, updated_at: str) -> dict[str, Any]:
     return {
         "target": target,
@@ -394,6 +434,8 @@ EMPTY_STATE: dict[str, Any] = {
     "channels": [],
     "channel_members": [],
     "profiles": BASE_PROFILES,
+    "agents": [],
+    "agent_heartbeats": [],
     "thread_attention": [],
 }
 
@@ -517,6 +559,8 @@ SEED_STATE: dict[str, Any] = {
     "channels": SEED_CHANNELS,
     "channel_members": SEED_CHANNEL_MEMBERS,
     "profiles": SEED_PROFILES,
+    "agents": [],
+    "agent_heartbeats": [],
     "thread_attention": [
         thread_attention_item("#general:00000000", True, "2026-03-15 01:00:10"),
     ],
@@ -606,6 +650,24 @@ def create_schema(conn: sqlite3.Connection) -> None:
             app_token_env TEXT,
             mode TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agents (
+            name TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            runtime TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL,
+            avatar_url TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_heartbeats (
+            name TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            pid TEXT,
+            session_id TEXT,
+            detail TEXT,
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS slack_messages (
@@ -768,6 +830,8 @@ def ensure_profile_columns(conn: sqlite3.Connection) -> None:
 
 def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM inbox")
+    conn.execute("DELETE FROM agent_heartbeats")
+    conn.execute("DELETE FROM agents")
     conn.execute("DELETE FROM slack_workspaces")
     conn.execute("DELETE FROM slack_messages")
     conn.execute("DELETE FROM messages")
@@ -849,6 +913,42 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 record["updated_at"],
             )
             for record in state.get("slack_workspaces", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO agents(name, display_name, runtime, workspace_path, capabilities_json, avatar_url, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                record["name"],
+                record["display_name"],
+                record["runtime"],
+                record["workspace_path"],
+                json.dumps(record.get("capabilities", []), sort_keys=True, separators=(",", ":")),
+                record.get("avatar_url"),
+                record["created_at"],
+                record["updated_at"],
+            )
+            for record in state.get("agents", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO agent_heartbeats(name, status, pid, session_id, detail, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                record["name"],
+                record["status"],
+                record.get("pid"),
+                record.get("session_id"),
+                record.get("detail"),
+                record["updated_at"],
+            )
+            for record in state.get("agent_heartbeats", [])
         ],
     )
     inbox_rows = []
@@ -1176,6 +1276,16 @@ def inbox_rows(conn: sqlite3.Connection, kind: str) -> list[dict[str, Any]]:
     ]
 
 
+def decode_capabilities(value: str) -> list[str]:
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [item for item in decoded if isinstance(item, str)]
+
+
 def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
     messages = [
         message(row["seq"], row["target"], row["id"], row["time"], row["type"], row["author"], row["body"])
@@ -1217,6 +1327,42 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             SELECT workspace, bot_token_env, signing_secret_env, app_token_env, mode, created_at, updated_at
             FROM slack_workspaces
             ORDER BY workspace
+            """
+        ).fetchall()
+    ]
+    agents = [
+        agent_item(
+            row["name"],
+            row["display_name"],
+            row["runtime"],
+            row["workspace_path"],
+            decode_capabilities(row["capabilities_json"]),
+            row["avatar_url"],
+            row["created_at"],
+            row["updated_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT name, display_name, runtime, workspace_path, capabilities_json, avatar_url, created_at, updated_at
+            FROM agents
+            ORDER BY name
+            """
+        ).fetchall()
+    ]
+    agent_heartbeats = [
+        agent_heartbeat_item(
+            row["name"],
+            row["status"],
+            row["pid"],
+            row["session_id"],
+            row["detail"],
+            row["updated_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT name, status, pid, session_id, detail, updated_at
+            FROM agent_heartbeats
+            ORDER BY name
             """
         ).fetchall()
     ]
@@ -1443,6 +1589,8 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "messages": messages,
         "slack_workspaces": slack_workspaces,
         "slack_messages": slack_messages,
+        "agents": agents,
+        "agent_heartbeats": agent_heartbeats,
         "remote_inbox": inbox_rows(conn, "remote"),
         "local_inbox": inbox_rows(conn, "local"),
         "freshness": freshness,
@@ -1598,6 +1746,18 @@ def format_integration_row(service: dict[str, Any], login: dict[str, Any] | None
     )
 
 
+def format_agent_row(agent: dict[str, Any], heartbeat: dict[str, Any] | None) -> str:
+    capabilities = ",".join(agent.get("capabilities", [])) or "-"
+    avatar = f" avatar={agent['avatar_url']}" if agent.get("avatar_url") else ""
+    heartbeat_text = " heartbeat=missing"
+    if heartbeat is not None:
+        heartbeat_text = f" heartbeat={heartbeat['status']} at {heartbeat['updated_at']}"
+    return (
+        f"- @{agent['name']} ({agent['display_name']}) runtime={agent['runtime']} "
+        f"workspace={agent['workspace_path']} capabilities={capabilities}{avatar}{heartbeat_text}"
+    )
+
+
 def member_display(record: dict[str, Any]) -> str:
     parts = [f"@{record['name']}"]
     if record.get("role"):
@@ -1738,11 +1898,33 @@ def profile_by_name(state: dict[str, Any], name: str) -> dict[str, Any] | None:
     return None
 
 
+def agent_by_name(state: dict[str, Any], name: str) -> dict[str, Any] | None:
+    normalized = name.removeprefix("@")
+    for record in state.get("agents", []):
+        if record["name"] == normalized:
+            return record
+    return None
+
+
+def heartbeat_by_agent(state: dict[str, Any], name: str) -> dict[str, Any] | None:
+    for record in state.get("agent_heartbeats", []):
+        if record["name"] == name:
+            return record
+    return None
+
+
 def valid_service_name(name: str) -> bool:
     if not name:
         return False
     allowed = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
     return name[0].islower() and all(char in allowed for char in name)
+
+
+def valid_workspace_path(value: str) -> bool:
+    if not value or value.startswith("/") or "\\" in value:
+        return False
+    path = Path(value)
+    return all(part not in {"", ".", ".."} for part in path.parts)
 
 
 def integration_service_by_name(state: dict[str, Any], name: str) -> dict[str, Any] | None:
@@ -2300,7 +2482,13 @@ def slack_outbound_plan_item(
         "swarm_message_id": record["id"],
         "swarm_target": record["target"],
         "swarm_seq": record["seq"],
+        "swarm_author": record["author"],
     }
+    agent = agent_by_name(state, str(record["author"]))
+    if agent is not None:
+        request["username"] = agent["display_name"]
+        if agent.get("avatar_url"):
+            request["icon_url"] = agent["avatar_url"]
     if thread_ts is not None:
         request["thread_ts"] = thread_ts
     return request, None
@@ -2312,6 +2500,10 @@ def slack_sendable_payload(plan: dict[str, Any]) -> dict[str, Any]:
         "text": plan["text"],
         "client_msg_id": plan["client_msg_id"],
     }
+    if "username" in plan:
+        payload["username"] = plan["username"]
+    if "icon_url" in plan:
+        payload["icon_url"] = plan["icon_url"]
     if "thread_ts" in plan:
         payload["thread_ts"] = plan["thread_ts"]
     return payload
@@ -3015,13 +3207,25 @@ def command_message_send(argv: list[str]) -> int:
             "Code: CONTENT_FLAG_UNSUPPORTED\n"
         )
 
+    if flag_missing_value(argv, "--author"):
+        return write_stderr("Error: --author requires a value\nCode: INVALID_ARG\n")
     target = arg_value(argv, "--target")
     if target is None:
         return write_stderr("Error: --target is required\nCode: INVALID_ARG\n")
     target_allowed = target.startswith("#") or target.startswith("dm:@")
     attachment_ids = arg_values(argv, "--attachment-id")
+    author = (arg_value(argv, "--author") or "candidate").removeprefix("@")
+    if not author:
+        return write_stderr("Error: --author requires a value\nCode: INVALID_ARG\n")
 
     def action(state: dict[str, Any]) -> int:
+        author_profile = profile_by_name(state, author)
+        if (
+            author != "candidate"
+            and agent_by_name(state, author) is None
+            and (author_profile is None or author_profile.get("kind") != "agent")
+        ):
+            return write_stderr("Error: Author not found\nCode: NOT_FOUND\n")
         if "--send-draft" in argv:
             if not target_allowed:
                 return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
@@ -3034,7 +3238,7 @@ def command_message_send(argv: list[str]) -> int:
             attachments, attachment_error = resolve_message_attachments(state, target, draft_attachment_ids)
             if attachment_error is not None:
                 return write_stderr(f"Error: {attachment_error}\nCode: NOT_FOUND\n")
-            record = append_message(state, target, body, attachments)
+            record = append_message(state, target, body, attachments, author=author)
             state["freshness"][target]["draft"] = None
             state["freshness"][target]["cursor"] = record["seq"]
             return write_stdout(success_text(target, record))
@@ -3049,7 +3253,7 @@ def command_message_send(argv: list[str]) -> int:
             return write_stderr(f"Error: {attachment_error}\nCode: NOT_FOUND\n")
         if freshness_blockers(state, target):
             return render_freshness_hold(state, target, body, [record["id"] for record in attachments])
-        record = append_message(state, target, body, attachments)
+        record = append_message(state, target, body, attachments, author=author)
         if target in state.get("freshness", {}):
             state["freshness"][target]["cursor"] = record["seq"]
         return write_stdout(success_text(target, record))
@@ -3694,6 +3898,274 @@ def command_daemon(argv: list[str]) -> int:
     if subcommand == "run":
         return command_daemon_run(rest)
     return write_stderr(f"Error: unknown daemon subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
+def command_agent_register(argv: list[str]) -> int:
+    if (
+        flag_missing_value(argv, "--name")
+        or flag_missing_value(argv, "--display-name")
+        or flag_missing_value(argv, "--runtime")
+        or flag_missing_value(argv, "--workspace")
+        or flag_missing_value(argv, "--avatar-url")
+        or flag_missing_value(argv, "--capability")
+    ):
+        return write_stderr("Error: Agent register flags require values\nCode: INVALID_ARG\n")
+    name = arg_value(argv, "--name")
+    display_name = arg_value(argv, "--display-name")
+    runtime = arg_value(argv, "--runtime")
+    avatar_url = arg_value(argv, "--avatar-url")
+    if name is not None:
+        name = name.removeprefix("@")
+    if not name or not valid_service_name(name):
+        return write_stderr("Error: --name must start lowercase and contain only lowercase letters, digits, '_' or '-'\nCode: INVALID_ARG\n")
+    if display_name is None or not display_name.strip():
+        return write_stderr("Error: --display-name is required\nCode: INVALID_ARG\n")
+    if runtime is None or not runtime.strip():
+        return write_stderr("Error: --runtime is required\nCode: INVALID_ARG\n")
+    workspace_path = arg_value(argv, "--workspace") or f"agents/{name}"
+    if not valid_workspace_path(workspace_path):
+        return write_stderr("Error: --workspace must be a safe relative path\nCode: INVALID_ARG\n")
+    if avatar_url is not None and not avatar_url.strip():
+        return write_stderr("Error: --avatar-url must be non-empty\nCode: INVALID_ARG\n")
+    capabilities: list[str] = []
+    seen: set[str] = set()
+    for value in arg_values(argv, "--capability"):
+        clean = value.strip()
+        if not clean:
+            return write_stderr("Error: --capability must be non-empty\nCode: INVALID_ARG\n")
+        if clean not in seen:
+            capabilities.append(clean)
+            seen.add(clean)
+
+    def action(state: dict[str, Any]) -> int:
+        existing_profile = profile_by_name(state, name)
+        if existing_profile is not None and existing_profile["kind"] != "agent":
+            return write_stderr("Error: Agent name conflicts with a human profile\nCode: CONFLICT\n")
+        now = current_timestamp()
+        existing = agent_by_name(state, name)
+        record = agent_item(
+            name,
+            display_name.strip(),
+            runtime.strip(),
+            workspace_path,
+            capabilities,
+            avatar_url.strip() if avatar_url is not None else None,
+            existing["created_at"] if existing is not None else now,
+            now,
+        )
+        if existing is None:
+            state.setdefault("agents", []).append(record)
+        else:
+            existing.update(record)
+        description = f"Swarm worker runtime={runtime.strip()} workspace={workspace_path}"
+        if existing_profile is None:
+            state.setdefault("profiles", []).append(
+                profile_item(name, display_name.strip(), "agent", description, record.get("avatar_url"))
+            )
+        else:
+            existing_profile["display_name"] = display_name.strip()
+            existing_profile["description"] = description
+            existing_profile["avatar_url"] = record.get("avatar_url")
+            existing_profile["avatar_file"] = None
+        return write_stdout(
+            f"Agent @{name} registered.\n"
+            f"Display name: {display_name.strip()}\n"
+            f"Runtime: {runtime.strip()}\n"
+            f"Workspace: {workspace_path}\n"
+            f"Capabilities: {', '.join(capabilities) if capabilities else '-'}\n"
+        )
+
+    return with_mutable_state(action)
+
+
+def command_agent_list(argv: list[str]) -> int:
+    def action(state: dict[str, Any]) -> int:
+        agents = sorted(state.get("agents", []), key=lambda row: row["name"])
+        heartbeats = {record["name"]: record for record in state.get("agent_heartbeats", [])}
+        rows = "\n".join(format_agent_row(agent, heartbeats.get(agent["name"])) for agent in agents)
+        if not rows:
+            rows = "No registered agents."
+        return write_stdout(f"## Agents ({len(agents)})\n\n{rows}\n")
+
+    return with_read_state(action)
+
+
+def command_agent_heartbeat(argv: list[str]) -> int:
+    if (
+        flag_missing_value(argv, "--name")
+        or flag_missing_value(argv, "--status")
+        or flag_missing_value(argv, "--pid")
+        or flag_missing_value(argv, "--session-id")
+        or flag_missing_value(argv, "--detail")
+    ):
+        return write_stderr("Error: Agent heartbeat flags require values\nCode: INVALID_ARG\n")
+    name = arg_value(argv, "--name")
+    if name is not None:
+        name = name.removeprefix("@")
+    status = arg_value(argv, "--status") or "alive"
+    pid = arg_value(argv, "--pid")
+    session_id = arg_value(argv, "--session-id")
+    detail = arg_value(argv, "--detail")
+    if not name:
+        return write_stderr("Error: --name is required\nCode: INVALID_ARG\n")
+    if not status.strip():
+        return write_stderr("Error: --status must be non-empty\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if agent_by_name(state, name) is None:
+            return write_stderr("Error: Agent not found\nCode: NOT_FOUND\n")
+        now = current_timestamp()
+        record = agent_heartbeat_item(
+            name,
+            status.strip(),
+            pid.strip() if pid is not None else None,
+            session_id.strip() if session_id is not None else None,
+            detail.strip() if detail is not None else None,
+            now,
+        )
+        existing = heartbeat_by_agent(state, name)
+        if existing is None:
+            state.setdefault("agent_heartbeats", []).append(record)
+        else:
+            existing.update(record)
+        return write_stdout(f"Heartbeat recorded for @{name}: {status.strip()} at {now}.\n")
+
+    return with_mutable_state(action)
+
+
+def write_agent_seed_workspace(agent: dict[str, Any], destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for child in ("runtime", "logs", "artifacts"):
+        (destination / child).mkdir(exist_ok=True)
+    seed = {
+        "schema_version": 1,
+        "format": "swarm-agent-redacted-seed",
+        "status": "format_only_waiting_for_selected_sources",
+        "agent": {
+            "name": agent["name"],
+            "display_name": agent["display_name"],
+            "runtime": agent["runtime"],
+            "workspace_path": agent["workspace_path"],
+            "capabilities": agent.get("capabilities", []),
+            "avatar_url": agent.get("avatar_url"),
+        },
+        "source_policy": {
+            "source_material": [],
+            "automatic_chat_dump": False,
+            "agent_self_runs_export": True,
+        },
+        "scrub_gates": {
+            "internal_demo": ["credentials", "other_people_dm_originals"],
+            "possibly_public": ["credentials", "other_people_dm_originals", "pii", "org_or_client_ip"],
+        },
+        "excluded": [
+            "environment files",
+            "credential files",
+            "raw tokens",
+            "other people's direct-message originals",
+        ],
+    }
+    (destination / "seed.json").write_text(json.dumps(seed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (destination / "MEMORY.md").write_text(
+        f"# {agent['display_name']}\n\n"
+        "## Role\n"
+        "Long-running Swarm worker. Fill in the role and operating boundaries after source selection.\n\n"
+        "## Boundaries\n"
+        "- Do not store credentials, tokens, or credential file contents here.\n"
+        "- Do not copy other people's direct-message originals into seed artifacts.\n\n"
+        "## Active Context\n"
+        f"- Seed skeleton generated for @{agent['name']}.\n",
+        encoding="utf-8",
+    )
+    (destination / "README.md").write_text(
+        f"# Swarm Agent Workspace: {agent['name']}\n\n"
+        "This directory is the persistent workspace skeleton for one long-running Swarm worker.\n"
+        "The included seed.json defines the redacted seed format only; real seed content is added after source selection.\n",
+        encoding="utf-8",
+    )
+    (destination / ".gitignore").write_text(
+        ".env\n"
+        "*.env\n"
+        "credential.json\n"
+        "credentials/\n"
+        "*.token\n"
+        "runtime/\n"
+        "logs/\n",
+        encoding="utf-8",
+    )
+
+
+def command_agent_seed(argv: list[str]) -> int:
+    if flag_missing_value(argv, "--name") or flag_missing_value(argv, "--output-dir"):
+        return write_stderr("Error: Agent seed flags require values\nCode: INVALID_ARG\n")
+    name = arg_value(argv, "--name")
+    if name is not None:
+        name = name.removeprefix("@")
+    output_dir = arg_value(argv, "--output-dir")
+    if not name:
+        return write_stderr("Error: --name is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        agent = agent_by_name(state, name)
+        if agent is None:
+            return write_stderr("Error: Agent not found\nCode: NOT_FOUND\n")
+        destination = Path(output_dir).expanduser() if output_dir else state_dir() / agent["workspace_path"]
+        write_agent_seed_workspace(agent, destination)
+        return write_stdout(
+            f"Seed workspace skeleton written for @{name}.\n"
+            f"Path: {destination}\n"
+            "Seed content status: format-only; waiting for selected sources.\n"
+        )
+
+    return with_read_state(action)
+
+
+def command_agent_supervisor_plan(argv: list[str]) -> int:
+    def action(state: dict[str, Any]) -> int:
+        agents = sorted(state.get("agents", []), key=lambda row: row["name"])
+        if not agents:
+            return write_stdout("## Agent Supervisor Plan (0 agents)\n\nNo registered agents.\n")
+        plans = []
+        for agent in agents:
+            plans.append(
+                {
+                    "agent": agent["name"],
+                    "runtime": agent["runtime"],
+                    "workspace": agent["workspace_path"],
+                    "heartbeat_command": (
+                        f"swarm agent heartbeat --name {shlex.quote(agent['name'])} "
+                        "--status alive --pid $PID --session-id $SESSION_ID"
+                    ),
+                    "seed_command": f"swarm agent seed --name {shlex.quote(agent['name'])}",
+                    "supervisor_policy": "run as a persistent worker and restart only after stale heartbeat",
+                }
+            )
+        rendered = "\n".join(json.dumps(plan, sort_keys=True, separators=(",", ":")) for plan in plans)
+        return write_stdout(
+            f"## Agent Supervisor Plan ({len(plans)} agents)\n\n"
+            f"{rendered}\n\n"
+            "No worker process was started; this is a deterministic supervisor plan from canonical state.\n"
+        )
+
+    return with_read_state(action)
+
+
+def command_agent(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing agent subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "register":
+        return command_agent_register(rest)
+    if subcommand == "list":
+        return command_agent_list(rest)
+    if subcommand == "heartbeat":
+        return command_agent_heartbeat(rest)
+    if subcommand == "seed":
+        return command_agent_seed(rest)
+    if subcommand == "supervisor-plan":
+        return command_agent_supervisor_plan(rest)
+    return write_stderr(f"Error: unknown agent subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
 def command_server_info() -> int:
@@ -5192,6 +5664,8 @@ def main(argv: list[str]) -> int:
         return command_reminder(argv[1:])
     if command == "daemon":
         return command_daemon(argv[1:])
+    if command == "agent":
+        return command_agent(argv[1:])
     if command == "server":
         return command_server(argv[1:])
     if command == "channel":
