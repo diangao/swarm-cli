@@ -1913,6 +1913,33 @@ def heartbeat_by_agent(state: dict[str, Any], name: str) -> dict[str, Any] | Non
     return None
 
 
+def record_agent_heartbeat(
+    state: dict[str, Any],
+    name: str,
+    status: str,
+    pid: str | None,
+    session_id: str | None,
+    detail: str | None,
+) -> str | None:
+    if agent_by_name(state, name) is None:
+        return "Agent not found"
+    now = current_timestamp()
+    record = agent_heartbeat_item(
+        name,
+        status.strip(),
+        pid.strip() if pid is not None else None,
+        session_id.strip() if session_id is not None else None,
+        detail.strip() if detail is not None else None,
+        now,
+    )
+    existing = heartbeat_by_agent(state, name)
+    if existing is None:
+        state.setdefault("agent_heartbeats", []).append(record)
+    else:
+        existing.update(record)
+    return None
+
+
 def valid_service_name(name: str) -> bool:
     if not name:
         return False
@@ -2307,6 +2334,33 @@ def append_task(state: dict[str, Any], channel: str, title: str) -> dict[str, An
         title.strip(),
         "todo",
         "candidate",
+        None,
+        record["id"],
+        now,
+        now,
+    )
+    state.setdefault("tasks", []).append(task)
+    freshness = state.setdefault("freshness", {}).setdefault(channel, {"cursor": 0, "draft": None})
+    freshness["cursor"] = record["seq"]
+    return task
+
+
+def append_task_for_author(
+    state: dict[str, Any],
+    channel: str,
+    title: str,
+    author: str,
+) -> dict[str, Any]:
+    record = append_message(state, channel, title, author=author)
+    number = int(state.get("next_task_number", 1))
+    state["next_task_number"] = number + 1
+    now = current_timestamp()
+    task = task_item(
+        number,
+        channel,
+        title.strip(),
+        "todo",
+        author,
         None,
         record["id"],
         now,
@@ -3457,17 +3511,29 @@ def command_task_claim(argv: list[str]) -> int:
     channel = arg_value(argv, "--channel")
     if channel is None:
         return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
+    if flag_missing_value(argv, "--assignee"):
+        return write_stderr("Error: --assignee requires a value\nCode: INVALID_ARG\n")
+    assignee = (arg_value(argv, "--assignee") or "candidate").removeprefix("@")
+    if not assignee:
+        return write_stderr("Error: --assignee requires a value\nCode: INVALID_ARG\n")
 
     def action(state: dict[str, Any]) -> int:
         if not channel_has_task_surface(state, channel):
             return write_stderr("Error: Agent or channel not found\nCode: CLAIM_FAILED\n")
+        assignee_profile = profile_by_name(state, assignee)
+        if (
+            assignee != "candidate"
+            and agent_by_name(state, assignee) is None
+            and (assignee_profile is None or assignee_profile.get("kind") != "agent")
+        ):
+            return write_stderr("Error: Assignee not found\nCode: NOT_FOUND\n")
         if freshness_blockers(state, channel):
             return render_task_freshness_hold(state, channel)
         tasks, pending_messages, error = resolve_task_claim_targets(state, channel, argv)
         if error is not None:
             return write_stderr(f"Error: {error}\nCode: NOT_FOUND\n")
         for task in tasks:
-            if task.get("assignee") and task["assignee"] != "candidate":
+            if task.get("assignee") and task["assignee"] != assignee:
                 return write_stderr(
                     f"Error: task #{task['number']} is already claimed by @{task['assignee']}\n"
                     "Code: CLAIM_CONFLICT\n"
@@ -3475,11 +3541,11 @@ def command_task_claim(argv: list[str]) -> int:
         for record in pending_messages:
             tasks.append(append_task_from_message(state, channel, record))
         for task in tasks:
-            task["assignee"] = "candidate"
+            task["assignee"] = assignee
             if task["status"] == "todo":
                 task["status"] = "in_progress"
             task["updated_at"] = current_timestamp()
-        lines = [f"Task #{task['number']} claimed by @candidate." for task in tasks]
+        lines = [f"Task #{task['number']} claimed by @{assignee}." for task in tasks]
         return write_stdout("\n".join(lines) + "\n")
 
     return with_mutable_state(action)
@@ -3489,10 +3555,22 @@ def command_task_unclaim(argv: list[str]) -> int:
     channel = arg_value(argv, "--channel")
     if channel is None:
         return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
+    if flag_missing_value(argv, "--assignee"):
+        return write_stderr("Error: --assignee requires a value\nCode: INVALID_ARG\n")
+    assignee = (arg_value(argv, "--assignee") or "candidate").removeprefix("@")
+    if not assignee:
+        return write_stderr("Error: --assignee requires a value\nCode: INVALID_ARG\n")
 
     def action(state: dict[str, Any]) -> int:
         if not channel_has_task_surface(state, channel):
             return write_stderr("Error: Agent or channel not found\nCode: UNCLAIM_FAILED\n")
+        assignee_profile = profile_by_name(state, assignee)
+        if (
+            assignee != "candidate"
+            and agent_by_name(state, assignee) is None
+            and (assignee_profile is None or assignee_profile.get("kind") != "agent")
+        ):
+            return write_stderr("Error: Assignee not found\nCode: NOT_FOUND\n")
         tasks, error = resolve_task_args(state, channel, argv)
         if error is not None:
             return write_stderr(f"Error: {error}\nCode: NOT_FOUND\n")
@@ -3501,15 +3579,15 @@ def command_task_unclaim(argv: list[str]) -> int:
         for task in tasks:
             if task["status"] == "done":
                 return write_stderr("Error: done tasks cannot be unclaimed\nCode: UNCLAIM_FAILED\n")
-            if task.get("assignee") != "candidate":
+            if task.get("assignee") != assignee:
                 return write_stderr(
-                    f"Error: task #{task['number']} is not claimed by @candidate\n"
+                    f"Error: task #{task['number']} is not claimed by @{assignee}\n"
                     "Code: UNCLAIM_FAILED\n"
                 )
         for task in tasks:
             task["assignee"] = None
             task["updated_at"] = current_timestamp()
-        lines = [f"Task #{task['number']} unclaimed by @candidate." for task in tasks]
+        lines = [f"Task #{task['number']} unclaimed by @{assignee}." for task in tasks]
         return write_stdout("\n".join(lines) + "\n")
 
     return with_mutable_state(action)
@@ -3867,6 +3945,17 @@ def parse_poll_interval(argv: list[str]) -> tuple[float, str | None]:
     return delta.total_seconds(), None
 
 
+def parse_agent_name_arg(argv: list[str], flag: str = "--name") -> tuple[str | None, str | None]:
+    if flag_missing_value(argv, flag):
+        return None, f"{flag} requires a value"
+    name = arg_value(argv, flag)
+    if name is not None:
+        name = name.removeprefix("@")
+    if not name:
+        return None, f"{flag} is required"
+    return name, None
+
+
 def command_daemon_run(argv: list[str]) -> int:
     interval_seconds, interval_error = parse_poll_interval(argv)
     if interval_error is not None:
@@ -4029,23 +4118,135 @@ def command_agent_heartbeat(argv: list[str]) -> int:
         return write_stderr("Error: --status must be non-empty\nCode: INVALID_ARG\n")
 
     def action(state: dict[str, Any]) -> int:
-        if agent_by_name(state, name) is None:
-            return write_stderr("Error: Agent not found\nCode: NOT_FOUND\n")
-        now = current_timestamp()
-        record = agent_heartbeat_item(
-            name,
-            status.strip(),
-            pid.strip() if pid is not None else None,
-            session_id.strip() if session_id is not None else None,
-            detail.strip() if detail is not None else None,
-            now,
+        error = record_agent_heartbeat(state, name, status, pid, session_id, detail)
+        if error is not None:
+            return write_stderr(f"Error: {error}\nCode: NOT_FOUND\n")
+        heartbeat = heartbeat_by_agent(state, name)
+        assert heartbeat is not None
+        return write_stdout(f"Heartbeat recorded for @{name}: {status.strip()} at {heartbeat['updated_at']}.\n")
+
+    return with_mutable_state(action)
+
+
+def command_agent_worker(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--name", "--once", "--interval", "--session-id", "--require-seed"})
+    if unknown:
+        return write_stderr(f"Error: unknown agent worker flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    name, name_error = parse_agent_name_arg(argv)
+    if name_error is not None:
+        return write_stderr(f"Error: {name_error}\nCode: INVALID_ARG\n")
+    assert name is not None
+    if flag_missing_value(argv, "--interval") or flag_missing_value(argv, "--session-id"):
+        return write_stderr("Error: Agent worker flags require values\nCode: INVALID_ARG\n")
+    interval = parse_duration(arg_value(argv, "--interval") or "5s")
+    if interval is None or interval.total_seconds() <= 0:
+        return write_stderr("Error: --interval must be a positive duration like 5s, 1m, 1h, or 1d\nCode: INVALID_ARG\n")
+    session_id = arg_value(argv, "--session-id") or f"worker-{name}-{uuid.uuid4().hex[:8]}"
+    require_seed = "--require-seed" in argv
+    once = "--once" in argv
+    pid = str(os.getpid())
+    iterations = 0
+
+    def tick(status: str, detail: str) -> int:
+        def action(state: dict[str, Any]) -> int:
+            agent = agent_by_name(state, name)
+            if agent is None:
+                return write_stderr("Error: Agent not found\nCode: NOT_FOUND\n")
+            workspace = state_dir() / str(agent["workspace_path"])
+            if require_seed and not (workspace / "seed.json").exists():
+                return write_stderr(f"Error: seed workspace missing for @{name}: {workspace}\nCode: NOT_FOUND\n")
+            error = record_agent_heartbeat(state, name, status, pid, session_id, detail)
+            if error is not None:
+                return write_stderr(f"Error: {error}\nCode: NOT_FOUND\n")
+            return 0
+
+        return with_mutable_state(action)
+
+    while True:
+        result = tick("alive", "worker loop heartbeat")
+        if result != 0:
+            return result
+        iterations += 1
+        if once:
+            return write_stdout(f"Worker heartbeat recorded for @{name}. Session: {session_id}. Iterations: {iterations}.\n")
+        try:
+            time.sleep(interval.total_seconds())
+        except KeyboardInterrupt:
+            tick("stopped", "worker loop stopped")
+            return write_stdout(f"Worker stopped for @{name}. Session: {session_id}. Iterations: {iterations}.\n")
+
+
+def command_agent_collab_smoke(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--channel", "--task-author", "--worker", "--verifier", "--title"})
+    if unknown:
+        return write_stderr(f"Error: unknown agent collab-smoke flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if (
+        flag_missing_value(argv, "--channel")
+        or flag_missing_value(argv, "--task-author")
+        or flag_missing_value(argv, "--worker")
+        or flag_missing_value(argv, "--verifier")
+        or flag_missing_value(argv, "--title")
+    ):
+        return write_stderr("Error: Agent collab-smoke flags require values\nCode: INVALID_ARG\n")
+    channel = arg_value(argv, "--channel")
+    if channel is None or not channel.startswith("#") or ":" in channel:
+        return write_stderr("Error: --channel must be a top-level channel\nCode: INVALID_ARG\n")
+    task_author = (arg_value(argv, "--task-author") or "").removeprefix("@")
+    worker = (arg_value(argv, "--worker") or "").removeprefix("@")
+    verifier = (arg_value(argv, "--verifier") or "").removeprefix("@")
+    title = arg_value(argv, "--title") or "Swarm collab smoke"
+    if not task_author or not worker or not verifier:
+        return write_stderr("Error: --task-author, --worker, and --verifier are required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        missing = [name for name in (task_author, worker, verifier) if agent_by_name(state, name) is None]
+        if missing:
+            return write_stderr(f"Error: Agent not found: @{missing[0]}\nCode: NOT_FOUND\n")
+        ensure_channel_catalog(state, channel)
+        task = append_task_for_author(state, channel, title, task_author)
+        task["assignee"] = worker
+        task["status"] = "in_progress"
+        task["updated_at"] = current_timestamp()
+        thread = reply_thread_target(channel, str(task["message_id"]))
+        report = append_message(
+            state,
+            thread,
+            f"Work completed for task #{task['number']}: claim accepted, artifact produced, ready for verification.",
+            author=worker,
         )
-        existing = heartbeat_by_agent(state, name)
-        if existing is None:
-            state.setdefault("agent_heartbeats", []).append(record)
-        else:
-            existing.update(record)
-        return write_stdout(f"Heartbeat recorded for @{name}: {status.strip()} at {now}.\n")
+        verify = append_message(
+            state,
+            thread,
+            f"Verified task #{task['number']}: worker report present and task state coherent.",
+            author=verifier,
+        )
+        task["status"] = "in_review"
+        task["updated_at"] = current_timestamp()
+        for name in (task_author, worker, verifier):
+            record_agent_heartbeat(
+                state,
+                name,
+                "alive",
+                None,
+                f"collab-smoke-{short_id(str(task['message_id']))}",
+                f"collab-smoke role={name}",
+            )
+        result = {
+            "channel": channel,
+            "task_number": task["number"],
+            "task_message_id": task["message_id"],
+            "thread": thread,
+            "task_author": task_author,
+            "worker": worker,
+            "verifier": verifier,
+            "worker_report_id": report["id"],
+            "verifier_report_id": verify["id"],
+            "status": task["status"],
+        }
+        return write_stdout(
+            "## Agent Collab Smoke\n\n"
+            f"{json.dumps(result, sort_keys=True, separators=(',', ':'))}\n"
+        )
 
     return with_mutable_state(action)
 
@@ -4156,6 +4357,7 @@ def command_agent_supervisor_plan(argv: list[str]) -> int:
                     "agent": agent["name"],
                     "runtime": agent["runtime"],
                     "workspace": agent["workspace_path"],
+                    "worker_command": f"swarm agent worker --name {shlex.quote(agent['name'])} --require-seed",
                     "heartbeat_command": (
                         f"swarm agent heartbeat --name {shlex.quote(agent['name'])} "
                         "--status alive --pid $PID --session-id $SESSION_ID"
@@ -4185,10 +4387,14 @@ def command_agent(argv: list[str]) -> int:
         return command_agent_list(rest)
     if subcommand == "heartbeat":
         return command_agent_heartbeat(rest)
+    if subcommand == "worker":
+        return command_agent_worker(rest)
     if subcommand == "seed":
         return command_agent_seed(rest)
     if subcommand == "supervisor-plan":
         return command_agent_supervisor_plan(rest)
+    if subcommand == "collab-smoke":
+        return command_agent_collab_smoke(rest)
     return write_stderr(f"Error: unknown agent subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 

@@ -2018,6 +2018,13 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
     for marker in secret_markers:
         require(marker not in seed_text, f"agent seed contained blocked marker: {marker}")
 
+    default_seeded = run(cli, state_dir, "agent", "seed", "--name", name).stdout
+    require("Seed workspace skeleton written" in default_seeded, "agent default seed did not acknowledge skeleton write")
+    worker_once = run(cli, state_dir, "agent", "worker", "--name", name, "--once", "--require-seed").stdout
+    require(f"Worker heartbeat recorded for @{name}" in worker_once, "agent worker once did not record heartbeat")
+    worker_unknown = run(cli, state_dir, "agent", "worker", "--name", name, "--bogus", expected=1).stderr
+    require("unknown agent worker flag: --bogus" in worker_unknown, "agent worker did not reject unknown flags")
+
     heartbeat = run(
         cli,
         state_dir,
@@ -2041,6 +2048,7 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
     plans = [json.loads(line) for line in supervisor.splitlines() if line.startswith("{")]
     require(len(plans) == 1, "agent supervisor plan did not render one plan")
     require(plans[0]["agent"] == name and plans[0]["workspace"] == f"agents/{name}", "agent supervisor plan fields mismatch")
+    require("worker_command" in plans[0] and "agent worker --name curator" in plans[0]["worker_command"], "agent supervisor plan missing worker command")
     require("No worker process was started" in supervisor, "agent supervisor plan did not state no-start boundary")
     supervisor_unknown = run(cli, state_dir, "agent", "supervisor-plan", "--bogus", expected=1).stderr
     require(
@@ -2068,6 +2076,63 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
     ).stderr
     require("Author not found" in rejected_author, "message send with missing author did not fail closed")
 
+    for other_name, other_display in (("worker", "Worker"), ("verifier", "Verifier")):
+        run(
+            cli,
+            state_dir,
+            "agent",
+            "register",
+            "--name",
+            other_name,
+            "--display-name",
+            other_display,
+            "--runtime",
+            "codex",
+            "--workspace",
+            f"agents/{other_name}",
+        )
+        run(cli, state_dir, "agent", "seed", "--name", other_name)
+    collab = run(
+        cli,
+        state_dir,
+        "agent",
+        "collab-smoke",
+        "--channel",
+        "#agent-collab",
+        "--task-author",
+        name,
+        "--worker",
+        "worker",
+        "--verifier",
+        "verifier",
+        "--title",
+        "three-agent smoke",
+    ).stdout
+    require("## Agent Collab Smoke" in collab, "agent collab-smoke did not render header")
+    collab_payload = next(json.loads(line) for line in collab.splitlines() if line.startswith("{"))
+    require(collab_payload["task_author"] == name, "collab smoke task author mismatch")
+    require(collab_payload["worker"] == "worker", "collab smoke worker mismatch")
+    require(collab_payload["verifier"] == "verifier", "collab smoke verifier mismatch")
+    require(collab_payload["status"] == "in_review", "collab smoke did not move task to in_review")
+    collab_unknown = run(cli, state_dir, "agent", "collab-smoke", "--bogus", expected=1).stderr
+    require("unknown agent collab-smoke flag: --bogus" in collab_unknown, "agent collab-smoke did not reject unknown flags")
+    agent_claim_title = f"agent claim task {uuid.uuid4()}"
+    claim_created = run(cli, state_dir, "task", "create", "--channel", "#agent-collab", "--title", agent_claim_title).stdout
+    claim_number = parse_task_number(claim_created)
+    agent_claim = run(
+        cli,
+        state_dir,
+        "task",
+        "claim",
+        "--channel",
+        "#agent-collab",
+        "--number",
+        str(claim_number),
+        "--assignee",
+        "worker",
+    ).stdout
+    require(f"Task #{claim_number} claimed by @worker." in agent_claim, "task claim did not accept registered agent assignee")
+
     conn = connect_state(state_dir)
     try:
         agent_row = conn.execute(
@@ -2085,7 +2150,17 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
             (name,),
         ).fetchone()
         require(heartbeat_row is not None, "agent heartbeat row missing from SQLite")
-        require(heartbeat_row["status"] == "alive" and heartbeat_row["pid"] == "4242", "agent heartbeat fields mismatch")
+        require(
+            heartbeat_row["status"] == "alive"
+            and str(heartbeat_row["session_id"]).startswith("collab-smoke-"),
+            "agent heartbeat fields mismatch",
+        )
+        worker_task_row = conn.execute(
+            "SELECT assignee, status FROM tasks WHERE number = ?",
+            (claim_number,),
+        ).fetchone()
+        require(worker_task_row is not None, "registered-agent claim task row missing")
+        require(worker_task_row["assignee"] == "worker", "registered-agent task assignee mismatch")
         profile_row = conn.execute("SELECT kind, avatar_url FROM profiles WHERE name = ?", (name,)).fetchone()
         require(profile_row is not None and profile_row["kind"] == "agent", "registered agent profile missing")
         require(profile_row["avatar_url"] == avatar_url, "registered agent profile avatar mismatch")
