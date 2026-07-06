@@ -2362,6 +2362,40 @@ def slack_web_post_message(
     return parse_slack_send_response(payload, plan)
 
 
+def slack_web_api_call(
+    token: str,
+    method_name: str,
+    payload: dict[str, Any],
+    timeout_seconds: float,
+) -> tuple[dict[str, Any] | None, str | None]:
+    request = urllib.request.Request(
+        f"https://slack.com/api/{method_name}",
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return None, f"Slack Web API HTTP error: {exc.code}"
+    except urllib.error.URLError:
+        return None, "Slack Web API transport error"
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "Slack Web API response was not valid JSON"
+    if not isinstance(decoded, dict):
+        return None, "Slack Web API response was not a JSON object"
+    if decoded.get("ok") is not True:
+        reason = decoded.get("error") if isinstance(decoded.get("error"), str) else "unknown_error"
+        return None, f"Slack Web API rejected {method_name}: {reason}"
+    return decoded, None
+
+
 def slack_event_envelope(payload: dict[str, Any]) -> dict[str, Any]:
     event = payload.get("event")
     return event if isinstance(event, dict) else payload
@@ -2402,6 +2436,54 @@ def state_time_from_slack_ts(slack_ts: str) -> str | None:
     if seconds <= 0:
         return None
     return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def valid_slack_ts(value: Any) -> bool:
+    return isinstance(value, str) and state_time_from_slack_ts(value) is not None
+
+
+def slack_history_message_to_event_payload(
+    workspace: str,
+    channel_id: str,
+    channel_name: str | None,
+    message: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    slack_ts = message.get("ts")
+    if not valid_slack_ts(slack_ts):
+        return None, "Slack history message missing valid ts"
+    event: dict[str, Any] = {
+        "type": "message",
+        "channel": channel_id,
+        "ts": slack_ts,
+        "text": message.get("text") if isinstance(message.get("text"), str) else "",
+    }
+    if channel_name:
+        event["channel_name"] = channel_name
+    user = message.get("user")
+    bot_id = message.get("bot_id")
+    if isinstance(user, str) and user.strip():
+        event["user"] = user.strip()
+    elif isinstance(bot_id, str) and bot_id.strip():
+        event["bot_id"] = bot_id.strip()
+    else:
+        return None, "Slack history message missing user or bot_id"
+    subtype = message.get("subtype")
+    if isinstance(subtype, str) and subtype.strip():
+        event["subtype"] = subtype.strip()
+    thread_ts = message.get("thread_ts")
+    if isinstance(thread_ts, str) and thread_ts.strip() and thread_ts.strip() != slack_ts:
+        event["thread_ts"] = thread_ts.strip()
+    payload: dict[str, Any] = {
+        "team_id": workspace,
+        "event": event,
+    }
+    if channel_name:
+        payload["channel_name"] = channel_name
+    return payload, None
+
+
+def sorted_slack_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(messages, key=lambda item: float(str(item["ts"])))
 
 
 def normalized_slack_event(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -4722,6 +4804,300 @@ def command_slack_send(argv: list[str]) -> int:
     )
 
 
+def parse_slack_limit(argv: list[str]) -> tuple[int, str | None]:
+    raw = arg_value(argv, "--limit")
+    if raw is None:
+        return 100, None
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0, "--limit must be a positive integer"
+    if value <= 0 or value > 1000:
+        return 0, "--limit must be between 1 and 1000"
+    return value, None
+
+
+def parse_bool_flag(argv: list[str], flag: str) -> bool:
+    return flag in argv
+
+
+def parse_slack_mock_api(path_value: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    if path_value is None:
+        return None, None
+    path = Path(path_value).expanduser()
+    try:
+        raw = path.read_text()
+    except OSError:
+        return None, f"Slack mock API file not found: {path_value}"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "invalid Slack mock API JSON"
+    if not isinstance(payload, dict):
+        return None, "Slack mock API JSON must be an object"
+    histories = payload.get("histories")
+    replies = payload.get("replies")
+    if histories is not None and not isinstance(histories, dict):
+        return None, "Slack mock API histories must be an object"
+    if replies is not None and not isinstance(replies, dict):
+        return None, "Slack mock API replies must be an object"
+    return payload, None
+
+
+def slack_history_mock_response(
+    mock_api: dict[str, Any],
+    method_name: str,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if method_name == "conversations.history":
+        histories = mock_api.get("histories", {})
+        assert isinstance(histories, dict)
+        channel_id = payload.get("channel")
+        response = histories.get(channel_id)
+    elif method_name == "conversations.replies":
+        replies = mock_api.get("replies", {})
+        assert isinstance(replies, dict)
+        channel_id = payload.get("channel")
+        thread_ts = payload.get("ts")
+        response = replies.get(f"{channel_id}:{thread_ts}")
+    else:
+        response = None
+    if response is None:
+        return {"ok": True, "messages": [], "has_more": False}, None
+    if not isinstance(response, dict):
+        return None, "Slack mock API response must be an object"
+    if response.get("ok") is not True:
+        reason = response.get("error") if isinstance(response.get("error"), str) else "unknown_error"
+        return None, f"Slack mock API rejected {method_name}: {reason}"
+    return deepcopy(response), None
+
+
+def slack_history_api_call(
+    token: str,
+    method_name: str,
+    payload: dict[str, Any],
+    timeout_seconds: float,
+    mock_api: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if mock_api is not None:
+        return slack_history_mock_response(mock_api, method_name, payload)
+    return slack_web_api_call(token, method_name, payload, timeout_seconds)
+
+
+def slack_history_messages_from_response(response: dict[str, Any]) -> tuple[list[dict[str, Any]] | None, str | None]:
+    messages = response.get("messages")
+    if not isinstance(messages, list):
+        return None, "Slack Web API response missing messages list"
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            return None, "Slack Web API messages must be objects"
+        if not valid_slack_ts(message.get("ts")):
+            return None, "Slack Web API message had invalid ts"
+        normalized.append(message)
+    return normalized, None
+
+
+def slack_history_next_cursor(response: dict[str, Any]) -> str | None:
+    metadata = response.get("response_metadata")
+    if not isinstance(metadata, dict):
+        return None
+    cursor = metadata.get("next_cursor")
+    if isinstance(cursor, str) and cursor.strip():
+        return cursor.strip()
+    return None
+
+
+def command_slack_export_history(argv: list[str]) -> int:
+    if (
+        flag_missing_value(argv, "--workspace")
+        or flag_missing_value(argv, "--channel-id")
+        or flag_missing_value(argv, "--channel-name")
+        or flag_missing_value(argv, "--limit")
+        or flag_missing_value(argv, "--oldest")
+        or flag_missing_value(argv, "--latest")
+        or flag_missing_value(argv, "--timeout-seconds")
+        or flag_missing_value(argv, "--mock-api-file")
+    ):
+        return write_stderr("Error: Slack export-history flags require values\nCode: INVALID_ARG\n")
+    workspace = arg_value(argv, "--workspace")
+    channel_id = arg_value(argv, "--channel-id")
+    channel_name = arg_value(argv, "--channel-name")
+    oldest = arg_value(argv, "--oldest")
+    latest = arg_value(argv, "--latest")
+    include_replies = parse_bool_flag(argv, "--include-replies")
+    limit, limit_error = parse_slack_limit(argv)
+    if limit_error is not None:
+        return write_stderr(f"Error: {limit_error}\nCode: INVALID_ARG\n")
+    timeout_seconds, timeout_error = parse_timeout_seconds(argv)
+    if timeout_error is not None:
+        return write_stderr(f"Error: {timeout_error}\nCode: INVALID_ARG\n")
+    mock_api, mock_error = parse_slack_mock_api(arg_value(argv, "--mock-api-file"))
+    if mock_error is not None:
+        return write_stderr(f"Error: {mock_error}\nCode: INVALID_ARG\n")
+    if not workspace or not channel_id:
+        return write_stderr("Error: --workspace and --channel-id are required\nCode: INVALID_ARG\n")
+    if oldest is not None and not valid_slack_ts(oldest):
+        return write_stderr("Error: --oldest must be a positive Slack timestamp\nCode: INVALID_ARG\n")
+    if latest is not None and not valid_slack_ts(latest):
+        return write_stderr("Error: --latest must be a positive Slack timestamp\nCode: INVALID_ARG\n")
+
+    context: dict[str, Any] = {}
+
+    def config_action(state: dict[str, Any]) -> int:
+        config = slack_workspace_by_id(state, workspace)
+        if config is None:
+            return write_stderr(
+                "Error: Slack workspace config not found\n"
+                "Code: NOT_FOUND\n"
+                "Next action: configure it with swarm slack configure.\n"
+            )
+        token_env = config["bot_token_env"]
+        context["token_env"] = token_env
+        if mock_api is None:
+            token_value = os.environ.get(token_env)
+            if not token_value:
+                return write_stderr(
+                    "Error: Slack bot token environment variable is not set\n"
+                    "Code: SLACK_TOKEN_MISSING\n"
+                    f"Next action: set {token_env} in the adapter process environment.\n"
+                )
+            context["token_value"] = token_value
+        else:
+            context["token_value"] = ""
+        return 0
+
+    configured = with_read_state(config_action)
+    if configured != 0:
+        return configured
+
+    events: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    skipped_messages = 0
+
+    def append_exported_message(message: dict[str, Any]) -> tuple[bool, str | None]:
+        nonlocal skipped_messages
+        slack_ts = str(message["ts"])
+        key = (channel_id, slack_ts)
+        if key in seen_keys:
+            return False, None
+        payload, payload_error = slack_history_message_to_event_payload(
+            workspace,
+            channel_id,
+            channel_name,
+            message,
+        )
+        if payload_error is not None:
+            skipped_messages += 1
+            return False, None
+        assert payload is not None
+        # Keep the exporter honest: every emitted row must already be accepted by ingest normalization.
+        _, ingest_error = normalized_slack_event(payload)
+        if ingest_error is not None:
+            skipped_messages += 1
+            return False, None
+        seen_keys.add(key)
+        events.append(payload)
+        return True, None
+
+    def append_message_replies(message: dict[str, Any]) -> str | None:
+        reply_cursor: str | None = None
+        while True:
+            reply_payload = {
+                "channel": channel_id,
+                "ts": message["ts"],
+                "limit": 200,
+            }
+            if reply_cursor:
+                reply_payload["cursor"] = reply_cursor
+            reply_response, reply_error = slack_history_api_call(
+                str(context["token_value"]),
+                "conversations.replies",
+                reply_payload,
+                timeout_seconds,
+                mock_api,
+            )
+            if reply_error is not None:
+                return reply_error
+            assert reply_response is not None
+            replies, replies_error = slack_history_messages_from_response(reply_response)
+            if replies_error is not None:
+                return replies_error
+            assert replies is not None
+            for reply in sorted_slack_messages(replies):
+                if str(reply["ts"]) == str(message["ts"]):
+                    continue
+                _, reply_append_error = append_exported_message(reply)
+                if reply_append_error is not None:
+                    return reply_append_error
+            reply_cursor = slack_history_next_cursor(reply_response)
+            if not reply_cursor or not reply_response.get("has_more"):
+                break
+        return None
+
+    history_payload: dict[str, Any] = {
+        "channel": channel_id,
+        "limit": min(limit, 200),
+    }
+    if oldest is not None:
+        history_payload["oldest"] = oldest
+    if latest is not None:
+        history_payload["latest"] = latest
+
+    fetched = 0
+    cursor: str | None = None
+    while fetched < limit:
+        request_payload = dict(history_payload)
+        if cursor:
+            request_payload["cursor"] = cursor
+        response, response_error = slack_history_api_call(
+            str(context["token_value"]),
+            "conversations.history",
+            request_payload,
+            timeout_seconds,
+            mock_api,
+        )
+        if response_error is not None:
+            return write_stderr(f"Error: {response_error}\nCode: SLACK_HISTORY_FAILED\n")
+        assert response is not None
+        messages, messages_error = slack_history_messages_from_response(response)
+        if messages_error is not None:
+            return write_stderr(f"Error: {messages_error}\nCode: SLACK_HISTORY_FAILED\n")
+        assert messages is not None
+        for message in sorted_slack_messages(messages):
+            _, append_error = append_exported_message(message)
+            if append_error is not None:
+                return write_stderr(f"Error: {append_error}\nCode: INVALID_SLACK_EVENT\n")
+            fetched += 1
+            if include_replies and message.get("reply_count"):
+                reply_error = append_message_replies(message)
+                if reply_error is not None:
+                    return write_stderr(f"Error: {reply_error}\nCode: SLACK_HISTORY_FAILED\n")
+            if fetched >= limit:
+                break
+        cursor = slack_history_next_cursor(response)
+        if not cursor or not response.get("has_more"):
+            break
+
+    rendered = "\n".join(
+        json.dumps(event, sort_keys=True, separators=(",", ":"))
+        for event in sorted(
+            events,
+            key=lambda payload: float(str(slack_event_envelope(payload)["ts"])),
+        )
+    )
+    sys.stderr.write(
+        f"Exported {len(events)} Slack event JSON rows from {channel_id}.\n"
+        "Read-only export; swarm SQLite state was not modified.\n"
+        f"Token source: {context['token_env']} (value not shown).\n"
+    )
+    if skipped_messages:
+        sys.stderr.write(f"Skipped {skipped_messages} history rows not accepted by current ingest.\n")
+    if mock_api is not None:
+        sys.stderr.write("Mock Slack API responses used; no network request was sent.\n")
+    return write_stdout(rendered + ("\n" if rendered else ""))
+
+
 def command_slack_mark_sent(argv: list[str]) -> int:
     if (
         flag_missing_value(argv, "--workspace")
@@ -4776,6 +5152,8 @@ def command_slack(argv: list[str]) -> int:
         return command_slack_outbound(rest)
     if subcommand == "send":
         return command_slack_send(rest)
+    if subcommand == "export-history":
+        return command_slack_export_history(rest)
     if subcommand == "mark-sent":
         return command_slack_mark_sent(rest)
     return write_stderr(f"Error: unknown slack subcommand: {subcommand}\nCode: INVALID_ARG\n")

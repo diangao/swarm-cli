@@ -1916,6 +1916,130 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
     ).stderr
     require("valid environment variable name" in invalid_config, "invalid Slack env var did not fail closed")
 
+    export_channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    export_channel_name = f"export-{uuid.uuid4().hex[:6]}"
+    export_target = f"#slack-{export_channel_id.lower()}"
+    export_root_ts = slack_ts(1761999900)
+    export_reply_ts = slack_ts(1761999910)
+    export_join_ts = slack_ts(1761999890)
+    export_root_body = f"exported slack root {uuid.uuid4()}"
+    export_reply_body = f"exported slack reply {uuid.uuid4()}"
+    mock_api_path = state_dir / "slack-export-mock.json"
+    mock_api_path.write_text(
+        json.dumps(
+            {
+                "histories": {
+                    export_channel_id: {
+                        "ok": True,
+                        "messages": [
+                            {
+                                "type": "message",
+                                "subtype": "channel_join",
+                                "user": "UEXPORTJOIN",
+                                "text": "joined the channel",
+                                "ts": export_join_ts,
+                            },
+                            {
+                                "type": "message",
+                                "user": "UEXPORTROOT",
+                                "text": export_root_body,
+                                "ts": export_root_ts,
+                                "reply_count": 1,
+                            }
+                        ],
+                        "has_more": False,
+                    }
+                },
+                "replies": {
+                    f"{export_channel_id}:{export_root_ts}": {
+                        "ok": True,
+                        "messages": [
+                            {
+                                "type": "message",
+                                "user": "UEXPORTROOT",
+                                "text": export_root_body,
+                                "ts": export_root_ts,
+                            },
+                            {
+                                "type": "message",
+                                "user": "UEXPORTREPLY",
+                                "text": export_reply_body,
+                                "ts": export_reply_ts,
+                                "thread_ts": export_root_ts,
+                            },
+                        ],
+                        "has_more": False,
+                    }
+                },
+            }
+        )
+    )
+    conn = connect_state(state_dir)
+    try:
+        before_export_rows = conn.execute("SELECT COUNT(*) AS count FROM slack_messages").fetchone()["count"]
+    finally:
+        conn.close()
+    exported_proc = run(
+        cli,
+        state_dir,
+        "slack",
+        "export-history",
+        "--workspace",
+        workspace,
+        "--channel-id",
+        export_channel_id,
+        "--channel-name",
+        export_channel_name,
+        "--include-replies",
+        "--mock-api-file",
+        str(mock_api_path),
+    )
+    require("Read-only export" in exported_proc.stderr, "slack export did not report read-only boundary")
+    require("Mock Slack API responses used" in exported_proc.stderr, "slack export did not report mock boundary")
+    require("Skipped 1 history rows" in exported_proc.stderr, "slack export did not skip unsupported history rows")
+    exported_lines = [line for line in exported_proc.stdout.splitlines() if line.strip()]
+    require(len(exported_lines) == 2, f"slack export rendered wrong row count:\n{exported_proc.stdout}")
+    require(all(line.startswith("{") for line in exported_lines), "slack export stdout was not pure event JSON rows")
+    exported_events = [json.loads(line) for line in exported_lines]
+    require(
+        [event["event"]["ts"] for event in exported_events] == [export_root_ts, export_reply_ts],
+        "slack export did not emit root before reply",
+    )
+    require(exported_events[0]["team_id"] == workspace, "slack export did not preserve workspace")
+    require(exported_events[0]["event"]["channel_name"] == export_channel_name, "slack export did not preserve channel name")
+    conn = connect_state(state_dir)
+    try:
+        after_export_rows = conn.execute("SELECT COUNT(*) AS count FROM slack_messages").fetchone()["count"]
+    finally:
+        conn.close()
+    require(before_export_rows == after_export_rows, "slack export mutated SQLite state")
+
+    export_root_import = run(cli, state_dir, "slack", "ingest", stdin=exported_lines[0]).stdout
+    export_root_id = parse_message_id(export_root_import)
+    require(export_root_body in export_root_import, "exported root did not ingest through existing path")
+    export_reply_import = run(cli, state_dir, "slack", "ingest", stdin=exported_lines[1]).stdout
+    export_reply_id = parse_message_id(export_reply_import)
+    require(f"Thread ts: {export_root_ts}" in export_reply_import, "exported reply did not map to Slack thread")
+    export_thread_target = f"{export_target}:{export_root_id[:8]}"
+    require(f"Target: {export_thread_target}" in export_reply_import, "exported reply target mismatch")
+    export_thread_history = run(cli, state_dir, "message", "read", "--channel", export_thread_target).stdout
+    require(export_root_body in export_thread_history and export_reply_body in export_thread_history, "exported thread not readable after ingest")
+    export_resolved = run(
+        cli,
+        state_dir,
+        "slack",
+        "resolve",
+        "--workspace",
+        workspace,
+        "--channel-id",
+        export_channel_id,
+        "--ts",
+        export_reply_ts,
+    ).stdout
+    require(export_reply_id in export_resolved, "exported reply mapping did not resolve")
+    export_inbox = run(cli, state_dir, "message", "check").stdout
+    require(export_root_body in export_inbox and export_reply_body in export_inbox, "exported ingest did not enqueue inbox delivery")
+
     root_event = {
         "team_id": workspace,
         "event": {
