@@ -2119,6 +2119,10 @@ def flag_missing_value(argv: list[str], flag: str) -> bool:
     return False
 
 
+def unknown_flags(argv: list[str], allowed: set[str]) -> list[str]:
+    return [value for value in argv if value.startswith("--") and value not in allowed]
+
+
 def attachment_by_id(state: dict[str, Any], attachment_id: str) -> dict[str, Any] | None:
     for record in state.get("attachments", []):
         if record["id"] == attachment_id:
@@ -3901,6 +3905,12 @@ def command_daemon(argv: list[str]) -> int:
 
 
 def command_agent_register(argv: list[str]) -> int:
+    unknown = unknown_flags(
+        argv,
+        {"--name", "--display-name", "--runtime", "--workspace", "--avatar-url", "--capability"},
+    )
+    if unknown:
+        return write_stderr(f"Error: unknown agent register flag: {unknown[0]}\nCode: INVALID_ARG\n")
     if (
         flag_missing_value(argv, "--name")
         or flag_missing_value(argv, "--display-name")
@@ -3979,6 +3989,10 @@ def command_agent_register(argv: list[str]) -> int:
 
 
 def command_agent_list(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, set())
+    if unknown:
+        return write_stderr(f"Error: unknown agent list flag: {unknown[0]}\nCode: INVALID_ARG\n")
+
     def action(state: dict[str, Any]) -> int:
         agents = sorted(state.get("agents", []), key=lambda row: row["name"])
         heartbeats = {record["name"]: record for record in state.get("agent_heartbeats", [])}
@@ -3991,6 +4005,9 @@ def command_agent_list(argv: list[str]) -> int:
 
 
 def command_agent_heartbeat(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--name", "--status", "--pid", "--session-id", "--detail"})
+    if unknown:
+        return write_stderr(f"Error: unknown agent heartbeat flag: {unknown[0]}\nCode: INVALID_ARG\n")
     if (
         flag_missing_value(argv, "--name")
         or flag_missing_value(argv, "--status")
@@ -4096,6 +4113,9 @@ def write_agent_seed_workspace(agent: dict[str, Any], destination: Path) -> None
 
 
 def command_agent_seed(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--name", "--output-dir"})
+    if unknown:
+        return write_stderr(f"Error: unknown agent seed flag: {unknown[0]}\nCode: INVALID_ARG\n")
     if flag_missing_value(argv, "--name") or flag_missing_value(argv, "--output-dir"):
         return write_stderr("Error: Agent seed flags require values\nCode: INVALID_ARG\n")
     name = arg_value(argv, "--name")
@@ -4121,6 +4141,10 @@ def command_agent_seed(argv: list[str]) -> int:
 
 
 def command_agent_supervisor_plan(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, set())
+    if unknown:
+        return write_stderr(f"Error: unknown agent supervisor-plan flag: {unknown[0]}\nCode: INVALID_ARG\n")
+
     def action(state: dict[str, Any]) -> int:
         agents = sorted(state.get("agents", []), key=lambda row: row["name"])
         if not agents:
