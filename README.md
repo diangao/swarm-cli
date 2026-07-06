@@ -41,6 +41,7 @@ Current implemented surface:
 - `swarm action prepare --target ...` for local pending `channel:create` / `agent:create` action cards
 - `swarm slack configure --workspace ... --bot-token-env ... [--signing-secret-env ...] [--app-token-env ...]`
 - `swarm slack env --workspace ...`
+- `swarm slack export-history --workspace ... --channel-id ... [--channel-name ...] [--include-replies]` to export Slack channel history as ingest-compatible event JSON rows
 - `swarm slack ingest [--event-file ...]` to import a Slack message-event JSON payload into swarm state
 - `swarm slack resolve --workspace ... --channel-id ... --ts ...` to resolve a Slack message timestamp to its swarm target/message
 - `swarm slack outbound --workspace ... (--target ...|--message-id ...) [--after-seq ...]` to render Slack `chat.postMessage` request plans from canonical swarm messages
@@ -61,15 +62,26 @@ remote execution backend.
 ## Slack Adapter Boundary
 
 Slack is treated as an adapter input and UI surface, not as the canonical
-coordination store. The current seam accepts local Slack-style message-event
-JSON, stores workspace configuration by environment-variable name, renders
-outbound request plans, and includes a small Slack Web API sender for
-`chat.postMessage`. It does not implement Slack Events API subscription, OAuth,
-Socket Mode, or workspace provisioning.
+coordination store. The current seam can export Slack channel history into
+local Slack-style message-event JSON, ingest those events, store workspace
+configuration by environment-variable name, render outbound request plans, and
+send through a small Slack Web API seam for `chat.postMessage`. It does not
+implement Slack Events API subscription, OAuth, Socket Mode, or workspace
+provisioning.
 
 `swarm slack configure` persists only names such as `SLACK_BOT_TOKEN`; it never
 stores token or signing-secret values. `swarm slack env` shows the configured
 names a real adapter process would need in its environment.
+
+`swarm slack export-history` is a read-only bridge from Slack Web API history
+to the existing ingest seam. It calls `conversations.history` and optionally
+`conversations.replies`, then emits newline-delimited event JSON on stdout that
+can be replayed row-by-row through `swarm slack ingest`. Status and
+token-source notes go to stderr so stdout remains machine-consumable. History
+rows that the current ingest seam does not support, such as Slack system
+subtypes, are skipped instead of emitted as invalid events. The exporter does
+not mutate swarm SQLite state; ingest remains the only path that appends
+canonical swarm messages or `slack_messages` mappings.
 
 `swarm slack ingest` maps a Slack root message to a swarm channel target derived
 from the Slack channel id (`C123` -> `#slack-c123`), stores a durable
