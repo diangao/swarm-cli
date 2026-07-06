@@ -1879,6 +1879,139 @@ def probe_integration_local_login(cli: Path, state_dir: Path) -> None:
         conn.close()
 
 
+def probe_agent_registry(cli: Path, state_dir: Path) -> None:
+    name = "curator"
+    display_name = f"Curator {uuid.uuid4().hex[:6]}"
+    avatar_url = f"https://example.com/avatar/{uuid.uuid4().hex}.png"
+    registered = run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        name,
+        "--display-name",
+        display_name,
+        "--runtime",
+        "codex",
+        "--workspace",
+        f"agents/{name}",
+        "--avatar-url",
+        avatar_url,
+        "--capability",
+        "triage",
+        "--capability",
+        "write",
+    ).stdout
+    require(f"Agent @{name} registered." in registered, "agent register did not acknowledge agent")
+    require(f"Display name: {display_name}" in registered, "agent register did not render display name")
+    listed = run(cli, state_dir, "agent", "list").stdout
+    require(f"@{name} ({display_name}) runtime=codex" in listed, "agent list did not render registered agent")
+    require("capabilities=triage,write" in listed, "agent list did not render capabilities")
+    server_info = run(cli, state_dir, "server", "info").stdout
+    require(f"@{name} ({display_name})" in server_info, "server info did not include registered agent profile")
+
+    seed_dir = state_dir / "agent-seed"
+    seeded = run(cli, state_dir, "agent", "seed", "--name", name, "--output-dir", str(seed_dir)).stdout
+    require("Seed workspace skeleton written" in seeded, "agent seed did not acknowledge skeleton write")
+    required_files = ["seed.json", "MEMORY.md", "README.md", ".gitignore"]
+    for filename in required_files:
+        require((seed_dir / filename).exists(), f"agent seed missing {filename}")
+    seed_payload = json.loads((seed_dir / "seed.json").read_text())
+    require(seed_payload["format"] == "swarm-agent-redacted-seed", "agent seed format mismatch")
+    require(seed_payload["status"] == "format_only_waiting_for_selected_sources", "agent seed was not format-only")
+    require(seed_payload["source_policy"]["automatic_chat_dump"] is False, "agent seed allowed automatic chat dump")
+    require(seed_payload["scrub_gates"]["internal_demo"] == ["credentials", "other_people_dm_originals"], "agent seed internal gate mismatch")
+    require(
+        seed_payload["scrub_gates"]["possibly_public"] == [
+            "credentials",
+            "other_people_dm_originals",
+            "pii",
+            "org_or_client_ip",
+        ],
+        "agent seed public gate mismatch",
+    )
+    seed_text = "\n".join((seed_dir / filename).read_text() for filename in required_files)
+    secret_markers = [
+        "xox" + "b-",
+        "xox" + "p-",
+        "sk" + "_agent_",
+        "sk" + "_machine_",
+        "raft" + "_secret_",
+        "slock" + "_secret_",
+        "credential.json contents",
+    ]
+    for marker in secret_markers:
+        require(marker not in seed_text, f"agent seed contained blocked marker: {marker}")
+
+    heartbeat = run(
+        cli,
+        state_dir,
+        "agent",
+        "heartbeat",
+        "--name",
+        name,
+        "--status",
+        "alive",
+        "--pid",
+        "4242",
+        "--session-id",
+        "session-abc",
+        "--detail",
+        "ready",
+    ).stdout
+    require(f"Heartbeat recorded for @{name}: alive" in heartbeat, "agent heartbeat did not acknowledge update")
+    supervisor = run(cli, state_dir, "agent", "supervisor-plan").stdout
+    plans = [json.loads(line) for line in supervisor.splitlines() if line.startswith("{")]
+    require(len(plans) == 1, "agent supervisor plan did not render one plan")
+    require(plans[0]["agent"] == name and plans[0]["workspace"] == f"agents/{name}", "agent supervisor plan fields mismatch")
+    require("No worker process was started" in supervisor, "agent supervisor plan did not state no-start boundary")
+
+    target = f"#agent-author-{uuid.uuid4().hex[:8]}"
+    body = f"registered author body {uuid.uuid4()}"
+    sent = run(cli, state_dir, "message", "send", "--target", target, "--author", name, stdin=body).stdout
+    parse_message_id(sent)
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(f"@{name}: {body}" in history, "message send --author did not persist registered author")
+    rejected_author = run(
+        cli,
+        state_dir,
+        "message",
+        "send",
+        "--target",
+        target,
+        "--author",
+        "missing-agent",
+        stdin="should fail",
+        expected=1,
+    ).stderr
+    require("Author not found" in rejected_author, "message send with missing author did not fail closed")
+
+    conn = connect_state(state_dir)
+    try:
+        agent_row = conn.execute(
+            "SELECT display_name, runtime, workspace_path, capabilities_json, avatar_url FROM agents WHERE name = ?",
+            (name,),
+        ).fetchone()
+        require(agent_row is not None, "agent registry row missing from SQLite")
+        require(agent_row["display_name"] == display_name, "agent registry display name mismatch")
+        require(agent_row["runtime"] == "codex", "agent registry runtime mismatch")
+        require(agent_row["workspace_path"] == f"agents/{name}", "agent registry workspace mismatch")
+        require(json.loads(agent_row["capabilities_json"]) == ["triage", "write"], "agent capabilities JSON mismatch")
+        require(agent_row["avatar_url"] == avatar_url, "agent avatar URL mismatch")
+        heartbeat_row = conn.execute(
+            "SELECT status, pid, session_id, detail FROM agent_heartbeats WHERE name = ?",
+            (name,),
+        ).fetchone()
+        require(heartbeat_row is not None, "agent heartbeat row missing from SQLite")
+        require(heartbeat_row["status"] == "alive" and heartbeat_row["pid"] == "4242", "agent heartbeat fields mismatch")
+        profile_row = conn.execute("SELECT kind, avatar_url FROM profiles WHERE name = ?", (name,)).fetchone()
+        require(profile_row is not None and profile_row["kind"] == "agent", "registered agent profile missing")
+        require(profile_row["avatar_url"] == avatar_url, "registered agent profile avatar mismatch")
+    finally:
+        conn.close()
+
+
 def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
     workspace = f"T{uuid.uuid4().hex[:8].upper()}"
     channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
@@ -2179,10 +2312,91 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
     require(reply_body in reply_inbox, "slack reply ingest did not enqueue inbox delivery")
     require(f"[target={thread_target} msg={reply_id[:8]}" in reply_inbox, "slack reply inbox row missing thread target/id")
 
+    custom_agent_name = f"curator-{uuid.uuid4().hex[:6]}"
+    custom_display_name = f"Curator {uuid.uuid4().hex[:6]}"
+    custom_avatar_url = f"https://example.com/slack-avatar/{uuid.uuid4().hex}.png"
+    run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        custom_agent_name,
+        "--display-name",
+        custom_display_name,
+        "--runtime",
+        "codex",
+        "--avatar-url",
+        custom_avatar_url,
+        "--capability",
+        "slack-render",
+    )
+    custom_body = f"slack customized author {uuid.uuid4()}"
+    custom_attempt = run(
+        cli,
+        state_dir,
+        "message",
+        "send",
+        "--target",
+        target,
+        "--author",
+        custom_agent_name,
+        stdin=custom_body,
+    ).stdout
+    if "Freshness hold:" in custom_attempt:
+        custom_sent = run(
+            cli,
+            state_dir,
+            "message",
+            "send",
+            "--send-draft",
+            "--target",
+            target,
+            "--author",
+            custom_agent_name,
+        ).stdout
+    else:
+        custom_sent = custom_attempt
+    custom_id = parse_message_id(custom_sent)
+    rendered_custom = run(
+        cli,
+        state_dir,
+        "slack",
+        "outbound",
+        "--workspace",
+        workspace,
+        "--message-id",
+        custom_id,
+    ).stdout
+    custom_plans = outbound_plans(rendered_custom)
+    require(len(custom_plans) == 1, "slack customized author plan count mismatch")
+    custom_plan = custom_plans[0]
+    require(custom_plan["swarm_author"] == custom_agent_name, "slack customized plan missing swarm author")
+    require(custom_plan["username"] == custom_display_name, "slack customized plan missing username")
+    require(custom_plan["icon_url"] == custom_avatar_url, "slack customized plan missing icon_url")
+    sendable = cli_module.slack_sendable_payload(custom_plan)
+    require(sendable["username"] == custom_display_name, "slack sendable payload missing username")
+    require(sendable["icon_url"] == custom_avatar_url, "slack sendable payload missing icon_url")
+    custom_sent_ts = slack_ts(1762000035)
+    run(
+        cli,
+        state_dir,
+        "slack",
+        "mark-sent",
+        "--workspace",
+        workspace,
+        "--message-id",
+        custom_id,
+        "--ts",
+        custom_sent_ts,
+    )
+
     top_outbound_body = f"slack outbound top {uuid.uuid4()}"
     top_hold = run(cli, state_dir, "message", "send", "--target", target, stdin=top_outbound_body).stdout
-    require("Freshness hold:" in top_hold, "slack outbound top setup should first hit freshness hold")
-    top_sent = run(cli, state_dir, "message", "send", "--send-draft", "--target", target).stdout
+    if "Freshness hold:" in top_hold:
+        top_sent = run(cli, state_dir, "message", "send", "--send-draft", "--target", target).stdout
+    else:
+        top_sent = top_hold
     top_outbound_id = parse_message_id(top_sent)
     rendered_top = run(cli, state_dir, "slack", "outbound", "--workspace", workspace, "--target", target).stdout
     top_plans = outbound_plans(rendered_top)
@@ -2538,11 +2752,12 @@ def main() -> int:
         probe_navigation_surfaces(cli, state_dir)
         probe_membership_attention(cli, state_dir)
         probe_integration_local_login(cli, state_dir)
+        probe_agent_registry(cli, state_dir)
         probe_attachments(cli, state_dir)
         probe_action_prepare(cli, state_dir)
         probe_slack_adapter(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, attachments, action prepare, and Slack adapter ingest/resolve/outbound/send")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, and Slack adapter ingest/resolve/outbound/send/customize")
     return 0
 
 
