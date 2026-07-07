@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import json
 import importlib.machinery
@@ -3178,6 +3179,54 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
     )
 
 
+def probe_daemon_dispatch_lease(cli: Path, state_dir: Path) -> None:
+    agent = f"lease-{uuid.uuid4().hex[:8]}"
+    run(cli, state_dir, "agent", "register", "--name", agent, "--display-name", "Lease Probe",
+        "--runtime", "codex", "--workspace", f"agents/{agent}")
+
+    bogus = run(cli, state_dir, "daemon", "dispatch", "enqueue", "--agent", agent, "--bogus", "x", expected=1)
+    require("Code: INVALID_ARG" in bogus.stderr, "dispatch enqueue accepted unknown flag")
+    ghost = run(cli, state_dir, "daemon", "dispatch", "enqueue", "--agent", "no-such-agent",
+                "--kind", "manual", "--payload", "{}", expected=1)
+    require("Code: NOT_FOUND" in ghost.stderr, "dispatch enqueue accepted unregistered agent")
+
+    out = run(cli, state_dir, "daemon", "dispatch", "enqueue", "--agent", agent,
+              "--kind", "manual", "--payload", "{\"n\":1}").stdout
+    require("enqueued" in out, "dispatch enqueue did not confirm")
+    dispatch_id = out.split("Dispatch ", 1)[1].split(" ", 1)[0]
+
+    claim = run(cli, state_dir, "daemon", "dispatch", "claim", "--owner", "alpha", "--lease-seconds", "1").stdout
+    require(f"- {dispatch_id} @{agent}" in claim, "dispatch claim did not lease the pending item")
+    require("attempts=1" in claim, "dispatch claim did not increment attempts")
+
+    wrong = run(cli, state_dir, "daemon", "dispatch", "complete", "--id", dispatch_id, "--owner", "beta", expected=1)
+    require("Code: DISPATCH_NOT_HELD" in wrong.stderr, "complete by non-holder was not rejected")
+
+    time.sleep(1.2)
+    stale = run(cli, state_dir, "daemon", "dispatch", "complete", "--id", dispatch_id, "--owner", "alpha", expected=1)
+    require("expired" in stale.stderr, "expired lease complete was not rejected")
+
+    reclaim = run(cli, state_dir, "daemon", "dispatch", "claim", "--owner", "beta", "--lease-seconds", "60").stdout
+    require("(reclaimed)" in reclaim and f"- {dispatch_id} " in reclaim, "expired lease was not reclaimed")
+    empty = run(cli, state_dir, "daemon", "dispatch", "claim", "--owner", "gamma", "--lease-seconds", "60").stdout
+    require("No claimable dispatches." in empty, "reclaim was not exactly-once")
+
+    done = run(cli, state_dir, "daemon", "dispatch", "complete", "--id", dispatch_id, "--owner", "beta").stdout
+    require("completed by beta" in done, "rightful holder could not complete")
+    double = run(cli, state_dir, "daemon", "dispatch", "complete", "--id", dispatch_id, "--owner", "beta", expected=1)
+    require("Code: DISPATCH_NOT_HELD" in double.stderr, "double complete was not rejected")
+
+    out2 = run(cli, state_dir, "daemon", "dispatch", "enqueue", "--agent", agent,
+               "--kind", "manual", "--payload", "{}", "--max-attempts", "1").stdout
+    second_id = out2.split("Dispatch ", 1)[1].split(" ", 1)[0]
+    run(cli, state_dir, "daemon", "dispatch", "claim", "--owner", "w", "--lease-seconds", "60")
+    failed = run(cli, state_dir, "daemon", "dispatch", "fail", "--id", second_id, "--owner", "w",
+                 "--error", "boom").stdout
+    require("failed permanently" in failed, "attempts cap did not fail dispatch permanently")
+    listing = run(cli, state_dir, "daemon", "dispatch", "list", "--status", "failed").stdout
+    require(f"- {second_id} " in listing and "error=boom" in listing, "failed dispatch missing from list")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -3206,8 +3255,9 @@ def main() -> int:
         probe_slack_adapter(cli, state_dir)
         probe_slack_daemon_event_loop(cli, state_dir)
         probe_daemon_wake_router(cli, state_dir)
+        probe_daemon_dispatch_lease(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, and daemon wake router single-flight/reminder routing")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, and daemon dispatch lease claim/expiry/exactly-once recovery")
     return 0
 
 
