@@ -10,6 +10,7 @@ import uuid
 import hashlib
 import json
 import mimetypes
+import re
 import shutil
 import shlex
 import time
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -183,6 +184,34 @@ def daemon_event_item(
         "time": time,
         "event": event,
         "detail": detail,
+    }
+
+
+def daemon_wake_item(
+    agent_name: str,
+    running: bool,
+    active_wake_count: int,
+    active_reason: str | None,
+    active_message_id: str | None,
+    active_started_at: str | None,
+    pending_count: int,
+    pending_reason: str | None,
+    pending_message_id: str | None,
+    pending_since: str | None,
+    updated_at: str,
+) -> dict[str, Any]:
+    return {
+        "agent_name": agent_name,
+        "running": running,
+        "active_wake_count": active_wake_count,
+        "active_reason": active_reason,
+        "active_message_id": active_message_id,
+        "active_started_at": active_started_at,
+        "pending_count": pending_count,
+        "pending_reason": pending_reason,
+        "pending_message_id": pending_message_id,
+        "pending_since": pending_since,
+        "updated_at": updated_at,
     }
 
 
@@ -440,6 +469,7 @@ EMPTY_STATE: dict[str, Any] = {
     "reminders": [],
     "reminder_events": [],
     "daemon_events": [],
+    "daemon_wakes": [],
     "attachments": [],
     "message_attachments": [],
     "message_reactions": [],
@@ -566,6 +596,7 @@ SEED_STATE: dict[str, Any] = {
     "reminders": [],
     "reminder_events": [],
     "daemon_events": [],
+    "daemon_wakes": [],
     "attachments": [],
     "message_attachments": [],
     "message_reactions": [],
@@ -750,6 +781,21 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_daemon_events_event_ordinal
             ON daemon_events(event, ordinal);
+        CREATE TABLE IF NOT EXISTS daemon_wakes (
+            agent_name TEXT PRIMARY KEY,
+            running INTEGER NOT NULL,
+            active_wake_count INTEGER NOT NULL,
+            active_reason TEXT,
+            active_message_id TEXT,
+            active_started_at TEXT,
+            pending_count INTEGER NOT NULL,
+            pending_reason TEXT,
+            pending_message_id TEXT,
+            pending_since TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_daemon_wakes_pending
+            ON daemon_wakes(running, pending_count);
         CREATE TABLE IF NOT EXISTS attachments (
             id TEXT PRIMARY KEY,
             channel TEXT NOT NULL,
@@ -865,6 +911,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM reminder_events")
     conn.execute("DELETE FROM reminders")
     conn.execute("DELETE FROM daemon_events")
+    conn.execute("DELETE FROM daemon_wakes")
     conn.execute("DELETE FROM message_attachments")
     conn.execute("DELETE FROM message_reactions")
     conn.execute("DELETE FROM action_cards")
@@ -1074,6 +1121,32 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 event["detail"],
             )
             for event in state.get("daemon_events", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO daemon_wakes(
+            agent_name, running, active_wake_count, active_reason, active_message_id,
+            active_started_at, pending_count, pending_reason, pending_message_id,
+            pending_since, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                wake["agent_name"],
+                1 if wake.get("running") else 0,
+                int(wake.get("active_wake_count", 0)),
+                wake.get("active_reason"),
+                wake.get("active_message_id"),
+                wake.get("active_started_at"),
+                int(wake.get("pending_count", 0)),
+                wake.get("pending_reason"),
+                wake.get("pending_message_id"),
+                wake.get("pending_since"),
+                wake["updated_at"],
+            )
+            for wake in state.get("daemon_wakes", [])
         ],
     )
     conn.executemany(
@@ -1483,6 +1556,30 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    daemon_wakes = [
+        daemon_wake_item(
+            row["agent_name"],
+            bool(row["running"]),
+            row["active_wake_count"],
+            row["active_reason"],
+            row["active_message_id"],
+            row["active_started_at"],
+            row["pending_count"],
+            row["pending_reason"],
+            row["pending_message_id"],
+            row["pending_since"],
+            row["updated_at"],
+        )
+        for row in conn.execute(
+            """
+            SELECT agent_name, running, active_wake_count, active_reason, active_message_id,
+                   active_started_at, pending_count, pending_reason, pending_message_id,
+                   pending_since, updated_at
+            FROM daemon_wakes
+            ORDER BY agent_name
+            """
+        ).fetchall()
+    ]
     attachments = [
         attachment_item(
             row["id"],
@@ -1652,6 +1749,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "reminders": reminders,
         "reminder_events": reminder_events,
         "daemon_events": daemon_events,
+        "daemon_wakes": daemon_wakes,
         "attachments": attachments,
         "message_attachments": message_attachments,
         "message_reactions": message_reactions,
@@ -2477,6 +2575,180 @@ def append_daemon_event(state: dict[str, Any], event: str, detail: dict[str, Any
     state.setdefault("daemon_events", []).append(
         daemon_event_item(0, current_timestamp(), event, detail_json)
     )
+
+
+def daemon_wake_by_agent(state: dict[str, Any], agent_name: str) -> dict[str, Any] | None:
+    normalized = agent_name.removeprefix("@")
+    for record in state.get("daemon_wakes", []):
+        if record["agent_name"] == normalized:
+            return record
+    return None
+
+
+def mentioned_agent_names(state: dict[str, Any], body: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"@([A-Za-z0-9_-]+)", body):
+        candidate = match.group(1)
+        normalized = candidate.removeprefix("@")
+        if normalized in seen:
+            continue
+        if agent_by_name(state, normalized) is None:
+            continue
+        names.append(normalized)
+        seen.add(normalized)
+    return names
+
+
+def enqueue_daemon_wake(
+    state: dict[str, Any],
+    agent_name: str,
+    reason: str,
+    message_id: str | None,
+) -> str:
+    agent_name = agent_name.removeprefix("@")
+    now = current_timestamp()
+    wake = daemon_wake_by_agent(state, agent_name)
+    if wake is None:
+        wake = daemon_wake_item(
+            agent_name,
+            False,
+            0,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            now,
+        )
+        state.setdefault("daemon_wakes", []).append(wake)
+    if wake.get("running"):
+        wake["pending_count"] = max(1, int(wake.get("pending_count", 0)) + 1)
+        if not wake.get("pending_since"):
+            wake["pending_since"] = now
+        wake["pending_reason"] = reason
+        wake["pending_message_id"] = message_id
+        wake["updated_at"] = now
+        append_daemon_event(
+            state,
+            "wake_pending",
+            {
+                "agent": agent_name,
+                "reason": reason,
+                "message_id": message_id,
+                "pending_count": wake["pending_count"],
+            },
+        )
+        return "pending"
+
+    wake["running"] = True
+    wake["active_wake_count"] = 1
+    wake["active_reason"] = reason
+    wake["active_message_id"] = message_id
+    wake["active_started_at"] = now
+    wake["pending_count"] = 0
+    wake["pending_reason"] = None
+    wake["pending_message_id"] = None
+    wake["pending_since"] = None
+    wake["updated_at"] = now
+    append_daemon_event(
+        state,
+        "wake_started",
+        {
+            "agent": agent_name,
+            "reason": reason,
+            "message_id": message_id,
+            "active_wake_count": wake["active_wake_count"],
+        },
+    )
+    return "started"
+
+
+def finish_daemon_wake(state: dict[str, Any], agent_name: str) -> tuple[str | None, str | None]:
+    agent_name = agent_name.removeprefix("@")
+    wake = daemon_wake_by_agent(state, agent_name)
+    if wake is None or not wake.get("running"):
+        return None, "Agent has no running daemon turn"
+    now = current_timestamp()
+    if int(wake.get("pending_count", 0)) > 0:
+        pending_count = int(wake.get("pending_count", 0))
+        wake["running"] = True
+        wake["active_wake_count"] = int(wake.get("active_wake_count", 0)) + 1
+        wake["active_reason"] = wake.get("pending_reason") or "pending"
+        wake["active_message_id"] = wake.get("pending_message_id")
+        wake["active_started_at"] = now
+        wake["pending_count"] = 0
+        wake["pending_reason"] = None
+        wake["pending_message_id"] = None
+        wake["pending_since"] = None
+        wake["updated_at"] = now
+        append_daemon_event(
+            state,
+            "wake_promoted",
+            {
+                "agent": agent_name,
+                "pending_count": pending_count,
+                "active_wake_count": wake["active_wake_count"],
+                "reason": wake.get("active_reason"),
+                "message_id": wake.get("active_message_id"),
+            },
+        )
+        return "promoted", None
+
+    wake["running"] = False
+    wake["active_reason"] = None
+    wake["active_message_id"] = None
+    wake["active_started_at"] = None
+    wake["updated_at"] = now
+    append_daemon_event(
+        state,
+        "wake_finished",
+        {
+            "agent": agent_name,
+            "active_wake_count": wake["active_wake_count"],
+        },
+    )
+    return "idle", None
+
+
+def route_message_wakes(state: dict[str, Any], record: dict[str, Any]) -> list[dict[str, str]]:
+    routed: list[dict[str, str]] = []
+    for agent_name in mentioned_agent_names(state, str(record.get("body", ""))):
+        status = enqueue_daemon_wake(state, agent_name, "mention", str(record["id"]))
+        routed.append({"agent": agent_name, "status": status, "reason": "mention"})
+    if not routed and "@" in str(record.get("body", "")):
+        append_daemon_event(
+            state,
+            "wake_route_miss",
+            {
+                "reason": "mention",
+                "message_id": record["id"],
+                "target": record["target"],
+            },
+        )
+    return routed
+
+
+def route_reminder_wake(state: dict[str, Any], reminder: dict[str, Any], record: dict[str, Any] | None) -> str | None:
+    target = reminder.get("target")
+    if not isinstance(target, str) or not target.startswith("dm:@"):
+        return None
+    agent_name = target.removeprefix("dm:@").split(":", 1)[0].removeprefix("@")
+    if agent_by_name(state, agent_name) is None:
+        append_daemon_event(
+            state,
+            "wake_route_miss",
+            {
+                "reason": "reminder",
+                "reminder_id": reminder["id"],
+                "target": target,
+            },
+        )
+        return None
+    message_id = str(record["id"]) if record is not None else None
+    return enqueue_daemon_wake(state, agent_name, "reminder", message_id)
 
 
 def append_inbox_for_message(state: dict[str, Any], record: dict[str, Any]) -> None:
@@ -3997,12 +4269,26 @@ def fire_due_reminders(state: dict[str, Any]) -> int:
     for reminder in due:
         detail_parts = [f"title={reminder['title']}"]
         target = reminder.get("target")
+        record = None
         if target:
             body = f"Reminder {reminder['id']}: {reminder['title']}"
             record = append_message(state, target, body, sender_type="system", author="system")
             append_inbox_for_message(state, record)
             detail_parts.append(f"target={target}")
             detail_parts.append(f"message_id={record['id']}")
+        wake_status = route_reminder_wake(state, reminder, record)
+        if wake_status is not None:
+            detail_parts.append(f"wake={wake_status}")
+            append_daemon_event(
+                state,
+                "wake_route",
+                {
+                    "source": "reminder",
+                    "reminder_id": reminder["id"],
+                    "target": target,
+                    "status": wake_status,
+                },
+            )
         append_reminder_event(state, reminder["id"], "fired", " ".join(detail_parts))
         fired += 1
 
@@ -4177,6 +4463,18 @@ def daemon_ingest_slack_payload(workspace: str, payload: dict[str, Any]) -> tupl
                 "target": mapping["target"],
             },
         )
+        if status == "imported":
+            routed = route_message_wakes(state, record)
+            if routed:
+                append_daemon_event(
+                    state,
+                    "wake_route",
+                    {
+                        "source": "slack",
+                        "message_id": record["id"],
+                        "routes": routed,
+                    },
+                )
         result["status"] = status
         result["message_id"] = record["id"]
         return 0
@@ -4377,6 +4675,73 @@ def command_daemon_run(argv: list[str]) -> int:
         )
 
 
+def format_daemon_wake_row(record: dict[str, Any]) -> str:
+    running = "running" if record.get("running") else "idle"
+    active = "-"
+    if record.get("active_reason") or record.get("active_message_id"):
+        active = (
+            f"{record.get('active_reason') or '-'}"
+            f"/{short_id(str(record['active_message_id'])) if record.get('active_message_id') else '-'}"
+        )
+    pending = "-"
+    if int(record.get("pending_count", 0)) > 0:
+        pending = (
+            f"{record['pending_count']} "
+            f"{record.get('pending_reason') or '-'}"
+            f"/{short_id(str(record['pending_message_id'])) if record.get('pending_message_id') else '-'}"
+        )
+    return (
+        f"@{record['agent_name']} {running} active_turns={record['active_wake_count']} "
+        f"active={active} pending={pending} updated={record['updated_at']}"
+    )
+
+
+def command_daemon_wakes(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--agent"})
+    if unknown:
+        return write_stderr(f"Error: unknown daemon wakes flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if flag_missing_value(argv, "--agent"):
+        return write_stderr("Error: --agent requires a value\nCode: INVALID_ARG\n")
+    agent_filter = arg_value(argv, "--agent")
+    if agent_filter is not None:
+        agent_filter = agent_filter.removeprefix("@")
+
+    def action(state: dict[str, Any]) -> int:
+        rows = sorted(state.get("daemon_wakes", []), key=lambda row: row["agent_name"])
+        if agent_filter is not None:
+            rows = [row for row in rows if row["agent_name"] == agent_filter]
+        if not rows:
+            return write_stdout("No daemon wakes.\n")
+        rendered = "\n".join(format_daemon_wake_row(row) for row in rows)
+        return write_stdout(f"## Daemon Wakes ({len(rows)})\n\n{rendered}\n")
+
+    return with_read_state(action)
+
+
+def command_daemon_finish_turn(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--agent"})
+    if unknown:
+        return write_stderr(f"Error: unknown daemon finish-turn flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if flag_missing_value(argv, "--agent"):
+        return write_stderr("Error: --agent requires a value\nCode: INVALID_ARG\n")
+    agent_name = arg_value(argv, "--agent")
+    if agent_name is not None:
+        agent_name = agent_name.removeprefix("@")
+    if not agent_name:
+        return write_stderr("Error: --agent is required\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if agent_by_name(state, agent_name) is None:
+            return write_stderr("Error: Agent not found\nCode: NOT_FOUND\n")
+        status, error = finish_daemon_wake(state, agent_name)
+        if error is not None:
+            return write_stderr(f"Error: {error}\nCode: NOT_FOUND\n")
+        assert status is not None
+        return write_stdout(f"Daemon turn finished for @{agent_name}: {status}.\n")
+
+    return with_mutable_state(action)
+
+
 def command_daemon(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing daemon subcommand\nCode: INVALID_ARG\n")
@@ -4386,6 +4751,10 @@ def command_daemon(argv: list[str]) -> int:
         return command_daemon_run(rest)
     if subcommand == "slack":
         return command_daemon_slack(rest)
+    if subcommand == "wakes":
+        return command_daemon_wakes(rest)
+    if subcommand == "finish-turn":
+        return command_daemon_finish_turn(rest)
     return write_stderr(f"Error: unknown daemon subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
