@@ -5232,9 +5232,9 @@ def clipped_turn_output(value: str | None, limit: int = 12000) -> str | None:
     return value[:limit] + f"\n[truncated {len(value) - limit} chars]"
 
 
-def safe_turn_env(agent_name: str, turn_id: int, session_id: str, workspace: Path, dispatch_id: int | None) -> dict[str, str]:
+def safe_turn_env(agent_name: str, turn_id: int, session_id: str, workspace: Path, dispatch_id: int | None, home: Path | None = None) -> dict[str, str]:
     env: dict[str, str] = {}
-    for key in ("LANG", "LC_ALL", "TERM"):
+    for key in ("LANG", "LC_ALL", "TERM", "USER", "LOGNAME"):
         value = os.environ.get(key)
         if value and not contains_credential_shape(value):
             env[key] = value
@@ -5244,7 +5244,7 @@ def safe_turn_env(agent_name: str, turn_id: int, session_id: str, workspace: Pat
         env["PATH"] = cli_dir
     else:
         env["PATH"] = cli_dir + (os.pathsep + path_value if path_value else "")
-    env["HOME"] = str(workspace)
+    env["HOME"] = str(home if home is not None else workspace)
     env["SWARM_CANDIDATE_STATE_DIR"] = str(state_dir())
     env["SWARM_AGENT_NAME"] = agent_name
     env["SWARM_TURN_ID"] = str(turn_id)
@@ -5357,8 +5357,25 @@ def prepare_daemon_turn(
                 input_message_id = str(active_record["id"])
                 if target is None:
                     target = str(active_record["target"])
-        session_id = explicit_session_id or payload_fields.get("session_id") or f"turn-{uuid.uuid4().hex[:12]}"
-        command = [*command, "--resume", session_id]
+        session_id = explicit_session_id or payload_fields.get("session_id")
+        prior_done_sessions = [
+            str(item["session_id"])
+            for item in state.get("daemon_turns", [])
+            if item["agent"] == agent_name and item["status"] == "done" and item.get("session_id")
+        ]
+        if not session_id:
+            session_id = prior_done_sessions[-1] if prior_done_sessions else str(uuid.uuid4())
+        resumable = session_id in prior_done_sessions
+        runtime_kind = Path(command[0]).name
+        if runtime_kind == "claude":
+            # Real claude CLI: --resume only accepts an existing session; first
+            # turns must create the session via --session-id (print mode).
+            if resumable:
+                command = [*command, "-p", "--resume", session_id]
+            else:
+                command = [*command, "-p", "--session-id", session_id]
+        else:
+            command = [*command, "--resume", session_id]
         now = current_timestamp()
         deadline = (datetime.strptime(now, "%Y-%m-%d %H:%M:%S") + timedelta(seconds=timeout_seconds)).strftime("%Y-%m-%d %H:%M:%S")
         turns = state.setdefault("daemon_turns", [])
@@ -5515,12 +5532,19 @@ def execute_daemon_turn(
 
     workspace = Path(str(prepared["workspace_abs"]))
     workspace.mkdir(parents=True, exist_ok=True)
+    command_list = prepared.get("command") or []
+    runtime_kind = Path(str(command_list[0])).name if command_list else ""
+    # The claude runtime authenticates via the OS user's keychain/HOME and
+    # cannot run from an isolated HOME; Slack transport tokens stay scrubbed
+    # from the child env either way. Follow-up hardening tracked for S7.
+    home_override = Path.home() if runtime_kind == "claude" else None
     env = safe_turn_env(
         str(prepared["agent"]),
         int(prepared["turn_id"]),
         str(prepared["session_id"]),
         workspace,
         prepared.get("dispatch_id"),
+        home=home_override,
     )
     status = "done"
     exit_code = None
@@ -5833,6 +5857,25 @@ def agents_with_active_wakes() -> list[str]:
     return with_read_state(action)
 
 
+def pending_outbound_targets(workspace: str) -> list[str]:
+    def action(state: dict[str, Any]) -> list[str]:
+        if slack_workspace_by_id(state, workspace) is None:
+            return []
+        targets: list[str] = []
+        for record in state.get("messages", []):
+            if not slack_record_needs_outbound(state, workspace, record):
+                continue
+            target = str(record["target"])
+            if target in targets:
+                continue
+            if known_slack_channel_mapping(state, workspace, target) is None:
+                continue
+            targets.append(target)
+        return targets
+
+    return with_read_state(action)
+
+
 def command_daemon_resident(argv: list[str]) -> int:
     unknown = unknown_flags(
         argv,
@@ -5917,6 +5960,13 @@ def command_daemon_resident(argv: list[str]) -> int:
                         "error": result.get("error") or result.get("raw_error"),
                     },
                 )
+            if workspace and mock_file is None:
+                for outbound_target in pending_outbound_targets(workspace):
+                    send_result = command_slack_send(["--workspace", workspace, "--target", outbound_target])
+                    daemon_record_event(
+                        "resident_outbound",
+                        {"target": outbound_target, "exit": send_result},
+                    )
             if idle_interval.total_seconds() > 0 and (loops == 0 or iterations < loops):
                 time.sleep(idle_interval.total_seconds())
     except KeyboardInterrupt:
