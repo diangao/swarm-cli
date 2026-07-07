@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -166,6 +166,20 @@ def reminder_event_item(
     return {
         "ordinal": ordinal,
         "reminder_id": reminder_id,
+        "time": time,
+        "event": event,
+        "detail": detail,
+    }
+
+
+def daemon_event_item(
+    ordinal: int,
+    time: str,
+    event: str,
+    detail: str,
+) -> dict[str, Any]:
+    return {
+        "ordinal": ordinal,
         "time": time,
         "event": event,
         "detail": detail,
@@ -425,6 +439,7 @@ EMPTY_STATE: dict[str, Any] = {
     "tasks": [],
     "reminders": [],
     "reminder_events": [],
+    "daemon_events": [],
     "attachments": [],
     "message_attachments": [],
     "message_reactions": [],
@@ -550,6 +565,7 @@ SEED_STATE: dict[str, Any] = {
     ],
     "reminders": [],
     "reminder_events": [],
+    "daemon_events": [],
     "attachments": [],
     "message_attachments": [],
     "message_reactions": [],
@@ -726,6 +742,14 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_reminder_events_id_ordinal
             ON reminder_events(reminder_id, ordinal);
+        CREATE TABLE IF NOT EXISTS daemon_events (
+            ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+            time TEXT NOT NULL,
+            event TEXT NOT NULL,
+            detail TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_daemon_events_event_ordinal
+            ON daemon_events(event, ordinal);
         CREATE TABLE IF NOT EXISTS attachments (
             id TEXT PRIMARY KEY,
             channel TEXT NOT NULL,
@@ -840,6 +864,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM tasks")
     conn.execute("DELETE FROM reminder_events")
     conn.execute("DELETE FROM reminders")
+    conn.execute("DELETE FROM daemon_events")
     conn.execute("DELETE FROM message_attachments")
     conn.execute("DELETE FROM message_reactions")
     conn.execute("DELETE FROM action_cards")
@@ -1035,6 +1060,20 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 event["detail"],
             )
             for event in state.get("reminder_events", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO daemon_events(time, event, detail)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (
+                event["time"],
+                event["event"],
+                event["detail"],
+            )
+            for event in state.get("daemon_events", [])
         ],
     )
     conn.executemany(
@@ -1429,6 +1468,21 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    daemon_events = [
+        daemon_event_item(
+            row["ordinal"],
+            row["time"],
+            row["event"],
+            row["detail"],
+        )
+        for row in conn.execute(
+            """
+            SELECT ordinal, time, event, detail
+            FROM daemon_events
+            ORDER BY ordinal
+            """
+        ).fetchall()
+    ]
     attachments = [
         attachment_item(
             row["id"],
@@ -1597,6 +1651,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "tasks": tasks,
         "reminders": reminders,
         "reminder_events": reminder_events,
+        "daemon_events": daemon_events,
         "attachments": attachments,
         "message_attachments": message_attachments,
         "message_reactions": message_reactions,
@@ -2414,6 +2469,16 @@ def append_reminder_event(state: dict[str, Any], reminder_id: str, event: str, d
     )
 
 
+def append_daemon_event(state: dict[str, Any], event: str, detail: dict[str, Any] | str) -> None:
+    if isinstance(detail, str):
+        detail_json = detail
+    else:
+        detail_json = json.dumps(detail, sort_keys=True, separators=(",", ":"))
+    state.setdefault("daemon_events", []).append(
+        daemon_event_item(0, current_timestamp(), event, detail_json)
+    )
+
+
 def append_inbox_for_message(state: dict[str, Any], record: dict[str, Any]) -> None:
     state.setdefault("local_inbox", []).append(
         inbox_item(
@@ -2819,6 +2884,55 @@ def slack_mapping_output(
         f"{body_line}"
         "Source of truth: swarm SQLite state; Slack is adapter input/UI, not canonical storage.\n"
     )
+
+
+def ingest_normalized_slack_event(
+    state: dict[str, Any],
+    event: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None, str | None, str | None]:
+    base_target = slack_channel_target(event["channel_id"])
+    if base_target is None:
+        return None, None, None, "INVALID_SLACK_EVENT", "Slack channel id did not map to a swarm channel target"
+
+    existing = slack_mapping_by_key(state, event["workspace"], event["channel_id"], event["slack_ts"])
+    if existing is not None:
+        record = message_by_full_id(state, existing["message_id"])
+        if record is None:
+            return None, None, None, "STATE_CORRUPT", "Slack mapping points to a missing swarm message"
+        return existing, record, "already", None, None
+
+    target = base_target
+    if event.get("thread_ts"):
+        root_mapping = slack_mapping_by_key(state, event["workspace"], event["channel_id"], event["thread_ts"])
+        if root_mapping is None:
+            return None, None, None, "SLACK_THREAD_ROOT_MISSING", "Slack thread root has not been imported; ingest the root message first"
+        root_record = message_by_full_id(state, root_mapping["message_id"])
+        if root_record is None:
+            return None, None, None, "STATE_CORRUPT", "Slack thread root mapping points to a missing swarm message"
+        target = f"{channel_for_target(root_mapping['target'])}:{short_id(str(root_record['id']))}"
+
+    ensure_slack_channel_catalog(state, base_target, event["channel_id"], event.get("channel_name"))
+    record = append_message(
+        state,
+        target,
+        event["body"],
+        sender_type=event["sender_type"],
+        author=event["author"],
+        timestamp=event["time"],
+    )
+    mapping = slack_message_item(
+        event["workspace"],
+        event["channel_id"],
+        event.get("channel_name"),
+        event["slack_ts"],
+        event.get("thread_ts"),
+        target,
+        record["id"],
+        current_timestamp(),
+    )
+    state.setdefault("slack_messages", []).append(mapping)
+    append_inbox_for_message(state, record)
+    return mapping, record, "imported", None, None
 
 
 def reminder_by_id(state: dict[str, Any], reminder_id: str) -> dict[str, Any] | None:
@@ -3945,6 +4059,14 @@ def parse_poll_interval(argv: list[str]) -> tuple[float, str | None]:
     return delta.total_seconds(), None
 
 
+def parse_duration_arg(argv: list[str], flag: str, default: str) -> tuple[float, str | None]:
+    value = arg_value(argv, flag) or default
+    delta = parse_duration(value)
+    if delta is None or delta.total_seconds() <= 0:
+        return 0.0, f"{flag} must be a positive duration like 5s, 1m, 1h, or 1d"
+    return delta.total_seconds(), None
+
+
 def parse_agent_name_arg(argv: list[str], flag: str = "--name") -> tuple[str | None, str | None]:
     if flag_missing_value(argv, flag):
         return None, f"{flag} requires a value"
@@ -3956,7 +4078,279 @@ def parse_agent_name_arg(argv: list[str], flag: str = "--name") -> tuple[str | N
     return name, None
 
 
+def daemon_record_event(event: str, detail: dict[str, Any] | str) -> int:
+    def action(state: dict[str, Any]) -> int:
+        append_daemon_event(state, event, detail)
+        return 0
+
+    return with_mutable_state(action)
+
+
+def slack_socket_payload_from_frame(frame: dict[str, Any]) -> dict[str, Any] | None:
+    if frame.get("type") == "events_api" and isinstance(frame.get("payload"), dict):
+        return frame["payload"]
+    if frame.get("type") in {"event", "slack_event"} and isinstance(frame.get("payload"), dict):
+        return frame["payload"]
+    if isinstance(frame.get("event"), dict):
+        return frame
+    return None
+
+
+def read_mock_socket_frames(path_text: str) -> tuple[list[dict[str, Any]] | None, str | None]:
+    path = Path(path_text).expanduser()
+    try:
+        raw = path.read_text()
+    except OSError:
+        return None, f"mock socket file not found: {path_text}"
+    if not raw.strip():
+        return None, "mock socket file is empty"
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        frames: list[dict[str, Any]] = []
+        for line_number, line in enumerate(raw.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                frame = json.loads(line)
+            except json.JSONDecodeError:
+                return None, f"mock socket file line {line_number} is not valid JSON"
+            if not isinstance(frame, dict):
+                return None, f"mock socket file line {line_number} must be a JSON object"
+            frames.append(frame)
+        if not frames:
+            return None, "mock socket file did not contain any frames"
+        return frames, None
+    if isinstance(decoded, dict):
+        return [decoded], None
+    if isinstance(decoded, list) and all(isinstance(item, dict) for item in decoded):
+        return decoded, None
+    return None, "mock socket file must be a JSON object, JSON array, or JSONL objects"
+
+
+def daemon_ingest_slack_payload(workspace: str, payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    event, event_error = normalized_slack_event(payload)
+    if event_error is not None:
+        daemon_record_event("slack_socket_skip", {"workspace": workspace, "reason": event_error})
+        return "skipped", None
+    assert event is not None
+    if event["workspace"] != workspace:
+        daemon_record_event(
+            "slack_socket_skip",
+            {
+                "workspace": workspace,
+                "event_workspace": event["workspace"],
+                "reason": "workspace mismatch",
+            },
+        )
+        return "skipped", None
+
+    result: dict[str, Any] = {}
+
+    def action(state: dict[str, Any]) -> int:
+        mapping, record, status, error_code, error = ingest_normalized_slack_event(state, event)
+        if error is not None:
+            append_daemon_event(
+                state,
+                "slack_socket_error",
+                {
+                    "workspace": workspace,
+                    "channel_id": event["channel_id"],
+                    "slack_ts": event["slack_ts"],
+                    "code": error_code,
+                    "error": error,
+                },
+            )
+            result["error"] = error
+            result["code"] = error_code
+            return 0
+        assert mapping is not None and record is not None and status is not None
+        append_daemon_event(
+            state,
+            "slack_socket_ingest",
+            {
+                "workspace": workspace,
+                "channel_id": event["channel_id"],
+                "slack_ts": event["slack_ts"],
+                "message_id": record["id"],
+                "status": status,
+                "target": mapping["target"],
+            },
+        )
+        result["status"] = status
+        result["message_id"] = record["id"]
+        return 0
+
+    with_mutable_state(action)
+    if "error" in result:
+        return None, str(result["error"])
+    return str(result.get("status", "skipped")), None
+
+
+def slack_socket_url(app_token: str, timeout_seconds: float) -> tuple[str | None, str | None]:
+    response, error = slack_web_api_call(app_token, "apps.connections.open", {}, timeout_seconds)
+    if error is not None:
+        return None, error
+    assert response is not None
+    url = response.get("url")
+    if not isinstance(url, str) or not url.startswith("wss://"):
+        return None, "Slack Socket Mode response did not include a websocket URL"
+    return url, None
+
+
+def run_mock_slack_socket(workspace: str, frames: list[dict[str, Any]], max_events: int | None) -> int:
+    daemon_record_event("slack_socket_connect", {"workspace": workspace, "source": "mock"})
+    processed = 0
+    for frame in frames:
+        frame_type = frame.get("type")
+        if frame_type == "disconnect":
+            daemon_record_event("slack_socket_disconnect", {"workspace": workspace, "source": "mock", "reason": frame.get("reason") or "mock"})
+            daemon_record_event("slack_socket_reconnect", {"workspace": workspace, "source": "mock"})
+            continue
+        payload = slack_socket_payload_from_frame(frame)
+        if payload is None:
+            daemon_record_event("slack_socket_skip", {"workspace": workspace, "source": "mock", "reason": "unsupported frame"})
+            continue
+        status, error = daemon_ingest_slack_payload(workspace, payload)
+        if error is not None:
+            return write_stderr(f"Error: {error}\nCode: SLACK_SOCKET_INGEST_FAILED\n")
+        if status != "skipped":
+            processed += 1
+        if max_events is not None and processed >= max_events:
+            break
+    return write_stdout(f"Slack daemon processed {processed} event frame(s).\n")
+
+
+def run_real_slack_socket(
+    workspace: str,
+    app_token: str,
+    max_events: int | None,
+    socket_timeout_seconds: float,
+    reconnect_backoff_seconds: float,
+) -> int:
+    processed = 0
+    while True:
+        url, url_error = slack_socket_url(app_token, socket_timeout_seconds)
+        if url_error is not None:
+            daemon_record_event("slack_socket_error", {"workspace": workspace, "error": url_error})
+            return write_stderr(f"Error: {url_error}\nCode: SLACK_SOCKET_CONNECT_FAILED\n")
+        try:
+            import websocket  # type: ignore[import-not-found]
+
+            ws = websocket.create_connection(url, timeout=socket_timeout_seconds)
+            daemon_record_event("slack_socket_connect", {"workspace": workspace, "source": "socket_mode"})
+            write_stdout(f"Slack Socket Mode connected for workspace {workspace}.\n")
+            try:
+                while True:
+                    raw = ws.recv()
+                    if not isinstance(raw, str):
+                        continue
+                    try:
+                        frame = json.loads(raw)
+                    except json.JSONDecodeError:
+                        daemon_record_event("slack_socket_skip", {"workspace": workspace, "reason": "invalid websocket JSON"})
+                        continue
+                    if not isinstance(frame, dict):
+                        daemon_record_event("slack_socket_skip", {"workspace": workspace, "reason": "non-object websocket frame"})
+                        continue
+                    envelope_id = frame.get("envelope_id")
+                    if isinstance(envelope_id, str) and envelope_id:
+                        ws.send(json.dumps({"envelope_id": envelope_id}, separators=(",", ":")))
+                    if frame.get("type") == "disconnect":
+                        daemon_record_event("slack_socket_disconnect", {"workspace": workspace, "source": "socket_mode", "reason": frame.get("reason") or "disconnect"})
+                        break
+                    payload = slack_socket_payload_from_frame(frame)
+                    if payload is None:
+                        continue
+                    status, error = daemon_ingest_slack_payload(workspace, payload)
+                    if error is not None:
+                        return write_stderr(f"Error: {error}\nCode: SLACK_SOCKET_INGEST_FAILED\n")
+                    if status != "skipped":
+                        processed += 1
+                    if max_events is not None and processed >= max_events:
+                        ws.close()
+                        return write_stdout(f"Slack daemon processed {processed} event frame(s).\n")
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        except KeyboardInterrupt:
+            return write_stdout(f"Slack daemon stopped after {processed} event frame(s).\n")
+        except Exception as exc:
+            daemon_record_event("slack_socket_disconnect", {"workspace": workspace, "source": "socket_mode", "reason": type(exc).__name__})
+        daemon_record_event("slack_socket_reconnect", {"workspace": workspace, "source": "socket_mode", "backoff_seconds": reconnect_backoff_seconds})
+        time.sleep(reconnect_backoff_seconds)
+
+
+def command_daemon_slack(argv: list[str]) -> int:
+    unknown = unknown_flags(
+        argv,
+        {"--workspace", "--mock-socket-file", "--max-events", "--socket-timeout", "--reconnect-backoff"},
+    )
+    if unknown:
+        return write_stderr(f"Error: unknown daemon slack flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if (
+        flag_missing_value(argv, "--workspace")
+        or flag_missing_value(argv, "--mock-socket-file")
+        or flag_missing_value(argv, "--max-events")
+        or flag_missing_value(argv, "--socket-timeout")
+        or flag_missing_value(argv, "--reconnect-backoff")
+    ):
+        return write_stderr("Error: daemon slack flags require values\nCode: INVALID_ARG\n")
+    workspace = arg_value(argv, "--workspace")
+    if not workspace:
+        return write_stderr("Error: --workspace is required\nCode: INVALID_ARG\n")
+    max_events, max_error = parse_positive_int_arg(argv, "--max-events")
+    if max_error is not None:
+        return write_stderr(f"Error: {max_error}\nCode: INVALID_ARG\n")
+    socket_timeout_seconds, timeout_error = parse_duration_arg(argv, "--socket-timeout", "30s")
+    if timeout_error is not None:
+        return write_stderr(f"Error: {timeout_error}\nCode: INVALID_ARG\n")
+    reconnect_backoff_seconds, backoff_error = parse_duration_arg(argv, "--reconnect-backoff", "1s")
+    if backoff_error is not None:
+        return write_stderr(f"Error: {backoff_error}\nCode: INVALID_ARG\n")
+
+    state = load_state()
+    config = slack_workspace_by_id(state, workspace)
+    if config is None:
+        return write_stderr(
+            "Error: Slack workspace config not found\n"
+            "Code: NOT_FOUND\n"
+            "Next action: configure it with swarm slack configure.\n"
+        )
+    if config.get("mode") != "socket_mode":
+        return write_stderr("Error: Slack daemon requires workspace mode socket_mode\nCode: INVALID_ARG\n")
+    app_token_env = config.get("app_token_env")
+    if not isinstance(app_token_env, str) or not app_token_env:
+        return write_stderr("Error: Slack Socket Mode app token env is not configured\nCode: SLACK_TOKEN_MISSING\n")
+    app_token = os.environ.get(app_token_env)
+    if not app_token:
+        return write_stderr(f"Error: Slack Socket Mode app token missing in env var {app_token_env}\nCode: SLACK_TOKEN_MISSING\n")
+
+    mock_socket_file = arg_value(argv, "--mock-socket-file")
+    if mock_socket_file is not None:
+        frames, frame_error = read_mock_socket_frames(mock_socket_file)
+        if frame_error is not None:
+            return write_stderr(f"Error: {frame_error}\nCode: INVALID_ARG\n")
+        assert frames is not None
+        return run_mock_slack_socket(workspace, frames, max_events)
+
+    return run_real_slack_socket(
+        workspace,
+        app_token,
+        max_events,
+        socket_timeout_seconds,
+        reconnect_backoff_seconds,
+    )
+
+
 def command_daemon_run(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--poll-interval", "--max-iterations", "--once"})
+    if unknown:
+        return write_stderr(f"Error: unknown daemon run flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if flag_missing_value(argv, "--poll-interval") or flag_missing_value(argv, "--max-iterations"):
+        return write_stderr("Error: daemon run flags require values\nCode: INVALID_ARG\n")
     interval_seconds, interval_error = parse_poll_interval(argv)
     if interval_error is not None:
         return write_stderr(f"Error: {interval_error}\nCode: INVALID_ARG\n")
@@ -3990,6 +4384,8 @@ def command_daemon(argv: list[str]) -> int:
     rest = argv[1:]
     if subcommand == "run":
         return command_daemon_run(rest)
+    if subcommand == "slack":
+        return command_daemon_slack(rest)
     return write_stderr(f"Error: unknown daemon subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
@@ -5090,53 +5486,13 @@ def command_slack_ingest(argv: list[str]) -> int:
         return write_stderr(f"Error: {event_error}\nCode: INVALID_SLACK_EVENT\n")
     assert event is not None
 
-    base_target = slack_channel_target(event["channel_id"])
-    if base_target is None:
-        return write_stderr("Error: Slack channel id did not map to a swarm channel target\nCode: INVALID_SLACK_EVENT\n")
-
     def action(state: dict[str, Any]) -> int:
-        existing = slack_mapping_by_key(state, event["workspace"], event["channel_id"], event["slack_ts"])
-        if existing is not None:
-            record = message_by_full_id(state, existing["message_id"])
-            if record is None:
-                return write_stderr("Error: Slack mapping points to a missing swarm message\nCode: STATE_CORRUPT\n")
-            return write_stdout(slack_mapping_output(existing, record, "Slack event already imported."))
-
-        target = base_target
-        if event.get("thread_ts"):
-            root_mapping = slack_mapping_by_key(state, event["workspace"], event["channel_id"], event["thread_ts"])
-            if root_mapping is None:
-                return write_stderr(
-                    "Error: Slack thread root has not been imported; ingest the root message first\n"
-                    "Code: SLACK_THREAD_ROOT_MISSING\n"
-                )
-            root_record = message_by_full_id(state, root_mapping["message_id"])
-            if root_record is None:
-                return write_stderr("Error: Slack thread root mapping points to a missing swarm message\nCode: STATE_CORRUPT\n")
-            target = f"{channel_for_target(root_mapping['target'])}:{short_id(str(root_record['id']))}"
-
-        ensure_slack_channel_catalog(state, base_target, event["channel_id"], event.get("channel_name"))
-        record = append_message(
-            state,
-            target,
-            event["body"],
-            sender_type=event["sender_type"],
-            author=event["author"],
-            timestamp=event["time"],
-        )
-        mapping = slack_message_item(
-            event["workspace"],
-            event["channel_id"],
-            event.get("channel_name"),
-            event["slack_ts"],
-            event.get("thread_ts"),
-            target,
-            record["id"],
-            current_timestamp(),
-        )
-        state.setdefault("slack_messages", []).append(mapping)
-        append_inbox_for_message(state, record)
-        return write_stdout(slack_mapping_output(mapping, record, "Slack event imported."))
+        mapping, record, status, error_code, error = ingest_normalized_slack_event(state, event)
+        if error is not None:
+            return write_stderr(f"Error: {error}\nCode: {error_code}\n")
+        assert mapping is not None and record is not None and status is not None
+        heading = "Slack event already imported." if status == "already" else "Slack event imported."
+        return write_stdout(slack_mapping_output(mapping, record, heading))
 
     return with_mutable_state(action)
 
