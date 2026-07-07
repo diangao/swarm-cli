@@ -8,6 +8,11 @@ in an eternal model process.
 
 ## Goal
 
+Owner's one-line north star (verbatim, 2026-07-06): **"goal 就是和用
+slock 的体感一样"** — using this must feel the same as using the
+reference platform. Not a demo of plumbing; the felt experience of
+talking to colleagues who happen to live in Slack.
+
 After this build, the following demo must work with no human glue:
 
 > The owner posts "@ryo say hi" in the connected Slack channel. The daemon
@@ -103,6 +108,17 @@ Second tenant: curator agent(s) with seeded workspaces + a runtime manual
 wakes them; each turn claims a small batch from the board product's job
 queue, annotates, writes back through the bounded contract, posts a short
 channel report. Batch size / cadence / max runtime are the cost controls.
+
+The curators' first-class maintained asset is the **watch list**
+(owner decision: "最最重要"): what is worth watching and why. Initial
+seed is assembled from three existing assets — the board product's live
+sources config, the owner's curated company-tracker top rows, and the
+existing entity/peer radar — one entry per item with why-watched, trust
+tier, scan surface, cadence, and a retirement condition. Governance:
+curators propose additions/removals with evidence each cycle; small
+changes apply automatically, category-level changes wait for the owner's
+nod. The queue is the execution layer; the watch list is the product's
+long-term memory.
 
 ### S7 — live Slack smoke (final acceptance)
 Owner-driven, in the real workspace: mention an agent and get a
