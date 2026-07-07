@@ -111,9 +111,10 @@ channel report. Batch size / cadence / max runtime are the cost controls.
 
 The curators' first-class maintained asset is the **watch list**
 (owner decision: "最最重要"): what is worth watching and why. Initial
-seed is assembled from three existing assets — the board product's live
-sources config, the owner's curated company-tracker top rows, and the
-existing entity/peer radar — one entry per item with why-watched, trust
+seed is assembled from existing assets — the board product's live
+sources config, the existing entity/peer radar, and items the owner has
+hand-picked in channels (the company tracker stays out of v1 by owner
+decision) — one entry per item with why-watched, trust
 tier, scan surface, cadence, and a retirement condition. Governance:
 curators propose additions/removals with evidence each cycle; small
 changes apply automatically, category-level changes wait for the owner's
