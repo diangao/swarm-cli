@@ -4,41 +4,114 @@
   "verifier": "independent clone + probes against SQLite ground truth; every check is pass/fail, no partial credit",
   "slices": {
     "S1_event_loop": [
-      {"id": "s1-connect", "check": "daemon start with valid token env connects Socket Mode and survives a forced disconnect (reconnect within 30s, logged)"},
-      {"id": "s1-push-ingest", "check": "message posted in connected channel appears as durable swarm message + mapping row without any manual export/ingest command"},
-      {"id": "s1-idempotent", "check": "Slack redelivery of the same event id creates no duplicate rows"},
-      {"id": "s1-failclosed", "check": "daemon start with missing token env exits nonzero with SLACK_TOKEN_MISSING; unknown flags rejected INVALID_ARG"}
+      {
+        "id": "s1-connect",
+        "check": "daemon start with valid token env connects Socket Mode and survives a forced disconnect (reconnect within 30s, logged)"
+      },
+      {
+        "id": "s1-push-ingest",
+        "check": "message posted in connected channel appears as durable swarm message + mapping row without any manual export/ingest command"
+      },
+      {
+        "id": "s1-idempotent",
+        "check": "Slack redelivery of the same event id creates no duplicate rows"
+      },
+      {
+        "id": "s1-failclosed",
+        "check": "daemon start with missing token env exits nonzero with SLACK_TOKEN_MISSING; unknown flags rejected INVALID_ARG"
+      }
     ],
     "S2_wake_router": [
-      {"id": "s2-route-mention", "check": "message containing @<agent> wakes exactly that registered agent; unregistered names wake nobody and log a routing miss"},
-      {"id": "s2-single-flight", "check": "two events for one agent within one turn produce one running turn + one pending-wake marker; second turn starts only after first ends"},
-      {"id": "s2-reminder-wake", "check": "due reminder wakes its author agent through the same router path"}
+      {
+        "id": "s2-route-mention",
+        "check": "message containing @<agent> wakes exactly that registered agent; unregistered names wake nobody and log a routing miss"
+      },
+      {
+        "id": "s2-single-flight",
+        "check": "two events for one agent within one turn produce one running turn + one pending-wake marker; second turn starts only after first ends"
+      },
+      {
+        "id": "s2-reminder-wake",
+        "check": "due reminder wakes its author agent through the same router path"
+      }
     ],
     "S3_turn_runner": [
-      {"id": "s3-spawn", "check": "turn spawns the registry runtime with workspace cwd and session resume; agent-authored reply reaches Slack under customize identity"},
-      {"id": "s3-watchdog", "check": "turn exceeding max runtime is killed, marked failed, retried per policy with backoff, attempts capped"},
-      {"id": "s3-creds", "check": "token value absent from workspace files, repo tree, process argv, and logs (grep gate)"}
+      {
+        "id": "s3-spawn",
+        "check": "turn spawns the registry runtime with workspace cwd and session resume; agent-authored reply reaches Slack under customize identity"
+      },
+      {
+        "id": "s3-watchdog",
+        "check": "turn exceeding max runtime is killed, marked failed, retried per policy with backoff, attempts capped"
+      },
+      {
+        "id": "s3-creds",
+        "check": "token value absent from workspace files, repo tree, process argv, logs, AND the spawned turn's environment (runtime env dump probe) — turns reach Slack only through the swarm CLI/daemon and never hold transport tokens"
+      },
+      {
+        "id": "s3-outbound-credshape",
+        "check": "outbound send path scans message text for credential-shaped strings (xoxb-/xapp-/sk_/bearer-like) and blocks the send on hit (defense-in-depth)"
+      }
     ],
     "S4_lease_recovery": [
-      {"id": "s4-lease-expiry", "check": "kill -9 daemon mid-claimed-job; after restart, expired lease returns job to claimable exactly once"},
-      {"id": "s4-no-double-write", "check": "recovered job re-run produces no duplicate outbound send (mark-sent) and no duplicate state row"},
-      {"id": "s4-stale-guard", "check": "writeback against a changed snapshot is rejected (existing guard still enforced through daemon path)"}
+      {
+        "id": "s4-lease-expiry",
+        "check": "kill -9 daemon mid-claimed-job; after restart, expired lease returns job to claimable exactly once"
+      },
+      {
+        "id": "s4-no-double-write",
+        "check": "recovered job re-run produces no duplicate outbound send (mark-sent) and no duplicate state row"
+      },
+      {
+        "id": "s4-stale-guard",
+        "check": "writeback against a changed snapshot is rejected (existing guard still enforced through daemon path)"
+      }
     ],
     "S5_presence": [
-      {"id": "s5-presence-truth", "check": "registry presence reflects daemon observation (online/in_turn/last_seen) and goes stale correctly when daemon stops"},
-      {"id": "s5-heartbeat-retired", "check": "30s self-report worker loop and its launchd jobs removed; launchd carries exactly one swarm job (the daemon)"}
+      {
+        "id": "s5-presence-truth",
+        "check": "registry presence reflects daemon observation (online/in_turn/last_seen) and goes stale correctly when daemon stops"
+      },
+      {
+        "id": "s5-heartbeat-retired",
+        "check": "30s self-report worker loop and its launchd jobs removed; launchd carries exactly one swarm job (the daemon)"
+      }
     ],
     "S6_curator_workload": [
-      {"id": "s6-seed-gate", "check": "curator workspace seeds pass the scrub gate (credentials=0, others' DM originals=0, owner-sensitive=0) before first turn"},
-      {"id": "s6-scheduled-batch", "check": "hourly reminder wakes curator; one turn claims <= batch-size jobs, annotates via bounded contract, writes back, posts one channel report"},
-      {"id": "s6-cost-control", "check": "batch size, cadence, and max runtime enforced; a cycle exceeding limits stops itself and reports rather than continuing"},
-      {"id": "s6-coverage", "check": "backfill progresses monotonically across cycles with zero contract-violation rows (sampled conformance check)"}
+      {
+        "id": "s6-seed-gate",
+        "check": "curator workspace seeds pass the scrub gate (credentials=0, others' DM originals=0, owner-sensitive=0) before first turn"
+      },
+      {
+        "id": "s6-scheduled-batch",
+        "check": "hourly reminder wakes curator; one turn claims <= batch-size jobs, annotates via bounded contract, writes back, posts one channel report"
+      },
+      {
+        "id": "s6-cost-control",
+        "check": "batch size, cadence, and max runtime enforced; a cycle exceeding limits stops itself and reports rather than continuing"
+      },
+      {
+        "id": "s6-coverage",
+        "check": "backfill progresses monotonically across cycles with zero contract-violation rows (sampled conformance check)"
+      }
     ],
     "S7_live_smoke": [
-      {"id": "s7-owner-mention", "check": "owner mentions an agent in Slack; agent replies with self-authored content under its own rendered identity"},
-      {"id": "s7-kill-recover", "check": "owner-visible conversation survives daemon kill/restart with no lost or duplicated replies"},
-      {"id": "s7-curator-visible", "check": "owner sees annotated real cards (summary + why-it-matters) on the board product after a scheduled curator cycle"},
-      {"id": "s7-owner-judgment", "check": "owner declares the demo believable as colleagues-in-Slack; any 'that felt scripted' note reopens the relevant slice"}
+      {
+        "id": "s7-owner-mention",
+        "check": "owner mentions an agent in Slack; agent replies with self-authored content under its own rendered identity"
+      },
+      {
+        "id": "s7-kill-recover",
+        "check": "owner-visible conversation survives daemon kill/restart with no lost or duplicated replies"
+      },
+      {
+        "id": "s7-curator-visible",
+        "check": "owner sees annotated real cards (summary + why-it-matters) on the board product after a scheduled curator cycle"
+      },
+      {
+        "id": "s7-owner-judgment",
+        "check": "owner declares the demo believable as colleagues-in-Slack; any 'that felt scripted' note reopens the relevant slice"
+      }
     ]
   }
 }
