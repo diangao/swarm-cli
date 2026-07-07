@@ -4048,6 +4048,219 @@ def probe_curator_workload(cli: Path, state_dir: Path) -> None:
     require(failed_report in history, "curator did not post the over-budget failure report")
 
 
+def probe_curator_grind_db_workload(cli: Path, state_dir: Path) -> None:
+    agent = f"grind-curator-{uuid.uuid4().hex[:8]}"
+    report_target = f"#grind-curator-report-{uuid.uuid4().hex[:8]}"
+    sources_path = state_dir / "grind-curator-sources.json"
+    sources_path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "id": "grind-public",
+                        "name": "Grind public source surface",
+                        "why": "incremental curator test seed",
+                        "surface": "public web source",
+                    }
+                ]
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    grind_server = state_dir / "mock-grind-server"
+    grind_server.mkdir()
+    db_path = grind_server / "grind.db"
+    now = "2026-07-07T18:00:00Z"
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE processed_cards (
+                  id INTEGER PRIMARY KEY,
+                  enriched_at TEXT,
+                  enrich_status TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE curator_jobs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  card_id INTEGER NOT NULL,
+                  prompt_version TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  claimed_by TEXT,
+                  claimed_at TEXT,
+                  processed_at TEXT,
+                  error TEXT,
+                  updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO processed_cards (id, enriched_at, enrich_status) VALUES (1, NULL, 'pending')"
+            )
+            conn.execute(
+                "INSERT INTO processed_cards (id, enriched_at, enrich_status) VALUES (2, NULL, 'pending')"
+            )
+            conn.execute(
+                """
+                INSERT INTO curator_jobs (card_id, prompt_version, status, updated_at)
+                VALUES (1, 'test-prompt', 'pending', ?)
+                """,
+                (now,),
+            )
+    finally:
+        conn.close()
+
+    worker = grind_server / "mock_curator_worker.py"
+    worker.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sqlite3
+from pathlib import Path
+
+db_path = os.environ["GW_DB_PATH"]
+prompt = os.environ["CURATOR_PROMPT_VERSION"]
+batch = int(os.environ["CURATOR_BATCH"])
+workspace = Path(os.environ["CURATOR_AGENT_WORKSPACE"])
+workspace.mkdir(parents=True, exist_ok=True)
+(workspace / "mock-env.json").write_text(json.dumps({
+    "worker": os.environ["CURATOR_WORKER_ID"],
+    "batch": os.environ["CURATOR_BATCH"],
+    "queue_fill_limit": os.environ["CURATOR_QUEUE_FILL_LIMIT"],
+    "prompt": prompt,
+}, sort_keys=True) + "\\n", encoding="utf-8")
+
+conn = sqlite3.connect(db_path, timeout=5.0)
+conn.row_factory = sqlite3.Row
+try:
+    conn.execute("BEGIN IMMEDIATE")
+    rows = conn.execute(
+        "SELECT id, card_id FROM curator_jobs WHERE prompt_version = ? AND status = 'pending' ORDER BY id LIMIT ?",
+        (prompt, batch),
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE curator_jobs SET status = 'claimed', attempts = attempts + 1, claimed_by = ?, claimed_at = ?, updated_at = ? WHERE id = ?",
+            (os.environ["CURATOR_WORKER_ID"], "2026-07-07T18:01:00Z", "2026-07-07T18:01:00Z", row["id"]),
+        )
+        conn.execute(
+            "UPDATE processed_cards SET enriched_at = ?, enrich_status = 'done' WHERE id = ?",
+            ("2026-07-07T18:02:00Z", row["card_id"]),
+        )
+        conn.execute(
+            "UPDATE curator_jobs SET status = 'done', processed_at = ?, updated_at = ? WHERE id = ?",
+            ("2026-07-07T18:02:00Z", "2026-07-07T18:02:00Z", row["id"]),
+        )
+    conn.commit()
+finally:
+    conn.close()
+"""
+    )
+    worker.chmod(0o755)
+    (grind_server / "package.json").write_text(
+        json.dumps({"scripts": {"curator:codex": f"{sys.executable} mock_curator_worker.py"}}, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    installed = run(
+        cli,
+        state_dir,
+        "curator",
+        "install",
+        "--name",
+        agent,
+        "--display-name",
+        "Grind Curator",
+        "--source-config",
+        str(sources_path),
+        "--report-target",
+        report_target,
+        "--batch-size",
+        "1",
+        "--cadence",
+        "1h",
+        "--at",
+        "2000-01-01T00:00:00",
+        "--max-runtime",
+        "10s",
+        "--grind-server",
+        str(grind_server),
+        "--grind-db",
+        str(db_path),
+        "--prompt-version",
+        "test-prompt",
+        "--queue-fill-limit",
+        "7",
+    ).stdout
+    require("Mode: grind-db" in installed, "grind curator install did not report grind-db mode")
+
+    workspace = state_dir / "agents" / agent
+    config = json.loads((workspace / "runtime" / "curator-config.json").read_text(encoding="utf-8"))
+    require(config["queue_source"] == "grind-db", "grind curator config did not select grind-db queue")
+    require(config["prompt_version"] == "test-prompt", "grind curator prompt version mismatch")
+    require(config["queue_fill_limit"] == 7, "grind curator queue fill limit mismatch")
+    require(config["grind_db_path"] == str(db_path.resolve()), "grind curator DB path mismatch")
+    require(not (workspace / "runtime" / "curator-jobs.json").exists(), "grind curator should not create fixture queue file")
+
+    resident = run(
+        cli,
+        state_dir,
+        "daemon",
+        "resident",
+        "--loops",
+        "2",
+        "--idle-interval",
+        "0s",
+        "--turn-timeout",
+        "15s",
+    ).stdout
+    require(" 0 turn(s)" not in resident, "grind curator reminder wake did not run")
+
+    env_snapshot = json.loads(
+        (workspace / "runtime" / "grind-codex-workspace" / "mock-env.json").read_text(encoding="utf-8")
+    )
+    require(env_snapshot == {
+        "worker": agent,
+        "batch": "1",
+        "queue_fill_limit": "7",
+        "prompt": "test-prompt",
+    }, f"grind curator worker env mismatch: {env_snapshot}")
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cards = {int(row["id"]): dict(row) for row in conn.execute("SELECT * FROM processed_cards")}
+        jobs = {int(row["card_id"]): dict(row) for row in conn.execute("SELECT * FROM curator_jobs")}
+    finally:
+        conn.close()
+    require(cards[1]["enrich_status"] == "done" and cards[1]["enriched_at"], "grind curator did not enrich claimed card")
+    require(cards[2]["enrich_status"] == "pending" and cards[2]["enriched_at"] is None, "grind curator touched unqueued card")
+    require(jobs[1]["status"] == "done" and jobs[1]["claimed_by"] == agent, "grind curator did not complete true DB job")
+
+    history = run(cli, state_dir, "message", "read", "--channel", report_target).stdout
+    expected_lines = [
+        "grind curator batch: true_db=1 prompt=test-prompt",
+        "exit=0 violations=0",
+        "before unqueued=1 pending=1 claimed=0 done=0 failed=0 canceled=0",
+        "after unqueued=1 pending=0 claimed=0 done=1 failed=0 canceled=0",
+        "delta done=1 failed=0 canceled=0 pending=-1 unqueued=0",
+    ]
+    for line in expected_lines:
+        require(line in history, f"grind curator true-DB report missing line: {line}")
+    turn_list = run(cli, state_dir, "daemon", "turn", "list", "--status", "done").stdout
+    require(f"@{agent} status=done" in turn_list, "grind curator turn missing from done turn list")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -4081,8 +4294,9 @@ def main() -> int:
         probe_daemon_resident(cli, state_dir)
         probe_attention_wakes(cli, state_dir)
         probe_curator_workload(cli, state_dir)
+        probe_curator_grind_db_workload(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, resident daemon presence/worker-retirement, attention wake-all/SILENT convention, and curator seed/schedule/queue-writeback workload")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, resident daemon presence/worker-retirement, attention wake-all/SILENT convention, curator seed/schedule/queue-writeback workload, and Grind DB-backed curator scheduled workload")
     return 0
 
 
