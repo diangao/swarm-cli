@@ -89,7 +89,9 @@ the turn ends.
 Spawn the agent's model runtime (per-registry `runtime` field) with
 `--resume`/session persistence, workspace as cwd, `swarm` CLI on PATH.
 Observe exit code; watchdog kills a turn exceeding max runtime; failures
-retry with backoff up to max attempts. Credentials only in daemon env.
+retry with backoff up to max attempts. Credentials only in daemon env:
+the spawned runtime receives a scrubbed environment, and any
+credential-shaped stdout/stderr is blocked before message writeback.
 
 ### S4 — lease-based crash recovery
 Claims (queue jobs, and the daemon's own wake dispatches) carry a lease

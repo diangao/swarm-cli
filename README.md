@@ -26,6 +26,11 @@ Current implemented surface:
 - `swarm reminder cancel --id ...`
 - `swarm reminder log --id ...`
 - `swarm daemon run [--once] [--poll-interval ...]` for local reminder auto-fire
+- `swarm daemon slack --workspace ...` for Socket Mode event intake into canonical state
+- `swarm daemon wakes [--agent ...]` and `swarm daemon finish-turn --agent ...` for per-agent wake single-flight state
+- `swarm daemon dispatch enqueue/claim/complete/fail/list` for leased daemon work
+- `swarm daemon turn run --agent ... [--dispatch-id ... --owner ...]` to spawn a registered runtime with workspace cwd, `--resume`, watchdog timeout, dispatch finalization, and credential-shaped output blocking
+- `swarm daemon turn list [--agent ...] [--status ...]`
 - `swarm server info`
 - `swarm channel members ...`
 - `swarm channel join ...`

@@ -3227,6 +3227,328 @@ def probe_daemon_dispatch_lease(cli: Path, state_dir: Path) -> None:
     require(f"- {second_id} " in listing and "error=boom" in listing, "failed dispatch missing from list")
 
 
+def probe_daemon_turn_runner(cli: Path, state_dir: Path) -> None:
+    agent = f"runner-{uuid.uuid4().hex[:8]}"
+    runtime = state_dir / "turn-runtime.py"
+    runtime.write_text(
+        "\n".join(
+            [
+                "import json, os, sys, time",
+                "args = sys.argv[1:]",
+                "payload = sys.stdin.read()",
+                "if payload == 'sleep':",
+                "    time.sleep(2)",
+                "if payload == 'leak':",
+                "    print('sk' + '_agent_probe_runtime_secret')",
+                "    raise SystemExit(0)",
+                "print(json.dumps({",
+                "    'cwd': os.getcwd(),",
+                "    'env_has_secret': 'OPENAI_API_KEY' in os.environ,",
+                "    'home': os.environ.get('HOME'),",
+                "    'input': payload,",
+                "    'resume': args[args.index('--resume') + 1] if '--resume' in args else None,",
+                "    'state_dir': os.environ.get('SWARM_CANDIDATE_STATE_DIR'),",
+                "    'turn_id': os.environ.get('SWARM_TURN_ID'),",
+                "}, sort_keys=True))",
+            ]
+        )
+        + "\n"
+    )
+    runtime.chmod(0o755)
+    run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        agent,
+        "--display-name",
+        "Runner Probe",
+        "--runtime",
+        f"{sys.executable} {runtime}",
+        "--workspace",
+        f"agents/{agent}",
+    )
+    payload = json.dumps({"target": "#turn-probe", "input": "hello", "session_id": "sess-safe"})
+    enqueued = run(
+        cli,
+        state_dir,
+        "daemon",
+        "dispatch",
+        "enqueue",
+        "--agent",
+        agent,
+        "--kind",
+        "turn",
+        "--payload",
+        payload,
+    ).stdout
+    dispatch_id = enqueued.split("Dispatch ", 1)[1].split(" ", 1)[0]
+    run(cli, state_dir, "daemon", "dispatch", "claim", "--owner", "runner", "--lease-seconds", "60")
+    completed = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--dispatch-id",
+        dispatch_id,
+        "--owner",
+        "runner",
+        "--timeout",
+        "3s",
+        env_overrides={"OPENAI_API_KEY": "sk" + "_agent_parent_should_not_cross"},
+    ).stdout
+    require("completed" in completed and "message=" in completed, "turn runner did not complete and write back")
+
+    history = run(cli, state_dir, "message", "read", "--channel", "#turn-probe").stdout
+    require("\"env_has_secret\": false" in history, "spawned runtime inherited parent credential env")
+    require(f"agents/{agent}" in history, "spawned runtime did not run in agent workspace")
+    require("\"resume\": \"sess-safe\"" in history, "spawned runtime did not receive resume session")
+    require(f"\"state_dir\": \"{state_dir}\"" in history, "spawned runtime did not receive canonical state dir")
+    done = run(cli, state_dir, "daemon", "dispatch", "list", "--status", "done").stdout
+    require(f"- {dispatch_id} @{agent}" in done, "turn runner did not complete dispatch")
+    turn_list = run(cli, state_dir, "daemon", "turn", "list", "--status", "done").stdout
+    require(f"@{agent} status=done" in turn_list, "completed turn missing from turn list")
+
+    workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    bot_token_env = f"SWARM_TURN_BOT_{uuid.uuid4().hex[:8].upper()}"
+    app_token_env = f"SWARM_TURN_APP_{uuid.uuid4().hex[:8].upper()}"
+    run(
+        cli,
+        state_dir,
+        "slack",
+        "configure",
+        "--workspace",
+        workspace,
+        "--bot-token-env",
+        bot_token_env,
+        "--app-token-env",
+        app_token_env,
+        "--mode",
+        "socket_mode",
+    )
+    mock_socket = state_dir / "turn-wake-mock.jsonl"
+    mock_socket.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "events_api",
+                        "payload": {
+                            "team_id": workspace,
+                            "event": {
+                                "type": "message",
+                                "channel": channel_id,
+                                "user": "UTURN",
+                                "text": f"first @{agent} wake {uuid.uuid4()}",
+                                "ts": f"1762300000.{uuid.uuid4().int % 1_000_000:06d}",
+                            },
+                        },
+                        "envelope_id": f"env-{uuid.uuid4().hex}",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "events_api",
+                        "payload": {
+                            "team_id": workspace,
+                            "event": {
+                                "type": "message",
+                                "channel": channel_id,
+                                "user": "UTURN",
+                                "text": f"second @{agent} wake {uuid.uuid4()}",
+                                "ts": f"1762300001.{uuid.uuid4().int % 1_000_000:06d}",
+                            },
+                        },
+                        "envelope_id": f"env-{uuid.uuid4().hex}",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    run(
+        cli,
+        state_dir,
+        "daemon",
+        "slack",
+        "--workspace",
+        workspace,
+        "--mock-socket-file",
+        str(mock_socket),
+        env_overrides={app_token_env: "xapp" + "-probe-turn-wake"},
+    )
+    wake_run = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--target",
+        "#turn-wake",
+        "--timeout",
+        "3s",
+    ).stdout
+    require("wake=promoted" in wake_run, "runner did not promote pending wake after first turn")
+    promoted = daemon_wake_row(state_dir, agent)
+    require(promoted is not None and int(promoted["running"]) == 1, "promoted wake should remain running")
+    require(int(promoted["active_wake_count"]) == 2, "runner did not advance active wake count")
+    require(int(promoted["pending_count"]) == 0, "runner did not clear pending wake marker")
+    wake_idle = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--input",
+        "second wake body",
+        "--target",
+        "#turn-wake",
+        "--timeout",
+        "3s",
+    ).stdout
+    require("wake=idle" in wake_idle, "runner did not idle wake after second turn")
+    idle = daemon_wake_row(state_dir, agent)
+    require(idle is not None and int(idle["running"]) == 0, "wake should be idle after runner finish")
+
+    leak_payload = json.dumps({"target": "#turn-probe", "input": "leak"})
+    leak_enqueued = run(
+        cli,
+        state_dir,
+        "daemon",
+        "dispatch",
+        "enqueue",
+        "--agent",
+        agent,
+        "--kind",
+        "turn",
+        "--payload",
+        leak_payload,
+        "--max-attempts",
+        "1",
+    ).stdout
+    leak_id = leak_enqueued.split("Dispatch ", 1)[1].split(" ", 1)[0]
+    run(cli, state_dir, "daemon", "dispatch", "claim", "--owner", "runner", "--lease-seconds", "60")
+    blocked = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--dispatch-id",
+        leak_id,
+        "--owner",
+        "runner",
+        "--timeout",
+        "3s",
+        expected=1,
+    )
+    require("Code: TURN_FAILED" in blocked.stderr, "credential-shaped output did not fail closed")
+    blocked_history = run(cli, state_dir, "message", "read", "--channel", "#turn-probe").stdout
+    require("probe_runtime_secret" not in blocked_history, "credential-shaped output was written to messages")
+    blocked_turns = run(cli, state_dir, "daemon", "turn", "list", "--status", "blocked").stdout
+    require("status=blocked" in blocked_turns, "blocked turn missing from turn list")
+    blocked_events = daemon_event_details(state_dir, "turn_credential_blocked")
+    require(any(str(detail.get("agent")) == agent for detail in blocked_events), "credential block event missing")
+    failed = run(cli, state_dir, "daemon", "dispatch", "list", "--status", "failed").stdout
+    require(f"- {leak_id} @{agent}" in failed, "blocked max-attempt dispatch did not fail")
+
+    sleep_payload = json.dumps({"target": "#turn-probe", "input": "sleep"})
+    sleep_enqueued = run(
+        cli,
+        state_dir,
+        "daemon",
+        "dispatch",
+        "enqueue",
+        "--agent",
+        agent,
+        "--kind",
+        "turn",
+        "--payload",
+        sleep_payload,
+        "--max-attempts",
+        "1",
+    ).stdout
+    sleep_id = sleep_enqueued.split("Dispatch ", 1)[1].split(" ", 1)[0]
+    run(cli, state_dir, "daemon", "dispatch", "claim", "--owner", "runner", "--lease-seconds", "60")
+    timed_out = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--dispatch-id",
+        sleep_id,
+        "--owner",
+        "runner",
+        "--timeout",
+        "1s",
+        expected=1,
+    )
+    require("timed out" in timed_out.stderr, "turn timeout did not report watchdog failure")
+    timeout_turns = run(cli, state_dir, "daemon", "turn", "list", "--status", "timeout").stdout
+    require("status=timeout" in timeout_turns, "timeout turn missing from turn list")
+    failed_timeout = run(cli, state_dir, "daemon", "dispatch", "list", "--status", "failed").stdout
+    require(f"- {sleep_id} @{agent}" in failed_timeout, "max-attempt timeout dispatch did not fail")
+
+    stale_payload = json.dumps({"target": "#turn-stale", "input": "sleep"})
+    stale_enqueued = run(
+        cli,
+        state_dir,
+        "daemon",
+        "dispatch",
+        "enqueue",
+        "--agent",
+        agent,
+        "--kind",
+        "turn",
+        "--payload",
+        stale_payload,
+    ).stdout
+    stale_id = stale_enqueued.split("Dispatch ", 1)[1].split(" ", 1)[0]
+    run(cli, state_dir, "daemon", "dispatch", "claim", "--owner", "runner", "--lease-seconds", "1")
+    stale = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--dispatch-id",
+        stale_id,
+        "--owner",
+        "runner",
+        "--timeout",
+        "3s",
+        expected=1,
+    )
+    require("Code: DISPATCH_NOT_HELD" in stale.stderr, "expired lease writeback was not rejected")
+    conn = connect_state(state_dir)
+    try:
+        stale_messages = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE target = ?",
+            ("#turn-stale",),
+        ).fetchone()
+    finally:
+        conn.close()
+    require(stale_messages["count"] == 0, "expired lease still wrote turn output")
+    failed_turns = run(cli, state_dir, "daemon", "turn", "list", "--status", "failed").stdout
+    require("dispatch finalize failed" in failed_turns, "expired lease turn was not marked failed")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -3256,8 +3578,9 @@ def main() -> int:
         probe_slack_daemon_event_loop(cli, state_dir)
         probe_daemon_wake_router(cli, state_dir)
         probe_daemon_dispatch_lease(cli, state_dir)
+        probe_daemon_turn_runner(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, and daemon dispatch lease claim/expiry/exactly-once recovery")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, and daemon turn runner env/output/watchdog gates")
     return 0
 
 
