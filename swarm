@@ -5538,6 +5538,26 @@ def format_daemon_turn_row(item: dict[str, Any]) -> str:
     )
 
 
+def ensure_agent_claude_entrypoint(agent_name: str, display_name: str, workspace: Path) -> None:
+    entrypoint = workspace / "CLAUDE.md"
+    if entrypoint.exists():
+        return
+    lines = [
+        f"# @{agent_name}",
+        "",
+        f"You are @{agent_name} ({display_name}), a persistent swarm agent. This directory is",
+        "your long-lived workspace; it survives across turns and sessions.",
+        "",
+        "At the start of a session, read your identity and knowledge files if present:",
+        "`persona.md`, `seed.json`, `MEMORY.md`, and anything under `knowledge/`.",
+        "Keep `MEMORY.md` up to date with important new facts so future sessions recover them.",
+        "",
+        "Your final output is delivered as your chat reply. If you were woken for a",
+        "channel message that does not need your reply, output exactly SILENT.",
+    ]
+    entrypoint.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def execute_daemon_turn(
     agent: str,
     dispatch_id: int | None,
@@ -5564,6 +5584,7 @@ def execute_daemon_turn(
     workspace = Path(str(prepared["workspace_abs"]))
     workspace.mkdir(parents=True, exist_ok=True)
     command_list = prepared.get("command") or []
+    ensure_agent_claude_entrypoint(str(prepared["agent"]), str(prepared["agent"]), workspace)
     runtime_kind = Path(str(command_list[0])).name if command_list else ""
     # The claude runtime authenticates via the OS user's keychain/HOME and
     # cannot run from an isolated HOME; Slack transport tokens stay scrubbed
