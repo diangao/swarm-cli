@@ -2886,6 +2886,135 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
         conn.close()
 
 
+def probe_slack_daemon_event_loop(cli: Path, state_dir: Path) -> None:
+    workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    channel_name = f"daemon-{uuid.uuid4().hex[:6]}"
+    bot_token_env = f"SWARM_SLACK_DAEMON_BOT_{uuid.uuid4().hex[:8].upper()}"
+    app_token_env = f"SWARM_SLACK_DAEMON_APP_{uuid.uuid4().hex[:8].upper()}"
+    body = f"daemon socket push {uuid.uuid4()}"
+    slack_ts = f"1762100000.{uuid.uuid4().int % 1_000_000:06d}"
+
+    configured = run(
+        cli,
+        state_dir,
+        "slack",
+        "configure",
+        "--workspace",
+        workspace,
+        "--bot-token-env",
+        bot_token_env,
+        "--app-token-env",
+        app_token_env,
+        "--mode",
+        "socket_mode",
+    ).stdout
+    require("Mode: socket_mode" in configured, "daemon Slack workspace was not configured for Socket Mode")
+
+    unknown = run(
+        cli,
+        state_dir,
+        "daemon",
+        "slack",
+        "--workspace",
+        workspace,
+        "--unknown-flag",
+        expected=1,
+    ).stderr
+    require("INVALID_ARG" in unknown and "--unknown-flag" in unknown, "daemon slack unknown flag did not fail closed")
+
+    missing_token = run(
+        cli,
+        state_dir,
+        "daemon",
+        "slack",
+        "--workspace",
+        workspace,
+        expected=1,
+    ).stderr
+    require("SLACK_TOKEN_MISSING" in missing_token, "daemon slack missing app token did not fail closed")
+    require(app_token_env in missing_token, "daemon slack missing-token error did not name app token env var")
+
+    root_event = {
+        "team_id": workspace,
+        "event": {
+            "type": "message",
+            "channel": channel_id,
+            "channel_name": channel_name,
+            "user": "UDAEMON",
+            "text": body,
+            "ts": slack_ts,
+        },
+    }
+    mock_socket = state_dir / "slack-socket-mock.jsonl"
+    mock_socket.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "events_api", "payload": root_event, "envelope_id": f"env-{uuid.uuid4().hex}"}),
+                json.dumps({"type": "disconnect", "reason": "probe forced disconnect"}),
+                json.dumps({"type": "events_api", "payload": root_event, "envelope_id": f"env-{uuid.uuid4().hex}"}),
+            ]
+        )
+        + "\n"
+    )
+    fake_app_token = f"xapp-probe-{uuid.uuid4()}"
+    daemoned = run(
+        cli,
+        state_dir,
+        "daemon",
+        "slack",
+        "--workspace",
+        workspace,
+        "--mock-socket-file",
+        str(mock_socket),
+        env_overrides={app_token_env: fake_app_token},
+    ).stdout
+    require("Slack daemon processed 2 event frame(s)." in daemoned, "daemon slack did not process mock socket frames")
+    require(fake_app_token not in daemoned, "daemon slack leaked app token value")
+
+    target = f"#slack-{channel_id.lower()}"
+    inbox = run(cli, state_dir, "message", "check").stdout
+    require(body in inbox, "daemon socket ingest did not enqueue the imported message")
+    drained = run(cli, state_dir, "message", "check").stdout
+    require(drained == "No new messages.\n", "daemon duplicate Slack event enqueued a second inbox delivery")
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(body in history, "daemon socket ingest did not create readable channel history")
+    require(history.count(body) == 1, "daemon duplicate Slack event created duplicate channel messages")
+
+    conn = connect_state(state_dir)
+    try:
+        message_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE target = ? AND body = ?",
+            (target, body),
+        ).fetchone()["count"]
+        require(message_count == 1, "daemon duplicate Slack redelivery created multiple canonical messages")
+        mapping_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM slack_messages
+            WHERE workspace = ? AND channel_id = ? AND slack_ts = ?
+            """,
+            (workspace, channel_id, slack_ts),
+        ).fetchone()["count"]
+        require(mapping_count == 1, "daemon duplicate Slack redelivery created multiple mapping rows")
+        events = conn.execute(
+            "SELECT event, detail FROM daemon_events ORDER BY ordinal"
+        ).fetchall()
+        event_names = [row["event"] for row in events]
+        require("slack_socket_connect" in event_names, "daemon did not persist socket connect event")
+        require("slack_socket_disconnect" in event_names, "daemon did not persist socket disconnect event")
+        require("slack_socket_reconnect" in event_names, "daemon did not persist socket reconnect event")
+        ingest_details = [
+            json.loads(row["detail"])
+            for row in events
+            if row["event"] == "slack_socket_ingest" and workspace in row["detail"]
+        ]
+        statuses = [detail["status"] for detail in ingest_details if detail.get("slack_ts") == slack_ts]
+        require(statuses == ["imported", "already"], f"daemon ingest did not record imported/already statuses: {statuses}")
+    finally:
+        conn.close()
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -2912,8 +3041,9 @@ def main() -> int:
         probe_attachments(cli, state_dir)
         probe_action_prepare(cli, state_dir)
         probe_slack_adapter(cli, state_dir)
+        probe_slack_daemon_event_loop(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, and Slack adapter ingest/resolve/outbound/send/customize")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, and Slack daemon Socket Mode ingest/replay idempotence")
     return 0
 
 
