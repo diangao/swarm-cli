@@ -215,6 +215,36 @@ def daemon_wake_item(
     }
 
 
+def daemon_dispatch_item(
+    dispatch_id: int,
+    created_time: str,
+    agent: str,
+    kind: str,
+    payload: str,
+    status: str,
+    attempts: int,
+    max_attempts: int,
+    lease_owner: str | None,
+    lease_expires_at: str | None,
+    completed_time: str | None,
+    error: str | None,
+) -> dict[str, Any]:
+    return {
+        "id": dispatch_id,
+        "created_time": created_time,
+        "agent": agent,
+        "kind": kind,
+        "payload": payload,
+        "status": status,
+        "attempts": attempts,
+        "max_attempts": max_attempts,
+        "lease_owner": lease_owner,
+        "lease_expires_at": lease_expires_at,
+        "completed_time": completed_time,
+        "error": error,
+    }
+
+
 def attachment_item(
     attachment_id: str,
     channel: str,
@@ -470,6 +500,7 @@ EMPTY_STATE: dict[str, Any] = {
     "reminder_events": [],
     "daemon_events": [],
     "daemon_wakes": [],
+    "daemon_dispatches": [],
     "attachments": [],
     "message_attachments": [],
     "message_reactions": [],
@@ -597,6 +628,7 @@ SEED_STATE: dict[str, Any] = {
     "reminder_events": [],
     "daemon_events": [],
     "daemon_wakes": [],
+    "daemon_dispatches": [],
     "attachments": [],
     "message_attachments": [],
     "message_reactions": [],
@@ -796,6 +828,22 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_daemon_wakes_pending
             ON daemon_wakes(running, pending_count);
+        CREATE TABLE IF NOT EXISTS daemon_dispatches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_time TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            completed_time TEXT,
+            error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_daemon_dispatches_status
+            ON daemon_dispatches(status, id);
         CREATE TABLE IF NOT EXISTS attachments (
             id TEXT PRIMARY KEY,
             channel TEXT NOT NULL,
@@ -912,6 +960,7 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM reminders")
     conn.execute("DELETE FROM daemon_events")
     conn.execute("DELETE FROM daemon_wakes")
+    conn.execute("DELETE FROM daemon_dispatches")
     conn.execute("DELETE FROM message_attachments")
     conn.execute("DELETE FROM message_reactions")
     conn.execute("DELETE FROM action_cards")
@@ -1147,6 +1196,32 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 wake["updated_at"],
             )
             for wake in state.get("daemon_wakes", [])
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO daemon_dispatches(
+            id, created_time, agent, kind, payload, status, attempts,
+            max_attempts, lease_owner, lease_expires_at, completed_time, error
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                item["id"],
+                item["created_time"],
+                item["agent"],
+                item["kind"],
+                item["payload"],
+                item["status"],
+                item["attempts"],
+                item["max_attempts"],
+                item["lease_owner"],
+                item["lease_expires_at"],
+                item["completed_time"],
+                item["error"],
+            )
+            for item in state.get("daemon_dispatches", [])
         ],
     )
     conn.executemany(
@@ -1580,6 +1655,30 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    daemon_dispatches = [
+        daemon_dispatch_item(
+            row["id"],
+            row["created_time"],
+            row["agent"],
+            row["kind"],
+            row["payload"],
+            row["status"],
+            row["attempts"],
+            row["max_attempts"],
+            row["lease_owner"],
+            row["lease_expires_at"],
+            row["completed_time"],
+            row["error"],
+        )
+        for row in conn.execute(
+            """
+            SELECT id, created_time, agent, kind, payload, status, attempts,
+                   max_attempts, lease_owner, lease_expires_at, completed_time, error
+            FROM daemon_dispatches
+            ORDER BY id
+            """
+        )
+    ]
     attachments = [
         attachment_item(
             row["id"],
@@ -1750,6 +1849,7 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "reminder_events": reminder_events,
         "daemon_events": daemon_events,
         "daemon_wakes": daemon_wakes,
+        "daemon_dispatches": daemon_dispatches,
         "attachments": attachments,
         "message_attachments": message_attachments,
         "message_reactions": message_reactions,
@@ -4742,6 +4842,295 @@ def command_daemon_finish_turn(argv: list[str]) -> int:
     return with_mutable_state(action)
 
 
+def parse_state_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def dispatch_lease_available(item: dict[str, Any], now: datetime) -> bool:
+    if item["status"] == "pending":
+        return True
+    if item["status"] != "leased":
+        return False
+    expires = parse_state_timestamp(item.get("lease_expires_at"))
+    return expires is not None and expires <= now
+
+
+def command_daemon_dispatch_enqueue(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--agent", "--kind", "--payload", "--max-attempts"})
+    if unknown:
+        return write_stderr(f"Error: unknown daemon dispatch enqueue flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if (
+        flag_missing_value(argv, "--agent")
+        or flag_missing_value(argv, "--kind")
+        or flag_missing_value(argv, "--payload")
+        or flag_missing_value(argv, "--max-attempts")
+    ):
+        return write_stderr("Error: daemon dispatch enqueue flags require values\nCode: INVALID_ARG\n")
+    agent = arg_value(argv, "--agent")
+    kind = arg_value(argv, "--kind") or "manual"
+    payload = arg_value(argv, "--payload")
+    max_attempts_text = arg_value(argv, "--max-attempts")
+    if not agent or not agent.strip():
+        return write_stderr("Error: --agent is required\nCode: INVALID_ARG\n")
+    if payload is None:
+        return write_stderr("Error: --payload is required\nCode: INVALID_ARG\n")
+    max_attempts = 3
+    if max_attempts_text is not None:
+        try:
+            max_attempts = int(max_attempts_text)
+        except ValueError:
+            max_attempts = 0
+        if max_attempts <= 0:
+            return write_stderr("Error: --max-attempts must be a positive integer\nCode: INVALID_ARG\n")
+    agent_name = agent.strip()
+
+    def action(state: dict[str, Any]) -> int:
+        if not any(record["name"] == agent_name for record in state.get("agents", [])):
+            return write_stderr(f"Error: Agent not found: {agent_name}\nCode: NOT_FOUND\n")
+        dispatches = state.setdefault("daemon_dispatches", [])
+        next_id = max((item["id"] for item in dispatches), default=0) + 1
+        dispatches.append(
+            daemon_dispatch_item(
+                next_id,
+                current_timestamp(),
+                agent_name,
+                kind.strip(),
+                payload,
+                "pending",
+                0,
+                max_attempts,
+                None,
+                None,
+                None,
+                None,
+            )
+        )
+        append_daemon_event(state, "dispatch_enqueued", {"id": next_id, "agent": agent_name, "kind": kind.strip()})
+        return write_stdout(
+            f"Dispatch {next_id} enqueued for @{agent_name}.\n"
+            f"Kind: {kind.strip()}\n"
+            f"Max attempts: {max_attempts}\n"
+        )
+
+    return with_mutable_state(action)
+
+
+
+def command_daemon_dispatch_claim(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--owner", "--lease-seconds", "--limit"})
+    if unknown:
+        return write_stderr(f"Error: unknown daemon dispatch claim flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if (
+        flag_missing_value(argv, "--owner")
+        or flag_missing_value(argv, "--lease-seconds")
+        or flag_missing_value(argv, "--limit")
+    ):
+        return write_stderr("Error: daemon dispatch claim flags require values\nCode: INVALID_ARG\n")
+    owner = arg_value(argv, "--owner")
+    if not owner or not owner.strip():
+        return write_stderr("Error: --owner is required\nCode: INVALID_ARG\n")
+    lease_seconds = 300
+    lease_text = arg_value(argv, "--lease-seconds")
+    if lease_text is not None:
+        try:
+            lease_seconds = int(lease_text)
+        except ValueError:
+            lease_seconds = 0
+        if lease_seconds <= 0:
+            return write_stderr("Error: --lease-seconds must be a positive integer\nCode: INVALID_ARG\n")
+    limit = 1
+    limit_text = arg_value(argv, "--limit")
+    if limit_text is not None:
+        try:
+            limit = int(limit_text)
+        except ValueError:
+            limit = 0
+        if limit <= 0:
+            return write_stderr("Error: --limit must be a positive integer\nCode: INVALID_ARG\n")
+    owner_name = owner.strip()
+
+    def action(state: dict[str, Any]) -> int:
+        now = datetime.strptime(current_timestamp(), "%Y-%m-%d %H:%M:%S")
+        lines: list[str] = []
+        claimed = 0
+        for item in state.setdefault("daemon_dispatches", []):
+            if claimed >= limit:
+                break
+            if not dispatch_lease_available(item, now):
+                continue
+            reclaimed = item["status"] == "leased"
+            if item["attempts"] >= item["max_attempts"]:
+                item["status"] = "failed"
+                item["lease_owner"] = None
+                item["lease_expires_at"] = None
+                item["error"] = "max attempts exceeded"
+                append_daemon_event(state, "dispatch_failed", {"id": item["id"], "reason": "max attempts exceeded"})
+                lines.append(f"- {item['id']} @{item['agent']} failed (max attempts exceeded)")
+                continue
+            item["status"] = "leased"
+            item["attempts"] += 1
+            item["lease_owner"] = owner_name
+            expires = now + timedelta(seconds=lease_seconds)
+            item["lease_expires_at"] = expires.strftime("%Y-%m-%d %H:%M:%S")
+            event = "dispatch_reclaimed" if reclaimed else "dispatch_leased"
+            append_daemon_event(state, event, {"id": item["id"], "owner": owner_name, "attempts": item["attempts"]})
+            lines.append(
+                f"- {item['id']} @{item['agent']} kind={item['kind']} attempts={item['attempts']} "
+                f"lease_expires={item['lease_expires_at']}{' (reclaimed)' if reclaimed else ''}"
+            )
+            claimed += 1
+        header = f"## Dispatch Claim ({claimed} leased by {owner_name})\n"
+        body = "\n".join(lines) if lines else "No claimable dispatches."
+        return write_stdout(header + "\n" + body + "\n")
+
+    return with_mutable_state(action)
+
+
+def find_dispatch(state: dict[str, Any], dispatch_id: int) -> dict[str, Any] | None:
+    for item in state.get("daemon_dispatches", []):
+        if item["id"] == dispatch_id:
+            return item
+    return None
+
+
+def dispatch_holder_check(item: dict[str, Any], owner_name: str) -> str | None:
+    if item["status"] != "leased":
+        return f"Error: Dispatch {item['id']} is not leased (status: {item['status']})\nCode: DISPATCH_NOT_HELD\n"
+    if item["lease_owner"] != owner_name:
+        return f"Error: Dispatch {item['id']} lease is held by another owner\nCode: DISPATCH_NOT_HELD\n"
+    now = datetime.strptime(current_timestamp(), "%Y-%m-%d %H:%M:%S")
+    expires = parse_state_timestamp(item.get("lease_expires_at"))
+    if expires is None or expires <= now:
+        return f"Error: Dispatch {item['id']} lease has expired\nCode: DISPATCH_NOT_HELD\n"
+    return None
+
+
+def command_daemon_dispatch_complete(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--id", "--owner"})
+    if unknown:
+        return write_stderr(f"Error: unknown daemon dispatch complete flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if flag_missing_value(argv, "--id") or flag_missing_value(argv, "--owner"):
+        return write_stderr("Error: daemon dispatch complete flags require values\nCode: INVALID_ARG\n")
+    id_text = arg_value(argv, "--id")
+    owner = arg_value(argv, "--owner")
+    if not id_text or not owner or not owner.strip():
+        return write_stderr("Error: --id and --owner are required\nCode: INVALID_ARG\n")
+    try:
+        dispatch_id = int(id_text)
+    except ValueError:
+        return write_stderr("Error: --id must be an integer\nCode: INVALID_ARG\n")
+    owner_name = owner.strip()
+
+    def action(state: dict[str, Any]) -> int:
+        item = find_dispatch(state, dispatch_id)
+        if item is None:
+            return write_stderr(f"Error: Dispatch not found: {dispatch_id}\nCode: NOT_FOUND\n")
+        holder_error = dispatch_holder_check(item, owner_name)
+        if holder_error is not None:
+            return write_stderr(holder_error)
+        item["status"] = "done"
+        item["completed_time"] = current_timestamp()
+        item["lease_owner"] = None
+        item["lease_expires_at"] = None
+        append_daemon_event(state, "dispatch_completed", {"id": dispatch_id, "owner": owner_name})
+        return write_stdout(f"Dispatch {dispatch_id} completed by {owner_name}.\n")
+
+    return with_mutable_state(action)
+
+
+def command_daemon_dispatch_fail(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--id", "--owner", "--error"})
+    if unknown:
+        return write_stderr(f"Error: unknown daemon dispatch fail flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if (
+        flag_missing_value(argv, "--id")
+        or flag_missing_value(argv, "--owner")
+        or flag_missing_value(argv, "--error")
+    ):
+        return write_stderr("Error: daemon dispatch fail flags require values\nCode: INVALID_ARG\n")
+    id_text = arg_value(argv, "--id")
+    owner = arg_value(argv, "--owner")
+    error_text = arg_value(argv, "--error") or "unspecified"
+    if not id_text or not owner or not owner.strip():
+        return write_stderr("Error: --id and --owner are required\nCode: INVALID_ARG\n")
+    try:
+        dispatch_id = int(id_text)
+    except ValueError:
+        return write_stderr("Error: --id must be an integer\nCode: INVALID_ARG\n")
+    owner_name = owner.strip()
+
+    def action(state: dict[str, Any]) -> int:
+        item = find_dispatch(state, dispatch_id)
+        if item is None:
+            return write_stderr(f"Error: Dispatch not found: {dispatch_id}\nCode: NOT_FOUND\n")
+        holder_error = dispatch_holder_check(item, owner_name)
+        if holder_error is not None:
+            return write_stderr(holder_error)
+        item["lease_owner"] = None
+        item["lease_expires_at"] = None
+        item["error"] = error_text
+        if item["attempts"] >= item["max_attempts"]:
+            item["status"] = "failed"
+            append_daemon_event(state, "dispatch_failed", {"id": dispatch_id, "reason": error_text})
+            return write_stdout(f"Dispatch {dispatch_id} failed permanently ({item['attempts']}/{item['max_attempts']} attempts).\n")
+        item["status"] = "pending"
+        append_daemon_event(state, "dispatch_requeued", {"id": dispatch_id, "reason": error_text})
+        return write_stdout(f"Dispatch {dispatch_id} requeued ({item['attempts']}/{item['max_attempts']} attempts used).\n")
+
+    return with_mutable_state(action)
+
+
+def command_daemon_dispatch_list(argv: list[str]) -> int:
+    unknown = unknown_flags(argv, {"--status"})
+    if unknown:
+        return write_stderr(f"Error: unknown daemon dispatch list flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    if flag_missing_value(argv, "--status"):
+        return write_stderr("Error: daemon dispatch list flags require values\nCode: INVALID_ARG\n")
+    status_filter = arg_value(argv, "--status")
+    if status_filter is not None and status_filter not in {"pending", "leased", "done", "failed"}:
+        return write_stderr("Error: --status must be pending, leased, done, or failed\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        items = state.get("daemon_dispatches", [])
+        if status_filter is not None:
+            items = [item for item in items if item["status"] == status_filter]
+        lines = [
+            f"- {item['id']} @{item['agent']} kind={item['kind']} status={item['status']} "
+            f"attempts={item['attempts']}/{item['max_attempts']}"
+            + (f" lease_owner={item['lease_owner']} lease_expires={item['lease_expires_at']}" if item["status"] == "leased" else "")
+            + (f" error={item['error']}" if item.get("error") and item["status"] == "failed" else "")
+            for item in items
+        ]
+        header = f"## Daemon Dispatches ({len(lines)})\n"
+        body = "\n".join(lines) if lines else "No dispatches."
+        return write_stdout(header + "\n" + body + "\n")
+
+    return with_read_state(action)
+
+
+def command_daemon_dispatch(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing daemon dispatch subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "enqueue":
+        return command_daemon_dispatch_enqueue(rest)
+    if subcommand == "claim":
+        return command_daemon_dispatch_claim(rest)
+    if subcommand == "complete":
+        return command_daemon_dispatch_complete(rest)
+    if subcommand == "fail":
+        return command_daemon_dispatch_fail(rest)
+    if subcommand == "list":
+        return command_daemon_dispatch_list(rest)
+    return write_stderr(f"Error: unknown daemon dispatch subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def command_daemon(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing daemon subcommand\nCode: INVALID_ARG\n")
@@ -4755,6 +5144,8 @@ def command_daemon(argv: list[str]) -> int:
         return command_daemon_wakes(rest)
     if subcommand == "finish-turn":
         return command_daemon_finish_turn(rest)
+    if subcommand == "dispatch":
+        return command_daemon_dispatch(rest)
     return write_stderr(f"Error: unknown daemon subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
