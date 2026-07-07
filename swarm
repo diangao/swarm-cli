@@ -6262,6 +6262,562 @@ def write_agent_seed_workspace(agent: dict[str, Any], destination: Path) -> None
     )
 
 
+def safe_watch_id(value: str) -> str:
+    normalized = []
+    for char in value.lower():
+        if char.isalnum():
+            normalized.append(char)
+        elif char in {"-", "_", ".", "/", ":"}:
+            normalized.append("-")
+    result = "".join(normalized).strip("-")
+    return result or uuid.uuid4().hex[:8]
+
+
+def source_text_is_owner_sensitive(value: str) -> bool:
+    lowered = value.lower()
+    markers = (
+        "fde tracker",
+        "company tracker",
+        "interview tracker",
+        "candidate tracker",
+        "notion tracker",
+        "personal tracker",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def flatten_json_items(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for key in ("items", "entities", "watchlist", "sources"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return nested
+        return list(value.values())
+    return []
+
+
+def curator_entry_from_raw(kind: str, item: Any) -> dict[str, str] | None:
+    if isinstance(item, str):
+        name = item.strip()
+        if not name:
+            return None
+        return {
+            "id": f"{kind}:{safe_watch_id(name)}",
+            "kind": kind,
+            "name": name,
+            "why_watched": "owner-selected watch item",
+            "trust_tier": "owner-selected",
+            "scan_surface": "manual watch list",
+            "cadence": "hourly curator cycle",
+            "retirement_condition": "retire when repeated cycles produce no actionable signal",
+        }
+    if not isinstance(item, dict):
+        return None
+    raw_id = str(item.get("id") or item.get("entityId") or item.get("slug") or item.get("name") or item.get("title") or "").strip()
+    name = str(item.get("name") or item.get("title") or raw_id).strip()
+    if not raw_id and not name:
+        return None
+    surface = str(item.get("scan_surface") or item.get("surface") or item.get("url") or item.get("kind") or "manual watch list").strip()
+    why = str(item.get("why_watched") or item.get("why") or item.get("description") or "configured watch item").strip()
+    trust = str(item.get("trust_tier") or item.get("trust") or "configured-source").strip()
+    cadence = str(item.get("cadence") or "hourly curator cycle").strip()
+    retirement = str(item.get("retirement_condition") or item.get("retire_when") or "retire when repeated cycles produce no actionable signal").strip()
+    return {
+        "id": f"{kind}:{safe_watch_id(raw_id or name)}",
+        "kind": kind,
+        "name": name or raw_id,
+        "why_watched": why,
+        "trust_tier": trust,
+        "scan_surface": surface,
+        "cadence": cadence,
+        "retirement_condition": retirement,
+    }
+
+
+def load_curator_watch_entries(
+    source_config: str | None,
+    entity_radar: str | None,
+    owner_watchlist: str | None,
+) -> tuple[list[dict[str, str]], dict[str, int], str | None]:
+    entries: list[dict[str, str]] = []
+    counters = {
+        "source_entries": 0,
+        "entity_entries": 0,
+        "owner_entries": 0,
+        "excluded_owner_sensitive": 0,
+        "excluded_dm_originals": 0,
+    }
+
+    def add_entries(path_text: str | None, kind: str) -> str | None:
+        if not path_text:
+            return None
+        path = Path(path_text).expanduser()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            return f"cannot read {kind} file: {type(exc).__name__}"
+        except json.JSONDecodeError as exc:
+            return f"invalid JSON in {kind} file: {exc.msg}"
+        for raw in flatten_json_items(data):
+            entry = curator_entry_from_raw(kind, raw)
+            if entry is None:
+                continue
+            combined = json.dumps(entry, sort_keys=True)
+            if contains_credential_shape(combined):
+                return f"credential-shaped value found in {kind} seed input"
+            surface = entry["scan_surface"].strip().lower()
+            if surface.startswith("dm:") or "direct message" in surface:
+                counters["excluded_dm_originals"] += 1
+                continue
+            if source_text_is_owner_sensitive(combined):
+                counters["excluded_owner_sensitive"] += 1
+                continue
+            entries.append(entry)
+            if kind == "source":
+                counters["source_entries"] += 1
+            elif kind == "entity":
+                counters["entity_entries"] += 1
+            else:
+                counters["owner_entries"] += 1
+        return None
+
+    for path_text, kind in ((source_config, "source"), (entity_radar, "entity"), (owner_watchlist, "owner")):
+        error = add_entries(path_text, kind)
+        if error is not None:
+            return [], counters, error
+
+    unique: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        unique.setdefault(entry["id"], entry)
+    ordered = [unique[key] for key in sorted(unique)]
+    if not ordered:
+        return [], counters, "curator watch list would be empty"
+    return ordered, counters, None
+
+
+def curator_runtime_source() -> str:
+    return r'''#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def load_json(path, fallback):
+    if not path.exists():
+        return fallback
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def dump_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def clean_excerpt(job):
+    return str(job.get("excerpt") or "").strip()
+
+
+def make_annotation(job):
+    title = str(job.get("title") or "Untitled").strip() or "Untitled"
+    excerpt = clean_excerpt(job)
+    summary_seed = excerpt.split(".")[0].strip() or excerpt
+    words = summary_seed.split()
+    summary = " ".join(words[:20]) if words else title
+    if len(summary) < 12:
+        summary = f"{title}: {summary}"
+    tags = job.get("tags")
+    if not isinstance(tags, list) or not tags:
+        tags = ["agents"]
+    tags = [str(tag).strip().lower().replace(" ", "-") for tag in tags if str(tag).strip()][:3] or ["agents"]
+    return {
+        "id": job.get("id"),
+        "summary": summary[:280],
+        "whyItMatters": None,
+        "tags": tags,
+        "priority": str(job.get("priority") or "medium") if str(job.get("priority") or "medium") in {"high", "medium", "low"} else "medium",
+    }
+
+
+def send_report(target, author, body):
+    if not target:
+        return
+    completed = subprocess.run(
+        ["swarm", "message", "send", "--target", target, "--author", author],
+        input=body,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    if completed.returncode == 0 and "Freshness hold:" in completed.stdout:
+        completed = subprocess.run(
+            ["swarm", "message", "send", "--send-draft", "--target", target, "--author", author],
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+    if completed.returncode != 0:
+        sys.stderr.write(completed.stderr or completed.stdout)
+        raise SystemExit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", default="")
+    args = parser.parse_args()
+    del args
+    workspace = Path.cwd()
+    config = load_json(workspace / "runtime" / "curator-config.json", {})
+    batch_size = int(config.get("batch_size", 10))
+    max_runtime_seconds = float(config.get("max_runtime_seconds", 300))
+    report_target = str(config.get("report_target") or "")
+    agent = os.environ.get("SWARM_AGENT_NAME", "curator")
+    start = time.monotonic()
+    queue_path = workspace / "runtime" / "curator-jobs.json"
+    writeback_path = workspace / "runtime" / "curator-writeback.jsonl"
+    jobs = load_json(queue_path, [])
+    if not isinstance(jobs, list):
+        raise SystemExit("curator-jobs.json must be a list")
+    claimed = []
+    for job in jobs:
+        if len(claimed) >= batch_size:
+            break
+        if isinstance(job, dict) and job.get("status", "pending") == "pending":
+            job["status"] = "claimed"
+            job["claimed_by"] = agent
+            claimed.append(job)
+    completed = 0
+    canceled = 0
+    failed = 0
+    writebacks = []
+    now = datetime.now(timezone.utc).isoformat()
+    for job in claimed:
+        if time.monotonic() - start >= max_runtime_seconds:
+            job["status"] = "pending"
+            job["error"] = "max_runtime_exceeded"
+            failed += 1
+            continue
+        if not clean_excerpt(job):
+            job["status"] = "canceled"
+            job["error"] = "insufficient_content: empty excerpt"
+            job["processed_at"] = now
+            canceled += 1
+            continue
+        annotation = make_annotation(job)
+        job["status"] = "done"
+        job["annotation"] = annotation
+        job["processed_at"] = now
+        completed += 1
+        writebacks.append({"job_id": job.get("id"), "annotation": annotation, "processed_at": now})
+    dump_json(queue_path, jobs)
+    if writebacks:
+        writeback_path.parent.mkdir(parents=True, exist_ok=True)
+        with writeback_path.open("a", encoding="utf-8") as handle:
+            for item in writebacks:
+                handle.write(json.dumps(item, sort_keys=True) + "\n")
+    remaining = sum(1 for job in jobs if isinstance(job, dict) and job.get("status", "pending") == "pending")
+    report = (
+        f"curator batch: claimed {len(claimed)}, completed {completed}, "
+        f"canceled {canceled}, failed {failed}, pending {remaining}"
+    )
+    send_report(report_target, agent, report)
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def write_curator_seed_workspace(
+    agent: dict[str, Any],
+    destination: Path,
+    watch_entries: list[dict[str, str]],
+    counters: dict[str, int],
+    report_target: str,
+    batch_size: int,
+    max_runtime_seconds: float,
+) -> None:
+    write_agent_seed_workspace(agent, destination)
+    runtime_dir = destination / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (destination / "watch-list.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "entries": watch_entries,
+                "governance": {
+                    "small_changes": "curator may propose additions/removals with evidence each cycle",
+                    "category_changes": "wait for owner nod",
+                    "excluded": ["private owner-only tracker"],
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    seed_path = destination / "seed.json"
+    seed_payload = json.loads(seed_path.read_text(encoding="utf-8"))
+    seed_payload["status"] = "ready_for_curator_turn"
+    seed_payload["curator_seed"] = {
+        "watch_entries": len(watch_entries),
+        "source_entries": counters.get("source_entries", 0),
+        "entity_entries": counters.get("entity_entries", 0),
+        "owner_entries": counters.get("owner_entries", 0),
+        "scrub_gate": {
+            "credentials": 0,
+            "other_people_dm_originals": 0,
+            "owner_sensitive": 0,
+        },
+        "excluded_counts": {
+            "dm_originals": counters.get("excluded_dm_originals", 0),
+            "owner_sensitive": counters.get("excluded_owner_sensitive", 0),
+        },
+    }
+    seed_path.write_text(json.dumps(seed_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (runtime_dir / "curator-config.json").write_text(
+        json.dumps(
+            {
+                "batch_size": batch_size,
+                "max_runtime_seconds": max_runtime_seconds,
+                "report_target": report_target,
+                "queue_file": "runtime/curator-jobs.json",
+                "writeback_file": "runtime/curator-writeback.jsonl",
+                "contract": {
+                    "empty_excerpt": "cancel insufficient_content",
+                    "why_it_matters": "null or non-empty string for contentful cards",
+                    "summary_requires_source_text": True,
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    jobs_path = runtime_dir / "curator-jobs.json"
+    if not jobs_path.exists():
+        jobs_path.write_text("[]\n", encoding="utf-8")
+    runner = runtime_dir / "curator_cycle.py"
+    runner.write_text(curator_runtime_source(), encoding="utf-8")
+    runner.chmod(0o755)
+    (destination / "MEMORY.md").write_text(
+        f"# {agent['display_name']}\n\n"
+        "## Role\n"
+        "Curate the owner's research dashboard through the swarm daemon resident runtime.\n\n"
+        "## Contract\n"
+        "- Run only bounded curator cycles; no infinite loop or self heartbeat.\n"
+        "- Claim at most the configured batch size per scheduled wake.\n"
+        "- Empty excerpt cards cancel as insufficient_content; do not synthesize from title-only shells.\n"
+        "- Write reports to the configured channel target.\n\n"
+        "## Seed Files\n"
+        "- watch-list.json is the maintained watch-list seed.\n"
+        "- runtime/curator-config.json defines batch, report target, and runtime limits.\n",
+        encoding="utf-8",
+    )
+
+
+def curator_seed_has_blocked_material(destination: Path) -> str | None:
+    checked_names = ["seed.json", "watch-list.json", "MEMORY.md", "runtime/curator-config.json", "runtime/curator_cycle.py"]
+    combined = []
+    for name in checked_names:
+        path = destination / name
+        if path.exists():
+            combined.append(path.read_text(encoding="utf-8"))
+    text = "\n".join(combined)
+    if contains_credential_shape(text):
+        return "credentials"
+    lowered = text.lower()
+    if "dm:@" in lowered:
+        return "other_people_dm_originals"
+    if source_text_is_owner_sensitive(lowered):
+        return "owner_sensitive"
+    return None
+
+
+def command_curator_install(argv: list[str]) -> int:
+    allowed = {
+        "--name",
+        "--display-name",
+        "--workspace",
+        "--source-config",
+        "--entity-radar",
+        "--owner-watchlist",
+        "--report-target",
+        "--batch-size",
+        "--cadence",
+        "--at",
+        "--in",
+        "--max-runtime",
+        "--avatar-url",
+    }
+    unknown = unknown_flags(argv, allowed)
+    if unknown:
+        return write_stderr(f"Error: unknown curator install flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    for flag in allowed:
+        if flag_missing_value(argv, flag):
+            return write_stderr(f"Error: {flag} requires a value\nCode: INVALID_ARG\n")
+    name = (arg_value(argv, "--name") or "curator").removeprefix("@")
+    display_name = arg_value(argv, "--display-name") or "Grind Curator"
+    workspace_path = arg_value(argv, "--workspace") or f"agents/{name}"
+    report_target = arg_value(argv, "--report-target")
+    if not valid_service_name(name):
+        return write_stderr("Error: --name must start lowercase and contain only lowercase letters, digits, '_' or '-'\nCode: INVALID_ARG\n")
+    if not valid_workspace_path(workspace_path):
+        return write_stderr("Error: --workspace must be a safe relative path\nCode: INVALID_ARG\n")
+    if report_target is None or not report_target.startswith("#") or ":" in report_target:
+        return write_stderr("Error: --report-target must be a top-level channel\nCode: INVALID_ARG\n")
+    batch_text = arg_value(argv, "--batch-size") or "10"
+    try:
+        batch_size = int(batch_text)
+    except ValueError:
+        batch_size = 0
+    if batch_size <= 0 or batch_size > 50:
+        return write_stderr("Error: --batch-size must be an integer from 1 to 50\nCode: INVALID_ARG\n")
+    cadence = arg_value(argv, "--cadence") or "1h"
+    cadence_delta = parse_duration(cadence)
+    if cadence_delta is None or cadence_delta.total_seconds() <= 0:
+        return write_stderr("Error: --cadence must be a positive duration like 1h\nCode: INVALID_ARG\n")
+    max_runtime_seconds, max_runtime_error = parse_duration_arg(argv, "--max-runtime", "5m")
+    if max_runtime_error is not None:
+        return write_stderr(f"Error: {max_runtime_error}\nCode: INVALID_ARG\n")
+    next_fire_at = schedule_time_from_args(argv) or current_timestamp()
+    watch_entries, counters, watch_error = load_curator_watch_entries(
+        arg_value(argv, "--source-config"),
+        arg_value(argv, "--entity-radar"),
+        arg_value(argv, "--owner-watchlist"),
+    )
+    if watch_error is not None:
+        return write_stderr(f"Error: {watch_error}\nCode: INVALID_ARG\n")
+    avatar_url = arg_value(argv, "--avatar-url")
+    if avatar_url is not None and not avatar_url.strip():
+        return write_stderr("Error: --avatar-url must be non-empty\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        existing_profile = profile_by_name(state, name)
+        if existing_profile is not None and existing_profile["kind"] != "agent":
+            return write_stderr("Error: Agent name conflicts with a human profile\nCode: CONFLICT\n")
+        ensure_channel_catalog(state, report_target)
+        now = current_timestamp()
+        runtime = f"{sys.executable} runtime/curator_cycle.py"
+        existing = agent_by_name(state, name)
+        record = agent_item(
+            name,
+            display_name.strip(),
+            runtime,
+            workspace_path,
+            ["curator", "watch-list", "queue-writeback"],
+            avatar_url.strip() if avatar_url is not None else None,
+            existing["created_at"] if existing is not None else now,
+            now,
+            existing.get("presence", "offline") if existing is not None else "offline",
+            existing.get("presence_updated_at") if existing is not None else None,
+            existing.get("last_turn_at") if existing is not None else None,
+        )
+        if existing is None:
+            state.setdefault("agents", []).append(record)
+        else:
+            existing.update(record)
+        description = f"Swarm curator runtime workspace={workspace_path}"
+        if existing_profile is None:
+            state.setdefault("profiles", []).append(profile_item(name, display_name.strip(), "agent", description, record.get("avatar_url")))
+        else:
+            existing_profile["display_name"] = display_name.strip()
+            existing_profile["description"] = description
+            existing_profile["avatar_url"] = record.get("avatar_url")
+            existing_profile["avatar_file"] = None
+        destination = state_dir() / workspace_path
+        write_curator_seed_workspace(record, destination, watch_entries, counters, report_target, batch_size, max_runtime_seconds)
+        blocked = curator_seed_has_blocked_material(destination)
+        if blocked is not None:
+            return write_stderr(f"Error: curator seed scrub gate failed: {blocked}\nCode: SEED_SCRUB_FAILED\n")
+        reminder_title = f"curator scheduled batch @{name}"
+        reminder_target = f"dm:@{name}"
+        reminder = next(
+            (
+                item
+                for item in state.get("reminders", [])
+                if item.get("target") == reminder_target
+                and item.get("title") == reminder_title
+                and item.get("status") != "canceled"
+            ),
+            None,
+        )
+        if reminder is None:
+            reminder_id = next_reminder_id(state)
+            reminder = reminder_item(
+                reminder_id,
+                reminder_title,
+                reminder_target,
+                "scheduled",
+                next_fire_at,
+                cadence,
+                now,
+                now,
+            )
+            state.setdefault("reminders", []).append(reminder)
+            reminder_event = "scheduled"
+        else:
+            reminder_id = str(reminder["id"])
+            reminder["status"] = "scheduled"
+            reminder["next_fire_at"] = next_fire_at
+            reminder["recurrence"] = cadence
+            reminder["updated_at"] = now
+            reminder_event = "updated"
+        append_reminder_event(
+            state,
+            reminder_id,
+            reminder_event,
+            f"title={reminder['title']} next={next_fire_at} target={reminder_target} every={cadence}",
+        )
+        append_daemon_event(
+            state,
+            "curator_installed",
+            {
+                "agent": name,
+                "workspace": workspace_path,
+                "reminder_id": reminder_id,
+                "watch_entries": len(watch_entries),
+                "batch_size": batch_size,
+                "cadence": cadence,
+                "report_target": report_target,
+            },
+        )
+        return write_stdout(
+            f"Curator @{name} installed.\n"
+            f"Workspace: {destination}\n"
+            f"Watch entries: {len(watch_entries)}\n"
+            "Scrub gate: credentials=0 other_people_dm_originals=0 owner_sensitive=0\n"
+            f"Batch size: {batch_size}\n"
+            f"Max runtime: {int(max_runtime_seconds)}s\n"
+            f"Reminder: {reminder_id} every={cadence} target=dm:@{name} next={next_fire_at}\n"
+            f"Report target: {report_target}\n"
+        )
+
+    return with_mutable_state(action)
+
+
+def command_curator(argv: list[str]) -> int:
+    if not argv:
+        return write_stderr("Error: missing curator subcommand\nCode: INVALID_ARG\n")
+    subcommand = argv[0]
+    rest = argv[1:]
+    if subcommand == "install":
+        return command_curator_install(rest)
+    return write_stderr(f"Error: unknown curator subcommand: {subcommand}\nCode: INVALID_ARG\n")
+
+
 def command_agent_seed(argv: list[str]) -> int:
     unknown = unknown_flags(argv, {"--name", "--output-dir"})
     if unknown:
@@ -7804,6 +8360,8 @@ def main(argv: list[str]) -> int:
         return command_daemon(argv[1:])
     if command == "agent":
         return command_agent(argv[1:])
+    if command == "curator":
+        return command_curator(argv[1:])
     if command == "server":
         return command_server(argv[1:])
     if command == "channel":
