@@ -6631,6 +6631,181 @@ if __name__ == "__main__":
 '''
 
 
+def curator_grind_runtime_source() -> str:
+    return r'''#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+
+def load_json(path, fallback):
+    if not path.exists():
+        return fallback
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def send_report(target, author, body):
+    if not target:
+        return
+    completed = subprocess.run(
+        ["swarm", "message", "send", "--target", target, "--author", author],
+        input=body,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    if completed.returncode == 0 and "Freshness hold:" in completed.stdout:
+        completed = subprocess.run(
+            ["swarm", "message", "send", "--send-draft", "--target", target, "--author", author],
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+    if completed.returncode != 0:
+        sys.stderr.write(completed.stderr or completed.stdout)
+        raise SystemExit(1)
+
+
+def stats_for(db_path, prompt_version):
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        counts = {"pending": 0, "claimed": 0, "done": 0, "failed": 0, "canceled": 0}
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS count FROM curator_jobs WHERE prompt_version = ? GROUP BY status",
+            (prompt_version,),
+        ):
+            counts[str(row["status"])] = int(row["count"])
+        unqueued = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM processed_cards c
+            WHERE c.enriched_at IS NULL AND c.enrich_status = 'pending'
+              AND NOT EXISTS (
+                SELECT 1 FROM curator_jobs j
+                WHERE j.card_id = c.id AND j.prompt_version = ?
+              )
+            """,
+            (prompt_version,),
+        ).fetchone()["count"]
+        counts["unqueued"] = int(unqueued)
+        return counts
+    finally:
+        conn.close()
+
+
+def fmt_stats(stats):
+    return (
+        f"unqueued={stats['unqueued']} pending={stats['pending']} claimed={stats['claimed']} "
+        f"done={stats['done']} failed={stats['failed']} canceled={stats['canceled']}"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", default="")
+    args = parser.parse_args()
+    del args
+    workspace = Path.cwd()
+    config = load_json(workspace / "runtime" / "curator-config.json", {})
+    report_target = str(config.get("report_target") or "")
+    agent = os.environ.get("SWARM_AGENT_NAME", "curator")
+    server_dir = Path(str(config.get("grind_server") or "")).expanduser()
+    db_path = Path(str(config.get("grind_db_path") or "")).expanduser()
+    prompt_version = str(config.get("prompt_version") or "curator-v3")
+    batch_size = int(config.get("batch_size", 10))
+    queue_fill_limit = int(config.get("queue_fill_limit", max(batch_size, 10)))
+    max_runtime_seconds = float(config.get("max_runtime_seconds", 300))
+    if not server_dir.exists():
+        raise SystemExit(f"grind server path missing: {server_dir}")
+    if not db_path.exists():
+        raise SystemExit(f"grind db path missing: {db_path}")
+
+    before = stats_for(db_path, prompt_version)
+    env = os.environ.copy()
+    env.update(
+        {
+            "GW_DB_PATH": str(db_path),
+            "CURATOR_WORKER_ID": agent,
+            "CURATOR_BATCH": str(batch_size),
+            "CURATOR_QUEUE_FILL_LIMIT": str(queue_fill_limit),
+            "CURATOR_PROMPT_VERSION": prompt_version,
+            "CURATOR_AGENT_WORKSPACE": str(workspace / "runtime" / "grind-codex-workspace"),
+            "CURATOR_CODEX_TIMEOUT_MS": str(max(1000, int(max_runtime_seconds * 1000))),
+        }
+    )
+    for key, env_key in (
+        ("codex_bin", "CURATOR_CODEX_BIN"),
+        ("codex_model", "CURATOR_CODEX_MODEL"),
+        ("codex_home", "CODEX_HOME"),
+    ):
+        value = config.get(key)
+        if value:
+            env[env_key] = str(value)
+    env.pop("CURATOR_LOOP", None)
+    timed_out = False
+    completed = None
+    spawn_error = ""
+    try:
+        completed = subprocess.run(
+            ["npm", "run", "curator:codex", "--silent"],
+            cwd=server_dir,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=max_runtime_seconds,
+            check=False,
+        )
+        worker_exit = int(completed.returncode)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        worker_exit = 124
+    except OSError as exc:
+        spawn_error = type(exc).__name__
+        worker_exit = 127
+    after = stats_for(db_path, prompt_version)
+    delta = {key: after.get(key, 0) - before.get(key, 0) for key in after}
+    contract_violations = max(0, delta.get("failed", 0))
+    effective_exit = worker_exit if worker_exit != 0 else (2 if contract_violations else 0)
+    report = (
+        f"grind curator batch: true_db=1 prompt={prompt_version} worker=@{agent} "
+        f"exit={worker_exit} violations={contract_violations}\n"
+        f"before {fmt_stats(before)}\n"
+        f"after {fmt_stats(after)}\n"
+        f"delta done={delta.get('done', 0)} failed={delta.get('failed', 0)} "
+        f"canceled={delta.get('canceled', 0)} pending={delta.get('pending', 0)} "
+        f"unqueued={delta.get('unqueued', 0)}"
+    )
+    if timed_out:
+        report += "\nworker_status=timeout"
+    elif spawn_error:
+        report += "\nworker_status=spawn_failed"
+    elif worker_exit != 0:
+        report += "\nworker_status=nonzero"
+    elif contract_violations:
+        report += "\nworker_status=failed_jobs"
+    send_report(report_target, agent, report)
+    if timed_out:
+        sys.stderr.write("curator worker timed out\n")
+    elif spawn_error:
+        sys.stderr.write(f"curator worker spawn failed: {spawn_error}\n")
+    elif completed is not None and worker_exit != 0:
+        sys.stderr.write(completed.stderr or completed.stdout)
+    elif contract_violations:
+        sys.stderr.write("curator worker produced failed jobs\n")
+    return effective_exit
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
 def write_curator_seed_workspace(
     agent: dict[str, Any],
     destination: Path,
@@ -6639,6 +6814,7 @@ def write_curator_seed_workspace(
     report_target: str,
     batch_size: int,
     max_runtime_seconds: float,
+    grind_config: dict[str, Any] | None = None,
 ) -> None:
     write_agent_seed_workspace(agent, destination)
     runtime_dir = destination / "runtime"
@@ -6679,31 +6855,40 @@ def write_curator_seed_workspace(
         },
     }
     seed_path.write_text(json.dumps(seed_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    (runtime_dir / "curator-config.json").write_text(
-        json.dumps(
+    config_payload: dict[str, Any] = {
+        "batch_size": batch_size,
+        "max_runtime_seconds": max_runtime_seconds,
+        "report_target": report_target,
+        "contract": {
+            "empty_excerpt": "cancel insufficient_content",
+            "why_it_matters": "null or non-empty string for contentful cards",
+            "summary_requires_source_text": True,
+        },
+    }
+    if grind_config is None:
+        config_payload.update(
             {
-                "batch_size": batch_size,
-                "max_runtime_seconds": max_runtime_seconds,
-                "report_target": report_target,
+                "queue_source": "workspace-json",
                 "queue_file": "runtime/curator-jobs.json",
                 "writeback_file": "runtime/curator-writeback.jsonl",
-                "contract": {
-                    "empty_excerpt": "cancel insufficient_content",
-                    "why_it_matters": "null or non-empty string for contentful cards",
-                    "summary_requires_source_text": True,
-                },
-            },
-            indent=2,
-            sort_keys=True,
+            }
         )
-        + "\n",
+        jobs_path = runtime_dir / "curator-jobs.json"
+        if not jobs_path.exists():
+            jobs_path.write_text("[]\n", encoding="utf-8")
+        runner_source = curator_runtime_source()
+        queue_note = "- runtime/curator-jobs.json is a substrate fixture queue.\n"
+    else:
+        config_payload.update(grind_config)
+        config_payload["queue_source"] = "grind-db"
+        runner_source = curator_grind_runtime_source()
+        queue_note = "- The queue is the real grind-window SQLite `curator_jobs` table.\n"
+    (runtime_dir / "curator-config.json").write_text(
+        json.dumps(config_payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    jobs_path = runtime_dir / "curator-jobs.json"
-    if not jobs_path.exists():
-        jobs_path.write_text("[]\n", encoding="utf-8")
     runner = runtime_dir / "curator_cycle.py"
-    runner.write_text(curator_runtime_source(), encoding="utf-8")
+    runner.write_text(runner_source, encoding="utf-8")
     runner.chmod(0o755)
     (destination / "MEMORY.md").write_text(
         f"# {agent['display_name']}\n\n"
@@ -6716,6 +6901,7 @@ def write_curator_seed_workspace(
         "- Write reports to the configured channel target.\n\n"
         "## Seed Files\n"
         "- watch-list.json is the maintained watch-list seed.\n"
+        f"{queue_note}"
         "- runtime/curator-config.json defines batch, report target, and runtime limits.\n",
         encoding="utf-8",
     )
@@ -6754,6 +6940,13 @@ def command_curator_install(argv: list[str]) -> int:
         "--in",
         "--max-runtime",
         "--avatar-url",
+        "--grind-server",
+        "--grind-db",
+        "--prompt-version",
+        "--queue-fill-limit",
+        "--codex-bin",
+        "--codex-model",
+        "--codex-home",
     }
     unknown = unknown_flags(argv, allowed)
     if unknown:
@@ -6785,6 +6978,41 @@ def command_curator_install(argv: list[str]) -> int:
     max_runtime_seconds, max_runtime_error = parse_duration_arg(argv, "--max-runtime", "5m")
     if max_runtime_error is not None:
         return write_stderr(f"Error: {max_runtime_error}\nCode: INVALID_ARG\n")
+    grind_server_text = arg_value(argv, "--grind-server")
+    grind_config = None
+    if grind_server_text is not None:
+        grind_server = Path(grind_server_text).expanduser()
+        if not grind_server.exists() or not grind_server.is_dir():
+            return write_stderr("Error: --grind-server must point to an existing grind-window server directory\nCode: INVALID_ARG\n")
+        if not (grind_server / "package.json").exists():
+            return write_stderr("Error: --grind-server must contain package.json\nCode: INVALID_ARG\n")
+        grind_db = Path(arg_value(argv, "--grind-db") or str(grind_server / "data" / "grind.db")).expanduser()
+        if not grind_db.exists():
+            return write_stderr("Error: --grind-db must point to an existing grind.db\nCode: INVALID_ARG\n")
+        prompt_version = (arg_value(argv, "--prompt-version") or "curator-v3").strip()
+        if not prompt_version or contains_credential_shape(prompt_version):
+            return write_stderr("Error: --prompt-version must be non-empty and non-secret\nCode: INVALID_ARG\n")
+        queue_fill_limit, queue_fill_error = parse_positive_int_arg(argv, "--queue-fill-limit")
+        if queue_fill_error is not None:
+            return write_stderr(f"Error: {queue_fill_error}\nCode: INVALID_ARG\n")
+        codex_bin = arg_value(argv, "--codex-bin")
+        codex_model = arg_value(argv, "--codex-model")
+        codex_home = arg_value(argv, "--codex-home")
+        for flag, value in (("--codex-bin", codex_bin), ("--codex-model", codex_model), ("--codex-home", codex_home)):
+            if value is not None and (not value.strip() or contains_credential_shape(value)):
+                return write_stderr(f"Error: {flag} must be non-empty and non-secret\nCode: INVALID_ARG\n")
+        grind_config = {
+            "grind_server": str(grind_server.resolve()),
+            "grind_db_path": str(grind_db.resolve()),
+            "prompt_version": prompt_version,
+            "queue_fill_limit": queue_fill_limit or max(batch_size, 10),
+        }
+        if codex_bin is not None:
+            grind_config["codex_bin"] = codex_bin.strip()
+        if codex_model is not None:
+            grind_config["codex_model"] = codex_model.strip()
+        if codex_home is not None:
+            grind_config["codex_home"] = str(Path(codex_home).expanduser())
     next_fire_at = schedule_time_from_args(argv) or current_timestamp()
     watch_entries, counters, watch_error = load_curator_watch_entries(
         arg_value(argv, "--source-config"),
@@ -6831,7 +7059,7 @@ def command_curator_install(argv: list[str]) -> int:
             existing_profile["avatar_url"] = record.get("avatar_url")
             existing_profile["avatar_file"] = None
         destination = state_dir() / workspace_path
-        write_curator_seed_workspace(record, destination, watch_entries, counters, report_target, batch_size, max_runtime_seconds)
+        write_curator_seed_workspace(record, destination, watch_entries, counters, report_target, batch_size, max_runtime_seconds, grind_config)
         blocked = curator_seed_has_blocked_material(destination)
         if blocked is not None:
             return write_stderr(f"Error: curator seed scrub gate failed: {blocked}\nCode: SEED_SCRUB_FAILED\n")
@@ -6890,6 +7118,7 @@ def command_curator_install(argv: list[str]) -> int:
         return write_stdout(
             f"Curator @{name} installed.\n"
             f"Workspace: {destination}\n"
+            f"Mode: {'grind-db' if grind_config is not None else 'workspace-json'}\n"
             f"Watch entries: {len(watch_entries)}\n"
             "Scrub gate: credentials=0 other_people_dm_originals=0 owner_sensitive=0\n"
             f"Batch size: {batch_size}\n"
