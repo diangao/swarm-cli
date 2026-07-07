@@ -5210,9 +5210,17 @@ def credential_shape_re() -> re.Pattern[str]:
     token_kinds = ("agent", "machine", "proj", "live", "test")
     token_prefix = "sk" + "_(?:" + "|".join(token_kinds) + ")" + "_"
     app_prefix = "xapp" + "-"
+    anthropic_prefix = "sk" + "-ant-"
+    openai_prefix = "sk" + "-"
+    aws_prefix = "AK" + "IA"
+    pem_header = "-----BEGIN" + " [A-Z0-9 ]*PRIVATE KEY-----"
     return re.compile(
         r"(?:" + token_prefix + r"[A-Za-z0-9_-]{4,}|xox[baprs]-[A-Za-z0-9-]{8,}|"
-        + app_prefix + r"[A-Za-z0-9-]{8,}|Bearer [A-Za-z0-9._-]{20,})"
+        + app_prefix + r"[A-Za-z0-9-]{8,}|Bearer [A-Za-z0-9._-]{20,}|"
+        + anthropic_prefix + r"[A-Za-z0-9_-]{8,}|"
+        + openai_prefix + r"[A-Za-z0-9]{20,}|"
+        + aws_prefix + r"[0-9A-Z]{16}|"
+        + pem_header + r")"
     )
 
 
