@@ -3015,6 +3015,169 @@ def probe_slack_daemon_event_loop(cli: Path, state_dir: Path) -> None:
         conn.close()
 
 
+def register_probe_agent(cli: Path, state_dir: Path, name: str) -> None:
+    run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        name,
+        "--display-name",
+        name.title(),
+        "--runtime",
+        "codex",
+        "--workspace",
+        f"agents/{name}",
+    )
+
+
+def daemon_wake_row(state_dir: Path, agent_name: str) -> sqlite3.Row | None:
+    conn = connect_state(state_dir)
+    try:
+        return conn.execute(
+            "SELECT * FROM daemon_wakes WHERE agent_name = ?",
+            (agent_name,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def daemon_event_details(state_dir: Path, event_name: str) -> list[dict[str, object]]:
+    conn = connect_state(state_dir)
+    try:
+        rows = conn.execute(
+            "SELECT detail FROM daemon_events WHERE event = ? ORDER BY ordinal",
+            (event_name,),
+        ).fetchall()
+    finally:
+        conn.close()
+    decoded: list[dict[str, object]] = []
+    for row in rows:
+        try:
+            detail = json.loads(row["detail"])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(detail, dict):
+            decoded.append(detail)
+    return decoded
+
+
+def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
+    workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    bot_token_env = f"SWARM_SLACK_ROUTER_BOT_{uuid.uuid4().hex[:8].upper()}"
+    app_token_env = f"SWARM_SLACK_ROUTER_APP_{uuid.uuid4().hex[:8].upper()}"
+    register_probe_agent(cli, state_dir, "ryo")
+    register_probe_agent(cli, state_dir, "dozy")
+    run(
+        cli,
+        state_dir,
+        "slack",
+        "configure",
+        "--workspace",
+        workspace,
+        "--bot-token-env",
+        bot_token_env,
+        "--app-token-env",
+        app_token_env,
+        "--mode",
+        "socket_mode",
+    )
+
+    def slack_frame(text: str, slack_ts: str) -> dict[str, object]:
+        return {
+            "type": "events_api",
+            "payload": {
+                "team_id": workspace,
+                "event": {
+                    "type": "message",
+                    "channel": channel_id,
+                    "user": "UROUTER",
+                    "text": text,
+                    "ts": slack_ts,
+                },
+            },
+            "envelope_id": f"env-{uuid.uuid4().hex}",
+        }
+
+    root_ts = f"1762200000.{uuid.uuid4().int % 1_000_000:06d}"
+    miss_ts = f"1762200001.{uuid.uuid4().int % 1_000_000:06d}"
+    second_ts = f"1762200002.{uuid.uuid4().int % 1_000_000:06d}"
+    mock_socket = state_dir / "slack-router-mock.jsonl"
+    mock_socket.write_text(
+        "\n".join(
+            [
+                json.dumps(slack_frame(f"hello @ryo route this {uuid.uuid4()}", root_ts)),
+                json.dumps(slack_frame(f"hello @unknown-agent miss this {uuid.uuid4()}", miss_ts)),
+                json.dumps(slack_frame(f"second @ryo event while running {uuid.uuid4()}", second_ts)),
+            ]
+        )
+        + "\n"
+    )
+    routed = run(
+        cli,
+        state_dir,
+        "daemon",
+        "slack",
+        "--workspace",
+        workspace,
+        "--mock-socket-file",
+        str(mock_socket),
+        env_overrides={app_token_env: f"{'xapp'}-probe-{uuid.uuid4()}"},
+    ).stdout
+    require("Slack daemon processed 3 event frame(s)." in routed, "daemon router did not process three mock frames")
+
+    ryo_wake = daemon_wake_row(state_dir, "ryo")
+    require(ryo_wake is not None, "mention did not create a daemon wake row for ryo")
+    require(int(ryo_wake["running"]) == 1, "first mention did not start ryo turn")
+    require(int(ryo_wake["active_wake_count"]) == 1, "ryo active wake count should start at one")
+    require(int(ryo_wake["pending_count"]) == 1, "second ryo event should become one pending marker")
+    dozy_wake = daemon_wake_row(state_dir, "dozy")
+    require(dozy_wake is None, "message for ryo should not wake dozy")
+    misses = daemon_event_details(state_dir, "wake_route_miss")
+    require(any(detail.get("reason") == "mention" for detail in misses), "unregistered @mention did not log route miss")
+
+    listed = run(cli, state_dir, "daemon", "wakes", "--agent", "ryo").stdout
+    require("@ryo running active_turns=1" in listed, "daemon wakes did not render running ryo state")
+    require("pending=1 mention/" in listed, "daemon wakes did not render pending marker")
+    first_finish = run(cli, state_dir, "daemon", "finish-turn", "--agent", "ryo").stdout
+    require("Daemon turn finished for @ryo: promoted." in first_finish, "finish-turn did not promote pending marker")
+    promoted = daemon_wake_row(state_dir, "ryo")
+    require(promoted is not None and int(promoted["running"]) == 1, "promoted ryo wake should still be running")
+    require(int(promoted["active_wake_count"]) == 2, "pending wake was not promoted to second active turn")
+    require(int(promoted["pending_count"]) == 0, "pending marker was not cleared on promotion")
+    second_finish = run(cli, state_dir, "daemon", "finish-turn", "--agent", "ryo").stdout
+    require("Daemon turn finished for @ryo: idle." in second_finish, "second finish did not idle ryo")
+    idle = daemon_wake_row(state_dir, "ryo")
+    require(idle is not None and int(idle["running"]) == 0, "ryo wake should be idle after second finish")
+
+    reminder_title = f"wake reminder {uuid.uuid4()}"
+    scheduled = run(
+        cli,
+        state_dir,
+        "reminder",
+        "schedule",
+        "--target",
+        "dm:@dozy",
+        "--title",
+        reminder_title,
+        "--in",
+        "0s",
+    ).stdout
+    reminder_id = parse_reminder_id(scheduled)
+    run(cli, state_dir, "daemon", "run", "--once")
+    dozy_after = daemon_wake_row(state_dir, "dozy")
+    require(dozy_after is not None, "due reminder did not wake author agent")
+    require(int(dozy_after["running"]) == 1, "reminder wake did not start dozy turn")
+    require(dozy_after["active_reason"] == "reminder", "reminder wake did not use reminder reason")
+    reminder_routes = daemon_event_details(state_dir, "wake_route")
+    require(
+        any(detail.get("source") == "reminder" and detail.get("reminder_id") == reminder_id for detail in reminder_routes),
+        "reminder wake did not route through daemon wake path",
+    )
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -3042,8 +3205,9 @@ def main() -> int:
         probe_action_prepare(cli, state_dir)
         probe_slack_adapter(cli, state_dir)
         probe_slack_daemon_event_loop(cli, state_dir)
+        probe_daemon_wake_router(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, and Slack daemon Socket Mode ingest/replay idempotence")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, and daemon wake router single-flight/reminder routing")
     return 0
 
 
