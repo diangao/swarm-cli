@@ -4132,15 +4132,18 @@ prompt = os.environ["CURATOR_PROMPT_VERSION"]
 batch = int(os.environ["CURATOR_BATCH"])
 workspace = Path(os.environ["CURATOR_AGENT_WORKSPACE"])
 workspace.mkdir(parents=True, exist_ok=True)
+heartbeat_path = Path(os.environ["CURATOR_HEARTBEAT_PATH"])
 (workspace / "mock-env.json").write_text(json.dumps({
     "worker": os.environ["CURATOR_WORKER_ID"],
     "batch": os.environ["CURATOR_BATCH"],
     "queue_fill_limit": os.environ["CURATOR_QUEUE_FILL_LIMIT"],
     "prompt": prompt,
+    "heartbeat_path": str(heartbeat_path),
 }, sort_keys=True) + "\\n", encoding="utf-8")
 
 conn = sqlite3.connect(db_path, timeout=5.0)
 conn.row_factory = sqlite3.Row
+completed = 0
 try:
     conn.execute("BEGIN IMMEDIATE")
     rows = conn.execute(
@@ -4160,9 +4163,16 @@ try:
             "UPDATE curator_jobs SET status = 'done', processed_at = ?, updated_at = ? WHERE id = ?",
             ("2026-07-07T18:02:00Z", "2026-07-07T18:02:00Z", row["id"]),
         )
+        completed += 1
     conn.commit()
 finally:
     conn.close()
+heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+heartbeat_path.write_text(json.dumps({
+    "status": "completed",
+    "claimed": len(rows),
+    "completed": completed,
+}, sort_keys=True) + "\\n", encoding="utf-8")
 """
     )
     worker.chmod(0o755)
@@ -4234,6 +4244,7 @@ finally:
         "batch": "1",
         "queue_fill_limit": "7",
         "prompt": "test-prompt",
+        "heartbeat_path": str((workspace / "runtime" / "grind-codex-workspace" / "heartbeat.json").resolve()),
     }, f"grind curator worker env mismatch: {env_snapshot}")
 
     conn = sqlite3.connect(db_path)
@@ -4254,11 +4265,140 @@ finally:
         "before unqueued=1 pending=1 claimed=0 done=0 failed=0 canceled=0",
         "after unqueued=1 pending=0 claimed=0 done=1 failed=0 canceled=0",
         "delta done=1 failed=0 canceled=0 pending=-1 unqueued=0",
+        "heartbeat status=completed claimed=1 completed=1",
     ]
     for line in expected_lines:
         require(line in history, f"grind curator true-DB report missing line: {line}")
     turn_list = run(cli, state_dir, "daemon", "turn", "list", "--status", "done").stdout
     require(f"@{agent} status=done" in turn_list, "grind curator turn missing from done turn list")
+
+    fail_agent = f"grind-curator-fail-{uuid.uuid4().hex[:8]}"
+    fail_report_target = f"#grind-curator-fail-{uuid.uuid4().hex[:8]}"
+    fail_server = state_dir / "mock-grind-server-fail"
+    fail_server.mkdir()
+    fail_db_path = fail_server / "grind.db"
+    conn = sqlite3.connect(fail_db_path)
+    try:
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE processed_cards (
+                  id INTEGER PRIMARY KEY,
+                  enriched_at TEXT,
+                  enrich_status TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE curator_jobs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  card_id INTEGER NOT NULL,
+                  prompt_version TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  claimed_by TEXT,
+                  claimed_at TEXT,
+                  processed_at TEXT,
+                  error TEXT,
+                  updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO processed_cards (id, enriched_at, enrich_status) VALUES (1, NULL, 'pending')"
+            )
+            conn.execute(
+                """
+                INSERT INTO curator_jobs (card_id, prompt_version, status, updated_at)
+                VALUES (1, 'test-prompt', 'pending', ?)
+                """,
+                (now,),
+            )
+    finally:
+        conn.close()
+    fail_worker = fail_server / "mock_curator_worker.py"
+    fail_worker.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+
+heartbeat_path = Path(os.environ["CURATOR_HEARTBEAT_PATH"])
+heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+heartbeat_path.write_text(json.dumps({
+    "status": "error",
+    "claimed": [1],
+    "completed": 0,
+    "error": "Codex exited 2",
+}, sort_keys=True) + "\\n", encoding="utf-8")
+"""
+    )
+    fail_worker.chmod(0o755)
+    (fail_server / "package.json").write_text(
+        json.dumps({"scripts": {"curator:codex": f"{sys.executable} mock_curator_worker.py"}}, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    run(
+        cli,
+        state_dir,
+        "curator",
+        "install",
+        "--name",
+        fail_agent,
+        "--display-name",
+        "Failing Grind Curator",
+        "--source-config",
+        str(sources_path),
+        "--report-target",
+        fail_report_target,
+        "--batch-size",
+        "1",
+        "--cadence",
+        "1h",
+        "--at",
+        "2000-01-01T00:00:00",
+        "--max-runtime",
+        "10s",
+        "--grind-server",
+        str(fail_server),
+        "--grind-db",
+        str(fail_db_path),
+        "--prompt-version",
+        "test-prompt",
+        "--queue-fill-limit",
+        "1",
+    )
+    failed_turn = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        fail_agent,
+        "--input",
+        "manual",
+        "--target",
+        fail_report_target,
+        "--session-id",
+        "fail-smoke",
+        "--timeout",
+        "15s",
+        expected=1,
+    )
+    require("Code: TURN_FAILED" in failed_turn.stderr, "heartbeat error did not fail daemon turn")
+    fail_history = run(cli, state_dir, "message", "read", "--channel", fail_report_target).stdout
+    for line in (
+        "grind curator batch: true_db=1 prompt=test-prompt",
+        "exit=0 violations=0",
+        "heartbeat status=error claimed=1 completed=0",
+        "worker_status=heartbeat_error",
+    ):
+        require(line in fail_history, f"heartbeat error report missing line: {line}")
+    failed_turns = run(cli, state_dir, "daemon", "turn", "list", "--status", "failed").stdout
+    require(f"@{fail_agent} status=failed" in failed_turns, "heartbeat error turn missing from failed turn list")
 
 
 def main() -> int:
