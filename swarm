@@ -6728,6 +6728,19 @@ def fmt_stats(stats):
     )
 
 
+def int_value(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def claimed_count(value):
+    if isinstance(value, list):
+        return len(value)
+    return int_value(value)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", default="")
@@ -6743,12 +6756,18 @@ def main():
     batch_size = int(config.get("batch_size", 10))
     queue_fill_limit = int(config.get("queue_fill_limit", max(batch_size, 10)))
     max_runtime_seconds = float(config.get("max_runtime_seconds", 300))
+    worker_workspace = workspace / "runtime" / "grind-codex-workspace"
+    heartbeat_path = worker_workspace / "heartbeat.json"
     if not server_dir.exists():
         raise SystemExit(f"grind server path missing: {server_dir}")
     if not db_path.exists():
         raise SystemExit(f"grind db path missing: {db_path}")
 
     before = stats_for(db_path, prompt_version)
+    try:
+        heartbeat_path.unlink()
+    except FileNotFoundError:
+        pass
     env = os.environ.copy()
     env.update(
         {
@@ -6757,7 +6776,8 @@ def main():
             "CURATOR_BATCH": str(batch_size),
             "CURATOR_QUEUE_FILL_LIMIT": str(queue_fill_limit),
             "CURATOR_PROMPT_VERSION": prompt_version,
-            "CURATOR_AGENT_WORKSPACE": str(workspace / "runtime" / "grind-codex-workspace"),
+            "CURATOR_AGENT_WORKSPACE": str(worker_workspace),
+            "CURATOR_HEARTBEAT_PATH": str(heartbeat_path),
             "CURATOR_CODEX_TIMEOUT_MS": str(max(1000, int(max_runtime_seconds * 1000))),
         }
     )
@@ -6793,7 +6813,14 @@ def main():
     after = stats_for(db_path, prompt_version)
     delta = {key: after.get(key, 0) - before.get(key, 0) for key in after}
     contract_violations = max(0, delta.get("failed", 0))
-    effective_exit = worker_exit if worker_exit != 0 else (2 if contract_violations else 0)
+    heartbeat = load_json(heartbeat_path, {}) if heartbeat_path.exists() else {}
+    heartbeat_status = str(heartbeat.get("status") or "missing")
+    heartbeat_claimed = claimed_count(heartbeat.get("claimed"))
+    heartbeat_completed = int_value(heartbeat.get("completed"))
+    heartbeat_error = heartbeat_status == "error"
+    heartbeat_no_progress = heartbeat_claimed > 0 and heartbeat_completed == 0
+    heartbeat_violation = heartbeat_error or heartbeat_no_progress
+    effective_exit = worker_exit if worker_exit != 0 else (2 if contract_violations or heartbeat_violation else 0)
     report = (
         f"grind curator batch: true_db=1 prompt={prompt_version} worker=@{agent} "
         f"exit={worker_exit} violations={contract_violations}\n"
@@ -6801,7 +6828,8 @@ def main():
         f"after {fmt_stats(after)}\n"
         f"delta done={delta.get('done', 0)} failed={delta.get('failed', 0)} "
         f"canceled={delta.get('canceled', 0)} pending={delta.get('pending', 0)} "
-        f"unqueued={delta.get('unqueued', 0)}"
+        f"unqueued={delta.get('unqueued', 0)}\n"
+        f"heartbeat status={heartbeat_status} claimed={heartbeat_claimed} completed={heartbeat_completed}"
     )
     if timed_out:
         report += "\nworker_status=timeout"
@@ -6809,6 +6837,10 @@ def main():
         report += "\nworker_status=spawn_failed"
     elif worker_exit != 0:
         report += "\nworker_status=nonzero"
+    elif heartbeat_error:
+        report += "\nworker_status=heartbeat_error"
+    elif heartbeat_no_progress:
+        report += "\nworker_status=heartbeat_no_progress"
     elif contract_violations:
         report += "\nworker_status=failed_jobs"
     send_report(report_target, agent, report)
@@ -6818,6 +6850,10 @@ def main():
         sys.stderr.write(f"curator worker spawn failed: {spawn_error}\n")
     elif completed is not None and worker_exit != 0:
         sys.stderr.write(completed.stderr or completed.stdout)
+    elif heartbeat_error:
+        sys.stderr.write("curator worker heartbeat status=error\n")
+    elif heartbeat_no_progress:
+        sys.stderr.write("curator worker claimed jobs without completing any\n")
     elif contract_violations:
         sys.stderr.write("curator worker produced failed jobs\n")
     return effective_exit
