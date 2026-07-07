@@ -3136,15 +3136,17 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
     require(ryo_wake is not None, "mention did not create a daemon wake row for ryo")
     require(int(ryo_wake["running"]) == 1, "first mention did not start ryo turn")
     require(int(ryo_wake["active_wake_count"]) == 1, "ryo active wake count should start at one")
-    require(int(ryo_wake["pending_count"]) == 1, "second ryo event should become one pending marker")
+    require(int(ryo_wake["pending_count"]) == 2, "attention + second mention should batch into ryo pending markers")
     dozy_wake = daemon_wake_row(state_dir, "dozy")
-    require(dozy_wake is None, "message for ryo should not wake dozy")
+    require(dozy_wake is not None and int(dozy_wake["running"]) == 1, "attention routing did not wake dozy")
+    require(dozy_wake["active_reason"] == "attention", "dozy wake should carry attention reason")
+    require(int(dozy_wake["pending_count"]) == 2, "later frames should batch into dozy pending markers")
     misses = daemon_event_details(state_dir, "wake_route_miss")
     require(any(detail.get("reason") == "mention" for detail in misses), "unregistered @mention did not log route miss")
 
     listed = run(cli, state_dir, "daemon", "wakes", "--agent", "ryo").stdout
     require("@ryo running active_turns=1" in listed, "daemon wakes did not render running ryo state")
-    require("pending=1 mention/" in listed, "daemon wakes did not render pending marker")
+    require("pending=2 mention/" in listed, "daemon wakes did not render pending marker")
     first_finish = run(cli, state_dir, "daemon", "finish-turn", "--agent", "ryo").stdout
     require("Daemon turn finished for @ryo: promoted." in first_finish, "finish-turn did not promote pending marker")
     promoted = daemon_wake_row(state_dir, "ryo")
@@ -3155,6 +3157,12 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
     require("Daemon turn finished for @ryo: idle." in second_finish, "second finish did not idle ryo")
     idle = daemon_wake_row(state_dir, "ryo")
     require(idle is not None and int(idle["running"]) == 0, "ryo wake should be idle after second finish")
+
+    # Drain dozy's attention wakes so the reminder section observes a fresh wake.
+    run(cli, state_dir, "daemon", "finish-turn", "--agent", "dozy")
+    run(cli, state_dir, "daemon", "finish-turn", "--agent", "dozy")
+    dozy_idle = daemon_wake_row(state_dir, "dozy")
+    require(dozy_idle is not None and int(dozy_idle["running"]) == 0, "dozy attention wakes did not drain to idle")
 
     reminder_title = f"wake reminder {uuid.uuid4()}"
     scheduled = run(
@@ -3562,6 +3570,58 @@ def agent_presence_row(state_dir: Path, agent_name: str) -> sqlite3.Row | None:
         ).fetchone()
     finally:
         conn.close()
+
+
+def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
+    silent_agent = f"att-silent-{uuid.uuid4().hex[:6]}"
+    vocal_agent = f"att-vocal-{uuid.uuid4().hex[:6]}"
+    silent_rt = state_dir / "att-silent-rt.py"
+    silent_rt.write_text("import sys\nsys.stdin.read()\nprint('SILENT')\n")
+    vocal_rt = state_dir / "att-vocal-rt.py"
+    vocal_rt.write_text("import sys\npayload = sys.stdin.read()\nassert '[attention wake]' in payload\nprint('attention reply: noted')\n")
+    for name, rt in ((silent_agent, silent_rt), (vocal_agent, vocal_rt)):
+        run(
+            cli, state_dir, "agent", "register",
+            "--name", name, "--display-name", name,
+            "--runtime", f"{sys.executable} {rt}",
+            "--workspace", f"agents/{name}",
+        )
+    workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    bot_env = f"ATT_BOT_{uuid.uuid4().hex[:6].upper()}"
+    app_env = f"ATT_APP_{uuid.uuid4().hex[:6].upper()}"
+    run(cli, state_dir, "slack", "configure", "--workspace", workspace, "--bot-token-env", bot_env, "--app-token-env", app_env, "--mode", "socket_mode")
+    mock = state_dir / "att-mock.jsonl"
+    mock.write_text(json.dumps({
+        "type": "events_api",
+        "payload": {"team_id": workspace, "event": {"type": "message", "channel": channel_id, "user": "UATTN", "text": f"no mention here {uuid.uuid4()}", "ts": f"1762400000.{uuid.uuid4().int % 1_000_000:06d}"}},
+        "envelope_id": f"env-{uuid.uuid4().hex}",
+    }) + "\n")
+    resident = run(
+        cli, state_dir, "daemon", "resident",
+        "--workspace", workspace, "--mock-socket-file", str(mock),
+        "--loops", "4", "--idle-interval", "0s", "--turn-timeout", "10s",
+        env_overrides={app_env: "xapp" + "-att-probe"},
+    ).stdout
+    require("Resident daemon stopped after 4 iteration(s)" in resident, "attention resident run did not finish")
+
+    routes = daemon_event_details(state_dir, "wake_route")
+    attention_agents = {
+        r.get("agent")
+        for detail in routes
+        for r in detail.get("routes", [])
+        if r.get("reason") == "attention"
+    }
+    require(
+        attention_agents >= {silent_agent, vocal_agent},
+        "attention routing did not wake both non-mentioned agents",
+    )
+    silents = daemon_event_details(state_dir, "turn_silent")
+    require(any(d.get("agent") == silent_agent for d in silents), "SILENT turn was not recorded in ledger")
+    target = f"#slack-{channel_id.lower()}"
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require("attention reply: noted" in history, "vocal attention agent reply was not appended")
+    require(f"@{silent_agent}" not in history, "SILENT output leaked into the channel")
 
 
 def probe_daemon_resident(cli: Path, state_dir: Path) -> None:
@@ -4019,9 +4079,10 @@ def main() -> int:
         probe_daemon_dispatch_lease(cli, state_dir)
         probe_daemon_turn_runner(cli, state_dir)
         probe_daemon_resident(cli, state_dir)
+        probe_attention_wakes(cli, state_dir)
         probe_curator_workload(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, resident daemon presence/worker-retirement, and curator seed/schedule/queue-writeback workload")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, resident daemon presence/worker-retirement, attention wake-all/SILENT convention, and curator seed/schedule/queue-writeback workload")
     return 0
 
 

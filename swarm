@@ -3011,10 +3011,11 @@ def finish_daemon_wake(state: dict[str, Any], agent_name: str) -> tuple[str | No
 
 def route_message_wakes(state: dict[str, Any], record: dict[str, Any]) -> list[dict[str, str]]:
     routed: list[dict[str, str]] = []
-    for agent_name in mentioned_agent_names(state, str(record.get("body", ""))):
+    mentioned = mentioned_agent_names(state, str(record.get("body", "")))
+    for agent_name in mentioned:
         status = enqueue_daemon_wake(state, agent_name, "mention", str(record["id"]))
         routed.append({"agent": agent_name, "status": status, "reason": "mention"})
-    if not routed and "@" in str(record.get("body", "")):
+    if not mentioned and "@" in str(record.get("body", "")):
         append_daemon_event(
             state,
             "wake_route_miss",
@@ -3024,6 +3025,17 @@ def route_message_wakes(state: dict[str, Any], record: dict[str, Any]) -> list[d
                 "target": record["target"],
             },
         )
+    # Slock-parity attention: every human channel message wakes every other
+    # registered agent; the reply/silence judgment lives in the agent turn
+    # (SILENT convention), not in the router.
+    author = str(record.get("author") or "")
+    if str(record.get("type") or "") == "human" or author.startswith("slack:"):
+        for agent in state.get("agents", []):
+            agent_name = str(agent["name"])
+            if agent_name in mentioned or agent_name == author:
+                continue
+            status = enqueue_daemon_wake(state, agent_name, "attention", str(record["id"]))
+            routed.append({"agent": agent_name, "status": status, "reason": "attention"})
     return routed
 
 
@@ -5367,6 +5379,12 @@ def prepare_daemon_turn(
                 input_message_id = str(active_record["id"])
                 if target is None:
                     target = str(active_record["target"])
+                if wake.get("active_reason") == "attention":
+                    input_text = (
+                        "[attention wake] New channel message below. You were not mentioned. "
+                        "Reply ONLY if you are addressed implicitly or have something genuinely useful to add; "
+                        "otherwise output exactly SILENT and nothing else.\n\n" + input_text
+                    )
         session_id = explicit_session_id or payload_fields.get("session_id")
         prior_done_sessions = [
             str(item["session_id"])
@@ -5482,8 +5500,11 @@ def finalize_daemon_turn(
         turn["stderr_text"] = stderr_text
         turn["error"] = effective_error
         message_id = None
-        if dispatch_error is None and status == "done" and target and stdout_text and stdout_text.strip():
-            record = append_message(state, target, stdout_text.strip(), author=agent_name)
+        stdout_clean = (stdout_text or "").strip()
+        if stdout_clean == "SILENT":
+            append_daemon_event(state, "turn_silent", {"id": turn_id, "agent": agent_name})
+        elif dispatch_error is None and status == "done" and target and stdout_clean:
+            record = append_message(state, target, stdout_clean, author=agent_name)
             message_id = record["id"]
         event_name = "turn_completed" if effective_status == "done" else "turn_failed"
         append_daemon_event(
