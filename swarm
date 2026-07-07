@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import uuid
 import hashlib
 import json
@@ -5869,18 +5870,29 @@ def command_daemon_resident(argv: list[str]) -> int:
     mock_consumed = False
     failure_streaks: dict[str, int] = {}
     quarantined: set[str] = set()
+    socket_thread: threading.Thread | None = None
+    socket_thread_lost = False
+    if workspace and mock_file is None:
+        # The live Socket Mode loop never returns while the connection is
+        # healthy, so it owns a background thread; the scheduler loop below
+        # keeps running reminders and wake consumption in parallel. Both
+        # sides serialize through per-call SQLite connections.
+        socket_thread = threading.Thread(
+            target=command_daemon_slack,
+            args=(["--workspace", workspace, "--socket-timeout", socket_window],),
+            name="slack-socket-loop",
+            daemon=True,
+        )
+        socket_thread.start()
     try:
         while loops == 0 or iterations < loops:
             iterations += 1
             if workspace and mock_file and not mock_consumed:
                 mock_consumed = True
                 command_daemon_slack(["--workspace", workspace, "--mock-socket-file", mock_file])
-            elif workspace and mock_file is None:
-                command_daemon_slack([
-                    "--workspace", workspace,
-                    "--max-events", max_events,
-                    "--socket-timeout", socket_window,
-                ])
+            if socket_thread is not None and not socket_thread.is_alive() and not socket_thread_lost:
+                socket_thread_lost = True
+                daemon_record_event("resident_socket_thread_exited", {"workspace": workspace or ""})
             process_due_reminders_once()
             for agent_name in agents_with_active_wakes():
                 if agent_name in quarantined:
