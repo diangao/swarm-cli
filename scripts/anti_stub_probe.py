@@ -2025,6 +2025,8 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
     require(f"Worker heartbeat recorded for @{name}" in worker_once, "agent worker once did not record heartbeat")
     worker_unknown = run(cli, state_dir, "agent", "worker", "--name", name, "--bogus", expected=1).stderr
     require("unknown agent worker flag: --bogus" in worker_unknown, "agent worker did not reject unknown flags")
+    worker_loop = run(cli, state_dir, "agent", "worker", "--name", name, expected=1).stderr
+    require("WORKER_RETIRED" in worker_loop and "daemon resident" in worker_loop, "agent worker loop mode was not retired")
 
     heartbeat = run(
         cli,
@@ -2049,7 +2051,8 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
     plans = [json.loads(line) for line in supervisor.splitlines() if line.startswith("{")]
     require(len(plans) == 1, "agent supervisor plan did not render one plan")
     require(plans[0]["agent"] == name and plans[0]["workspace"] == f"agents/{name}", "agent supervisor plan fields mismatch")
-    require("worker_command" in plans[0] and "agent worker --name curator" in plans[0]["worker_command"], "agent supervisor plan missing worker command")
+    require("worker_command" in plans[0] and plans[0]["worker_command"] == "swarm daemon resident", "agent supervisor plan should point at the resident daemon")
+    require("one resident daemon" in plans[0].get("supervisor_policy", ""), "agent supervisor plan policy should describe the single resident daemon")
     require("No worker process was started" in supervisor, "agent supervisor plan did not state no-start boundary")
     supervisor_unknown = run(cli, state_dir, "agent", "supervisor-plan", "--bogus", expected=1).stderr
     require(
@@ -3550,6 +3553,131 @@ def probe_daemon_turn_runner(cli: Path, state_dir: Path) -> None:
     require("exit=1" in failed_turns, "expired lease turn did not persist nonzero effective exit")
 
 
+def agent_presence_row(state_dir: Path, agent_name: str) -> sqlite3.Row | None:
+    conn = connect_state(state_dir)
+    try:
+        return conn.execute(
+            "SELECT presence, presence_updated_at, last_turn_at FROM agents WHERE name = ?",
+            (agent_name,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def probe_daemon_resident(cli: Path, state_dir: Path) -> None:
+    agent = f"resident-{uuid.uuid4().hex[:8]}"
+    runtime = state_dir / "resident-runtime.py"
+    runtime.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "payload = sys.stdin.read()",
+                "print('resident turn ok: ' + payload[:40])",
+            ]
+        )
+        + "\n"
+    )
+    runtime.chmod(0o755)
+    run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        agent,
+        "--display-name",
+        "Resident Probe",
+        "--runtime",
+        f"{sys.executable} {runtime}",
+        "--workspace",
+        f"agents/{agent}",
+    )
+    row = agent_presence_row(state_dir, agent)
+    require(row is not None and row["presence"] == "offline", "freshly registered agent should be offline")
+
+    unknown = run(cli, state_dir, "daemon", "resident", "--bogus", expected=1).stderr
+    require("unknown daemon resident flag: --bogus" in unknown, "daemon resident did not reject unknown flags")
+    bad_loops = run(cli, state_dir, "daemon", "resident", "--loops", "0", expected=1).stderr
+    require("must be a positive integer" in bad_loops, "daemon resident accepted --loops 0")
+
+    workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    bot_token_env = f"SWARM_RES_BOT_{uuid.uuid4().hex[:8].upper()}"
+    app_token_env = f"SWARM_RES_APP_{uuid.uuid4().hex[:8].upper()}"
+    run(
+        cli,
+        state_dir,
+        "slack",
+        "configure",
+        "--workspace",
+        workspace,
+        "--bot-token-env",
+        bot_token_env,
+        "--app-token-env",
+        app_token_env,
+        "--mode",
+        "socket_mode",
+    )
+    mock_socket = state_dir / "resident-mock.jsonl"
+    mock_socket.write_text(
+        json.dumps(
+            {
+                "type": "events_api",
+                "payload": {
+                    "team_id": workspace,
+                    "event": {
+                        "type": "message",
+                        "channel": channel_id,
+                        "user": "URESIDENT",
+                        "text": f"hello @{agent} resident {uuid.uuid4()}",
+                        "ts": f"1762300100.{uuid.uuid4().int % 1_000_000:06d}",
+                    },
+                },
+                "envelope_id": f"env-{uuid.uuid4().hex}",
+            }
+        )
+        + "\n"
+    )
+    resident_out = run(
+        cli,
+        state_dir,
+        "daemon",
+        "resident",
+        "--workspace",
+        workspace,
+        "--mock-socket-file",
+        str(mock_socket),
+        "--loops",
+        "2",
+        "--idle-interval",
+        "0s",
+        "--turn-timeout",
+        "5s",
+        env_overrides={app_token_env: "xapp" + "-probe-resident"},
+    ).stdout
+    require("Resident daemon stopped after 2 iteration(s)" in resident_out, "resident daemon did not report its run")
+    require(" 0 turn(s)" not in resident_out, "resident daemon ran no turns despite a pending wake")
+
+    row = agent_presence_row(state_dir, agent)
+    require(row is not None and row["presence"] == "offline", "presence should go offline when resident daemon stops")
+    require(row["presence_updated_at"], "presence_updated_at should be stamped by the resident daemon")
+    require(row["last_turn_at"], "last_turn_at should be stamped after a resident-run turn")
+
+    wake = daemon_wake_row(state_dir, agent)
+    require(wake is not None and int(wake["running"]) == 0, "resident daemon did not consume the wake to idle")
+
+    started = daemon_event_details(state_dir, "resident_started")
+    stopped = daemon_event_details(state_dir, "resident_stopped")
+    turns = daemon_event_details(state_dir, "resident_turn")
+    require(len(started) >= 1 and len(stopped) >= 1, "resident lifecycle events missing")
+    require(any(item.get("agent") == agent and item.get("ok") for item in turns), "resident_turn event missing or not ok")
+
+    turn_list = run(cli, state_dir, "daemon", "turn", "list", "--status", "done").stdout
+    require(f"@{agent} status=done" in turn_list, "resident-run turn missing from turn list")
+    agent_list = run(cli, state_dir, "agent", "list").stdout
+    require(f"@{agent}" in agent_list and "presence=offline" in agent_list, "agent list does not render presence")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -3580,8 +3708,9 @@ def main() -> int:
         probe_daemon_wake_router(cli, state_dir)
         probe_daemon_dispatch_lease(cli, state_dir)
         probe_daemon_turn_runner(cli, state_dir)
+        probe_daemon_resident(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, and daemon turn runner env/output/watchdog gates")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, and resident daemon presence/worker-retirement")
     return 0
 
 

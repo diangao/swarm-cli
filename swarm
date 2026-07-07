@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -437,6 +437,9 @@ def agent_item(
     avatar_url: str | None,
     created_at: str,
     updated_at: str,
+    presence: str = "offline",
+    presence_updated_at: str | None = None,
+    last_turn_at: str | None = None,
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -447,6 +450,9 @@ def agent_item(
         "avatar_url": avatar_url,
         "created_at": created_at,
         "updated_at": updated_at,
+        "presence": presence,
+        "presence_updated_at": presence_updated_at,
+        "last_turn_at": last_turn_at,
     }
 
 
@@ -786,7 +792,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
             capabilities_json TEXT NOT NULL,
             avatar_url TEXT,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            presence TEXT NOT NULL DEFAULT 'offline',
+            presence_updated_at TEXT,
+            last_turn_at TEXT
         );
         CREATE TABLE IF NOT EXISTS agent_heartbeats (
             name TEXT PRIMARY KEY,
@@ -1018,6 +1027,19 @@ def ensure_profile_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE profiles ADD COLUMN avatar_file TEXT")
 
 
+def ensure_agent_presence_columns(conn: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(agents)").fetchall()
+    }
+    if "presence" not in columns:
+        conn.execute("ALTER TABLE agents ADD COLUMN presence TEXT NOT NULL DEFAULT 'offline'")
+    if "presence_updated_at" not in columns:
+        conn.execute("ALTER TABLE agents ADD COLUMN presence_updated_at TEXT")
+    if "last_turn_at" not in columns:
+        conn.execute("ALTER TABLE agents ADD COLUMN last_turn_at TEXT")
+
+
 def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     conn.execute("DELETE FROM inbox")
     conn.execute("DELETE FROM agent_heartbeats")
@@ -1111,8 +1133,8 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     )
     conn.executemany(
         """
-        INSERT INTO agents(name, display_name, runtime, workspace_path, capabilities_json, avatar_url, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO agents(name, display_name, runtime, workspace_path, capabilities_json, avatar_url, created_at, updated_at, presence, presence_updated_at, last_turn_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -1124,6 +1146,9 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 record.get("avatar_url"),
                 record["created_at"],
                 record["updated_at"],
+                record.get("presence", "offline"),
+                record.get("presence_updated_at"),
+                record.get("last_turn_at"),
             )
             for record in state.get("agents", [])
         ],
@@ -1534,6 +1559,7 @@ def initialize_database(conn: sqlite3.Connection) -> None:
     with conn:
         create_schema(conn)
         ensure_profile_columns(conn)
+        ensure_agent_presence_columns(conn)
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         if row is None:
             replace_state(conn, initial_state())
@@ -1635,10 +1661,14 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             row["avatar_url"],
             row["created_at"],
             row["updated_at"],
+            row["presence"],
+            row["presence_updated_at"],
+            row["last_turn_at"],
         )
         for row in conn.execute(
             """
-            SELECT name, display_name, runtime, workspace_path, capabilities_json, avatar_url, created_at, updated_at
+            SELECT name, display_name, runtime, workspace_path, capabilities_json, avatar_url,
+                   created_at, updated_at, presence, presence_updated_at, last_turn_at
             FROM agents
             ORDER BY name
             """
@@ -2164,9 +2194,15 @@ def format_agent_row(agent: dict[str, Any], heartbeat: dict[str, Any] | None) ->
     heartbeat_text = " heartbeat=missing"
     if heartbeat is not None:
         heartbeat_text = f" heartbeat={heartbeat['status']} at {heartbeat['updated_at']}"
+    presence = agent.get("presence") or "offline"
+    presence_text = f" presence={presence}"
+    if agent.get("presence_updated_at"):
+        presence_text += f" at {agent['presence_updated_at']}"
+    if agent.get("last_turn_at"):
+        presence_text += f" last_turn={agent['last_turn_at']}"
     return (
         f"- @{agent['name']} ({agent['display_name']}) runtime={agent['runtime']} "
-        f"workspace={agent['workspace_path']} capabilities={capabilities}{avatar}{heartbeat_text}"
+        f"workspace={agent['workspace_path']} capabilities={capabilities}{avatar}{presence_text}{heartbeat_text}"
     )
 
 
@@ -5453,46 +5489,28 @@ def format_daemon_turn_row(item: dict[str, Any]) -> str:
     )
 
 
-def command_daemon_turn_run(argv: list[str]) -> int:
-    unknown = unknown_flags(
-        argv,
-        {"--agent", "--dispatch-id", "--owner", "--input", "--target", "--session-id", "--timeout"},
-    )
-    if unknown:
-        return write_stderr(f"Error: unknown daemon turn run flag: {unknown[0]}\nCode: INVALID_ARG\n")
-    for flag in ("--agent", "--dispatch-id", "--owner", "--input", "--target", "--session-id", "--timeout"):
-        if flag_missing_value(argv, flag):
-            return write_stderr(f"Error: {flag} requires a value\nCode: INVALID_ARG\n")
-    agent = arg_value(argv, "--agent")
-    if not agent or not agent.strip():
-        return write_stderr("Error: --agent is required\nCode: INVALID_ARG\n")
-    dispatch_id = None
-    dispatch_id_text = arg_value(argv, "--dispatch-id")
-    if dispatch_id_text is not None:
-        try:
-            dispatch_id = int(dispatch_id_text)
-        except ValueError:
-            return write_stderr("Error: --dispatch-id must be an integer\nCode: INVALID_ARG\n")
-    timeout_seconds, timeout_error = parse_duration_arg(argv, "--timeout", "5m")
-    if timeout_error is not None:
-        return write_stderr(f"Error: {timeout_error}\nCode: INVALID_ARG\n")
-    owner = arg_value(argv, "--owner")
-    if dispatch_id is not None and (owner is None or not owner.strip()):
-        return write_stderr("Error: --owner is required with --dispatch-id\nCode: INVALID_ARG\n")
-
+def execute_daemon_turn(
+    agent: str,
+    dispatch_id: int | None,
+    owner: str | None,
+    input_text: str | None,
+    target: str | None,
+    session_id: str | None,
+    timeout_seconds: float,
+) -> dict[str, Any]:
     prepared = prepare_daemon_turn(
         agent,
         dispatch_id,
         owner.strip() if owner is not None else None,
-        arg_value(argv, "--input"),
-        arg_value(argv, "--target"),
-        arg_value(argv, "--session-id"),
+        input_text,
+        target,
+        session_id,
         timeout_seconds,
     )
     if prepared.get("raw_error"):
-        return write_stderr(str(prepared["raw_error"]))
+        return {"ok": False, "raw_error": str(prepared["raw_error"])}
     if prepared.get("error"):
-        return write_stderr(f"Error: {prepared['error']}\nCode: {prepared.get('code', 'TURN_PREPARE_FAILED')}\n")
+        return {"ok": False, "error": str(prepared["error"]), "code": str(prepared.get("code", "TURN_PREPARE_FAILED"))}
 
     workspace = Path(str(prepared["workspace_abs"]))
     workspace.mkdir(parents=True, exist_ok=True)
@@ -5558,14 +5576,63 @@ def command_daemon_turn_run(argv: list[str]) -> int:
         error_text,
     )
     if finalized.get("raw_error"):
-        return write_stderr(str(finalized["raw_error"]))
+        return {"ok": False, "raw_error": str(finalized["raw_error"])}
     if finalized.get("error"):
-        return write_stderr(f"Error: {finalized['error']}\nCode: {finalized.get('code', 'TURN_FINALIZE_FAILED')}\n")
+        return {"ok": False, "error": str(finalized["error"]), "code": str(finalized.get("code", "TURN_FINALIZE_FAILED"))}
     if status != "done":
-        return write_stderr(f"Error: {error_text or 'turn failed'}\nCode: TURN_FAILED\n")
-    message_line = f" message={short_id(str(finalized['message_id']))}" if finalized.get("message_id") else ""
-    wake_line = f" wake={finalized['wake_status']}" if finalized.get("wake_status") else ""
-    return write_stdout(f"Turn {prepared['turn_id']} completed for @{prepared['agent']}.{message_line}{wake_line}\n")
+        return {"ok": False, "error": error_text or "turn failed", "code": "TURN_FAILED"}
+    return {
+        "ok": True,
+        "turn_id": int(prepared["turn_id"]),
+        "agent": str(prepared["agent"]),
+        "message_id": finalized.get("message_id"),
+        "wake_status": finalized.get("wake_status"),
+    }
+
+
+def command_daemon_turn_run(argv: list[str]) -> int:
+    unknown = unknown_flags(
+        argv,
+        {"--agent", "--dispatch-id", "--owner", "--input", "--target", "--session-id", "--timeout"},
+    )
+    if unknown:
+        return write_stderr(f"Error: unknown daemon turn run flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    for flag in ("--agent", "--dispatch-id", "--owner", "--input", "--target", "--session-id", "--timeout"):
+        if flag_missing_value(argv, flag):
+            return write_stderr(f"Error: {flag} requires a value\nCode: INVALID_ARG\n")
+    agent = arg_value(argv, "--agent")
+    if not agent or not agent.strip():
+        return write_stderr("Error: --agent is required\nCode: INVALID_ARG\n")
+    dispatch_id = None
+    dispatch_id_text = arg_value(argv, "--dispatch-id")
+    if dispatch_id_text is not None:
+        try:
+            dispatch_id = int(dispatch_id_text)
+        except ValueError:
+            return write_stderr("Error: --dispatch-id must be an integer\nCode: INVALID_ARG\n")
+    timeout_seconds, timeout_error = parse_duration_arg(argv, "--timeout", "5m")
+    if timeout_error is not None:
+        return write_stderr(f"Error: {timeout_error}\nCode: INVALID_ARG\n")
+    owner = arg_value(argv, "--owner")
+    if dispatch_id is not None and (owner is None or not owner.strip()):
+        return write_stderr("Error: --owner is required with --dispatch-id\nCode: INVALID_ARG\n")
+
+    result = execute_daemon_turn(
+        agent,
+        dispatch_id,
+        owner,
+        arg_value(argv, "--input"),
+        arg_value(argv, "--target"),
+        arg_value(argv, "--session-id"),
+        timeout_seconds,
+    )
+    if not result.get("ok"):
+        if result.get("raw_error"):
+            return write_stderr(str(result["raw_error"]))
+        return write_stderr(f"Error: {result['error']}\nCode: {result.get('code', 'TURN_FAILED')}\n")
+    message_line = f" message={short_id(str(result['message_id']))}" if result.get("message_id") else ""
+    wake_line = f" wake={result['wake_status']}" if result.get("wake_status") else ""
+    return write_stdout(f"Turn {result['turn_id']} completed for @{result['agent']}.{message_line}{wake_line}\n")
 
 
 def command_daemon_turn_list(argv: list[str]) -> int:
@@ -5728,6 +5795,126 @@ def command_daemon_dispatch(argv: list[str]) -> int:
     return write_stderr(f"Error: unknown daemon dispatch subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
+def set_all_agents_presence(presence: str) -> int:
+    def action(state: dict[str, Any]) -> int:
+        stamp = current_timestamp()
+        for record in state.get("agents", []):
+            record["presence"] = presence
+            record["presence_updated_at"] = stamp
+        append_daemon_event(state, "resident_presence", {"presence": presence, "agents": len(state.get("agents", []))})
+        return 0
+
+    return with_mutable_state(action)
+
+
+def set_agent_presence(agent_name: str, presence: str, mark_turn: bool = False) -> int:
+    def action(state: dict[str, Any]) -> int:
+        for record in state.get("agents", []):
+            if record["name"] == agent_name:
+                record["presence"] = presence
+                record["presence_updated_at"] = current_timestamp()
+                if mark_turn:
+                    record["last_turn_at"] = current_timestamp()
+                return 0
+        return 1
+
+    return with_mutable_state(action)
+
+
+def agents_with_active_wakes() -> list[str]:
+    def action(state: dict[str, Any]) -> list[str]:
+        names = []
+        for wake in state.get("daemon_wakes", []):
+            if int(wake.get("running") or 0) == 1:
+                names.append(str(wake["agent_name"]))
+        return names
+
+    return with_read_state(action)
+
+
+def command_daemon_resident(argv: list[str]) -> int:
+    unknown = unknown_flags(
+        argv,
+        {"--workspace", "--mock-socket-file", "--loops", "--idle-interval", "--turn-timeout", "--socket-window", "--max-events"},
+    )
+    if unknown:
+        return write_stderr(f"Error: unknown daemon resident flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    for flag in ("--workspace", "--mock-socket-file", "--loops", "--idle-interval", "--turn-timeout", "--socket-window", "--max-events"):
+        if flag_missing_value(argv, flag):
+            return write_stderr(f"Error: {flag} requires a value\nCode: INVALID_ARG\n")
+    workspace = arg_value(argv, "--workspace")
+    mock_file = arg_value(argv, "--mock-socket-file")
+    loops = 0
+    loops_text = arg_value(argv, "--loops")
+    if loops_text is not None:
+        try:
+            loops = int(loops_text)
+        except ValueError:
+            loops = -1
+        if loops <= 0:
+            return write_stderr("Error: --loops must be a positive integer\nCode: INVALID_ARG\n")
+    idle_interval = parse_duration(arg_value(argv, "--idle-interval") or "5s")
+    if idle_interval is None or idle_interval.total_seconds() < 0:
+        return write_stderr("Error: --idle-interval must be a duration like 5s, 1m, 1h, or 1d\nCode: INVALID_ARG\n")
+    turn_timeout = parse_duration(arg_value(argv, "--turn-timeout") or "5m")
+    if turn_timeout is None or turn_timeout.total_seconds() <= 0:
+        return write_stderr("Error: --turn-timeout must be a positive duration like 5s, 1m, 1h, or 1d\nCode: INVALID_ARG\n")
+    socket_window = arg_value(argv, "--socket-window") or "20s"
+    max_events = arg_value(argv, "--max-events") or "10"
+
+    set_all_agents_presence("idle")
+    daemon_record_event("resident_started", {"loops": loops, "workspace": workspace or ""})
+    iterations = 0
+    turns_run = 0
+    mock_consumed = False
+    failure_streaks: dict[str, int] = {}
+    quarantined: set[str] = set()
+    try:
+        while loops == 0 or iterations < loops:
+            iterations += 1
+            if workspace and mock_file and not mock_consumed:
+                mock_consumed = True
+                command_daemon_slack(["--workspace", workspace, "--mock-socket-file", mock_file])
+            elif workspace and mock_file is None:
+                command_daemon_slack([
+                    "--workspace", workspace,
+                    "--max-events", max_events,
+                    "--socket-timeout", socket_window,
+                ])
+            process_due_reminders_once()
+            for agent_name in agents_with_active_wakes():
+                if agent_name in quarantined:
+                    continue
+                set_agent_presence(agent_name, "in_turn")
+                result = execute_daemon_turn(agent_name, None, None, None, None, None, turn_timeout.total_seconds())
+                set_agent_presence(agent_name, "idle", mark_turn=True)
+                turns_run += 1
+                if result.get("ok"):
+                    failure_streaks[agent_name] = 0
+                else:
+                    failure_streaks[agent_name] = failure_streaks.get(agent_name, 0) + 1
+                    if failure_streaks[agent_name] >= 3:
+                        quarantined.add(agent_name)
+                        daemon_record_event("resident_agent_quarantined", {"agent": agent_name, "failures": failure_streaks[agent_name]})
+                daemon_record_event(
+                    "resident_turn",
+                    {
+                        "agent": agent_name,
+                        "ok": bool(result.get("ok")),
+                        "turn_id": result.get("turn_id"),
+                        "error": result.get("error") or result.get("raw_error"),
+                    },
+                )
+            if idle_interval.total_seconds() > 0 and (loops == 0 or iterations < loops):
+                time.sleep(idle_interval.total_seconds())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        set_all_agents_presence("offline")
+        daemon_record_event("resident_stopped", {"iterations": iterations, "turns": turns_run})
+    return write_stdout(f"Resident daemon stopped after {iterations} iteration(s), {turns_run} turn(s).\n")
+
+
 def command_daemon(argv: list[str]) -> int:
     if not argv:
         return write_stderr("Error: missing daemon subcommand\nCode: INVALID_ARG\n")
@@ -5737,6 +5924,8 @@ def command_daemon(argv: list[str]) -> int:
         return command_daemon_run(rest)
     if subcommand == "slack":
         return command_daemon_slack(rest)
+    if subcommand == "resident":
+        return command_daemon_resident(rest)
     if subcommand == "wakes":
         return command_daemon_wakes(rest)
     if subcommand == "finish-turn":
@@ -5899,6 +6088,11 @@ def command_agent_worker(argv: list[str]) -> int:
     session_id = arg_value(argv, "--session-id") or f"worker-{name}-{uuid.uuid4().hex[:8]}"
     require_seed = "--require-seed" in argv
     once = "--once" in argv
+    if not once:
+        return write_stderr(
+            "Error: the agent worker loop is retired; run the resident daemon instead (swarm daemon resident)\n"
+            "Code: WORKER_RETIRED\n"
+        )
     pid = str(os.getpid())
     iterations = 0
 
@@ -6112,13 +6306,12 @@ def command_agent_supervisor_plan(argv: list[str]) -> int:
                     "agent": agent["name"],
                     "runtime": agent["runtime"],
                     "workspace": agent["workspace_path"],
-                    "worker_command": f"swarm agent worker --name {shlex.quote(agent['name'])} --require-seed",
-                    "heartbeat_command": (
-                        f"swarm agent heartbeat --name {shlex.quote(agent['name'])} "
-                        "--status alive --pid $PID --session-id $SESSION_ID"
-                    ),
+                    "worker_command": "swarm daemon resident",
                     "seed_command": f"swarm agent seed --name {shlex.quote(agent['name'])}",
-                    "supervisor_policy": "run as a persistent worker and restart only after stale heartbeat",
+                    "supervisor_policy": (
+                        "one resident daemon supervises all agents; launchd carries exactly one swarm job; "
+                        "presence is daemon-observed, no per-agent self-report loop"
+                    ),
                 }
             )
         rendered = "\n".join(json.dumps(plan, sort_keys=True, separators=(",", ":")) for plan in plans)
