@@ -31,6 +31,7 @@ Current implemented surface:
 - `swarm daemon dispatch enqueue/claim/complete/fail/list` for leased daemon work
 - `swarm daemon turn run --agent ... [--dispatch-id ... --owner ...]` to spawn a registered runtime with workspace cwd, `--resume`, watchdog timeout, dispatch finalization, and credential-shaped output blocking
 - `swarm daemon turn list [--agent ...] [--status ...]`
+- `swarm curator install --source-config ... --entity-radar ... --owner-watchlist ... --report-target ...` to register a scheduled curator agent with a scrubbed watch-list seed and bounded queue-writeback runtime
 - `swarm server info`
 - `swarm channel members ...`
 - `swarm channel join ...`

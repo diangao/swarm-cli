@@ -3678,6 +3678,316 @@ def probe_daemon_resident(cli: Path, state_dir: Path) -> None:
     require(f"@{agent}" in agent_list and "presence=offline" in agent_list, "agent list does not render presence")
 
 
+def probe_curator_workload(cli: Path, state_dir: Path) -> None:
+    agent = f"curator-{uuid.uuid4().hex[:8]}"
+    report_target = f"#curator-report-{uuid.uuid4().hex[:8]}"
+    sources_path = state_dir / "curator-sources.json"
+    entities_path = state_dir / "curator-entities.json"
+    owner_path = state_dir / "curator-owner-watch.json"
+
+    sources_path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "id": "openai-cases",
+                        "name": "OpenAI enterprise cases",
+                        "why": "high-signal public adoption surface",
+                        "trust_tier": "trusted-public",
+                        "surface": "https://openai.com/customer-stories",
+                    },
+                    {
+                        "id": "private-dm",
+                        "name": "Friend forwarded thread",
+                        "surface": "dm:@someone",
+                    },
+                    {
+                        "id": "private-candidate",
+                        "name": "candidate tracker",
+                        "surface": "interview tracker",
+                    },
+                ]
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    entities_path.write_text(
+        json.dumps(
+            {
+                "entities": [
+                    {
+                        "id": "anthropic",
+                        "name": "Anthropic",
+                        "why": "frontier lab radar",
+                        "surface": "public company/news surface",
+                    }
+                ]
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    owner_path.write_text(
+        json.dumps(
+            {
+                "watchlist": [
+                    {
+                        "id": "agents-sdk",
+                        "name": "OpenAI Agents SDK",
+                        "why": "owner-selected agent framework radar",
+                        "surface": "public docs and releases",
+                    },
+                    {
+                        "id": "private-job",
+                        "name": "private candidate tracker",
+                        "surface": "notion tracker",
+                    },
+                ]
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    unknown = run(cli, state_dir, "curator", "install", "--bogus", expected=1).stderr
+    require("unknown curator install flag: --bogus" in unknown, "curator install did not reject unknown flags")
+    bad_batch = run(
+        cli,
+        state_dir,
+        "curator",
+        "install",
+        "--batch-size",
+        "51",
+        "--report-target",
+        report_target,
+        "--source-config",
+        str(sources_path),
+        expected=1,
+    ).stderr
+    require("batch-size must be an integer from 1 to 50" in bad_batch, "curator install accepted oversize batch")
+
+    install_args = [
+        "curator",
+        "install",
+        "--name",
+        agent,
+        "--display-name",
+        "Grind Curator",
+        "--source-config",
+        str(sources_path),
+        "--entity-radar",
+        str(entities_path),
+        "--owner-watchlist",
+        str(owner_path),
+        "--report-target",
+        report_target,
+        "--batch-size",
+        "2",
+        "--cadence",
+        "1h",
+        "--at",
+        "2000-01-01T00:00:00",
+        "--max-runtime",
+        "5s",
+    ]
+    installed = run(cli, state_dir, *install_args).stdout
+    require(f"Curator @{agent} installed." in installed, "curator install did not report installed agent")
+    require("Watch entries: 3" in installed, "curator install did not load the expected watch entries")
+    require("Scrub gate: credentials=0 other_people_dm_originals=0 owner_sensitive=0" in installed, "curator scrub gate missing")
+    require("Batch size: 2" in installed and "every=1h" in installed, "curator schedule/batch output missing")
+    repeat = run(cli, state_dir, *install_args).stdout
+    require(f"Curator @{agent} installed." in repeat, "repeat curator install did not succeed")
+    conn = connect_state(state_dir)
+    try:
+        duplicate_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM reminders WHERE target = ? AND title = ? AND status != 'canceled'",
+            (f"dm:@{agent}", f"curator scheduled batch @{agent}"),
+        ).fetchone()
+    finally:
+        conn.close()
+    require(duplicate_row["count"] == 1, "repeat curator install created duplicate active reminders")
+
+    workspace = state_dir / "agents" / agent
+    seed = json.loads((workspace / "seed.json").read_text(encoding="utf-8"))
+    watch = json.loads((workspace / "watch-list.json").read_text(encoding="utf-8"))
+    config_path = workspace / "runtime" / "curator-config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    require(seed["status"] == "ready_for_curator_turn", "curator seed status was not ready")
+    require(seed["curator_seed"]["watch_entries"] == 3, "curator seed watch count mismatch")
+    require(seed["curator_seed"]["scrub_gate"] == {
+        "credentials": 0,
+        "other_people_dm_originals": 0,
+        "owner_sensitive": 0,
+    }, "curator seed scrub gate mismatch")
+    require(seed["curator_seed"]["excluded_counts"]["dm_originals"] == 1, "curator seed did not count DM exclusions")
+    require(seed["curator_seed"]["excluded_counts"]["owner_sensitive"] == 2, "curator seed did not count owner-sensitive exclusions")
+    require(len(watch["entries"]) == 3, "curator watch list included excluded entries")
+    require(config["batch_size"] == 2, "curator config batch size mismatch")
+    require(config["max_runtime_seconds"] == 5.0, "curator config max runtime mismatch")
+    require(config["report_target"] == report_target, "curator config report target mismatch")
+    require(config["contract"]["empty_excerpt"] == "cancel insufficient_content", "curator contract missing empty excerpt rule")
+
+    seed_text_parts = [
+        workspace / "seed.json",
+        workspace / "watch-list.json",
+        workspace / "MEMORY.md",
+        workspace / "runtime" / "curator-config.json",
+        workspace / "runtime" / "curator_cycle.py",
+    ]
+    seed_text = "\n".join(path.read_text(encoding="utf-8") for path in seed_text_parts)
+    forbidden = ["dm:@", "candidate tracker", "notion tracker", "interview tracker", "xox" + "b-", "sk" + "_agent_"]
+    for marker in forbidden:
+        require(marker not in seed_text, f"curator seed leaked blocked marker: {marker}")
+
+    jobs_path = workspace / "runtime" / "curator-jobs.json"
+    jobs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "job-1",
+                    "title": "Agents SDK enterprise workflow",
+                    "excerpt": "OpenAI Agents SDK added sandbox and tracing patterns for enterprise agent workflows.",
+                    "priority": "high",
+                    "tags": ["Agent SDK", "Enterprise"],
+                    "status": "pending",
+                },
+                {
+                    "id": "job-empty",
+                    "title": "Harvey title shell",
+                    "excerpt": "   ",
+                    "priority": "medium",
+                    "status": "pending",
+                },
+                {
+                    "id": "job-3",
+                    "title": "Cloudflare Agent Cloud",
+                    "excerpt": "Cloudflare announced runtime primitives for long-lived agent workloads.",
+                    "priority": "medium",
+                    "status": "pending",
+                },
+            ],
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report_blocker = f"fresh report-channel blocker {uuid.uuid4()}"
+    insert_freshness_blocker(state_dir, report_target, report_blocker)
+
+    resident = run(
+        cli,
+        state_dir,
+        "daemon",
+        "resident",
+        "--loops",
+        "2",
+        "--idle-interval",
+        "0s",
+        "--turn-timeout",
+        "10s",
+    ).stdout
+    require(" 0 turn(s)" not in resident, "curator reminder wake did not run a resident turn")
+
+    jobs = {item["id"]: item for item in json.loads(jobs_path.read_text(encoding="utf-8"))}
+    require(jobs["job-1"]["status"] == "done", "contentful curator job did not complete")
+    require(jobs["job-empty"]["status"] == "canceled", "empty-excerpt curator job was not canceled")
+    require("insufficient_content" in jobs["job-empty"]["error"], "empty-excerpt cancel reason missing")
+    require(jobs["job-3"]["status"] == "pending", "curator exceeded configured batch size")
+
+    writebacks = (workspace / "runtime" / "curator-writeback.jsonl").read_text(encoding="utf-8").splitlines()
+    require(len(writebacks) == 1, "curator writeback count mismatch")
+    writeback = json.loads(writebacks[0])
+    require(writeback["job_id"] == "job-1", "curator wrote back the wrong job")
+    require(writeback["annotation"]["whyItMatters"] is None, "curator did not normalize absent whyItMatters to null")
+
+    history = run(cli, state_dir, "message", "read", "--channel", report_target).stdout
+    expected_report = "curator batch: claimed 2, completed 1, canceled 1, failed 0, pending 1"
+    require(report_blocker in history, "curator report freshness blocker setup failed")
+    require(expected_report in history, "curator did not post the successful batch report")
+    require(f"@{agent}" in history, "curator report did not use the agent author")
+    conn = connect_state(state_dir)
+    try:
+        draft_row = conn.execute("SELECT draft FROM freshness WHERE target = ?", (report_target,)).fetchone()
+    finally:
+        conn.close()
+    require(draft_row is not None and draft_row["draft"] is None, "curator report left a freshness draft behind")
+
+    reminders = run(cli, state_dir, "reminder", "list").stdout
+    require(f"target=dm:@{agent}" in reminders and "every=1h" in reminders, "curator recurring reminder missing")
+    turn_list = run(cli, state_dir, "daemon", "turn", "list", "--status", "done").stdout
+    require(f"@{agent} status=done" in turn_list, "curator turn missing from done turn list")
+    installed_events = daemon_event_details(state_dir, "curator_installed")
+    require(
+        any(item.get("agent") == agent and item.get("watch_entries") == 3 for item in installed_events),
+        "curator install event missing expected details",
+    )
+
+    second_cycle = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--input",
+        "manual second curator cycle",
+        "--timeout",
+        "10s",
+    ).stdout
+    require(f"completed for @{agent}" in second_cycle, "second curator cycle did not complete")
+    jobs = {item["id"]: item for item in json.loads(jobs_path.read_text(encoding="utf-8"))}
+    require(jobs["job-3"]["status"] == "done", "second curator cycle did not complete the pending job")
+    writebacks = (workspace / "runtime" / "curator-writeback.jsonl").read_text(encoding="utf-8").splitlines()
+    require(len(writebacks) == 2, "curator writeback did not progress monotonically across cycles")
+    history = run(cli, state_dir, "message", "read", "--channel", report_target).stdout
+    second_report = "curator batch: claimed 1, completed 1, canceled 0, failed 0, pending 0"
+    require(second_report in history, "curator did not post the second-cycle progress report")
+
+    updated_jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
+    updated_jobs.append(
+        {
+            "id": "job-4",
+            "title": "Runtime budget guard",
+            "excerpt": "A later cycle should respect max runtime before processing this job.",
+            "priority": "low",
+            "status": "pending",
+        }
+    )
+    jobs_path.write_text(json.dumps(updated_jobs, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    config["max_runtime_seconds"] = 0
+    config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    over_budget = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--input",
+        "manual over-budget curator run",
+        "--timeout",
+        "10s",
+        expected=1,
+    ).stderr
+    require("Code: TURN_FAILED" in over_budget, "over-budget curator run did not fail the turn")
+    jobs = {item["id"]: item for item in json.loads(jobs_path.read_text(encoding="utf-8"))}
+    require(jobs["job-4"]["status"] == "pending", "over-budget curator run consumed the pending job")
+    history = run(cli, state_dir, "message", "read", "--channel", report_target).stdout
+    failed_report = "curator batch: claimed 1, completed 0, canceled 0, failed 1, pending 1"
+    require(failed_report in history, "curator did not post the over-budget failure report")
+
+
 def main() -> int:
     cli = Path(os.environ.get("SWARM_CLI", DEFAULT_CLI)).resolve()
     require(cli.exists(), f"SWARM_CLI does not exist: {cli}")
@@ -3709,8 +4019,9 @@ def main() -> int:
         probe_daemon_dispatch_lease(cli, state_dir)
         probe_daemon_turn_runner(cli, state_dir)
         probe_daemon_resident(cli, state_dir)
+        probe_curator_workload(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, and resident daemon presence/worker-retirement")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, resident daemon presence/worker-retirement, and curator seed/schedule/queue-writeback workload")
     return 0
 
 
