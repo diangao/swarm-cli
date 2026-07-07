@@ -5409,10 +5409,11 @@ def finalize_daemon_turn(
             wake_status, _ = finish_daemon_wake(state, agent_name)
         effective_status = "failed" if dispatch_error is not None else status
         effective_error = "dispatch finalize failed" if dispatch_error is not None else error_text
+        effective_exit_code = 1 if dispatch_error is not None and (exit_code is None or exit_code == 0) else exit_code
         turn["status"] = effective_status
         turn["updated_at"] = now
         turn["finished_at"] = now
-        turn["exit_code"] = exit_code
+        turn["exit_code"] = effective_exit_code
         turn["stdout_text"] = stdout_text
         turn["stderr_text"] = stderr_text
         turn["error"] = effective_error

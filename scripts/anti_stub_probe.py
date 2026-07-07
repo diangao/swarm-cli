@@ -3547,6 +3547,7 @@ def probe_daemon_turn_runner(cli: Path, state_dir: Path) -> None:
     require(stale_messages["count"] == 0, "expired lease still wrote turn output")
     failed_turns = run(cli, state_dir, "daemon", "turn", "list", "--status", "failed").stdout
     require("dispatch finalize failed" in failed_turns, "expired lease turn was not marked failed")
+    require("exit=1" in failed_turns, "expired lease turn did not persist nonzero effective exit")
 
 
 def main() -> int:
