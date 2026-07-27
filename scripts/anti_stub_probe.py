@@ -3910,6 +3910,88 @@ def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
     wake = daemon_wake_row(state_dir, agent)
     require(wake is not None and int(wake["running"]) == 0, "freshness retry wake did not drain")
 
+    # Also prove the harder queue race: a second human is already present
+    # before the older wake starts. The old turn must compare freshness to the
+    # newest fact in its visible wake context, not to the absolute target head.
+    queued_state = state_dir / "queued"
+    queued_state.mkdir()
+    queued_agent = f"fresh-queued-{uuid.uuid4().hex[:8]}"
+    queued_workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    queued_channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    queued_target = f"#slack-{queued_channel_id.lower()}"
+    queued_bot_env = f"FRESHQ_BOT_{uuid.uuid4().hex[:6].upper()}"
+    queued_app_env = f"FRESHQ_APP_{uuid.uuid4().hex[:6].upper()}"
+    queued_old = f"queued older human {uuid.uuid4()}"
+    queued_new = f"queued newer human {uuid.uuid4()}"
+    queued_stale = f"queued stale output {uuid.uuid4()}"
+    queued_fresh = f"queued fresh output {uuid.uuid4()}"
+    queued_runtime = state_dir / "fresh-queued-runtime.py"
+    queued_runtime.write_text(
+        "import sys\n"
+        "payload = sys.stdin.read()\n"
+        f"if {queued_new!r} in payload:\n"
+        f"    print({queued_fresh!r})\n"
+        "else:\n"
+        f"    print({queued_stale!r})\n"
+    )
+    run(
+        cli, queued_state, "agent", "register",
+        "--name", queued_agent, "--display-name", queued_agent,
+        "--runtime", f"{sys.executable} {queued_runtime}",
+        "--workspace", f"agents/{queued_agent}",
+    )
+    run(
+        cli, queued_state, "slack", "configure",
+        "--workspace", queued_workspace,
+        "--bot-token-env", queued_bot_env,
+        "--app-token-env", queued_app_env,
+        "--mode", "socket_mode",
+    )
+    queued_mock = state_dir / "fresh-queued-mock.jsonl"
+    queued_mock.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "type": "events_api",
+                    "payload": {
+                        "team_id": queued_workspace,
+                        "event": {
+                            "type": "message",
+                            "channel": queued_channel_id,
+                            "user": "UFRESHQ",
+                            "text": body,
+                            "ts": f"{1762500100 + index}.{uuid.uuid4().int % 1_000_000:06d}",
+                        },
+                    },
+                    "envelope_id": f"env-{uuid.uuid4().hex}",
+                }
+            )
+            for index, body in enumerate((queued_old, queued_new))
+        )
+        + "\n"
+    )
+    run(
+        cli, queued_state,
+        "daemon", "slack",
+        "--workspace", queued_workspace,
+        "--mock-socket-file", str(queued_mock),
+        env_overrides={queued_app_env: f"xapp-fresh-queued-{uuid.uuid4()}"},
+    )
+    queued_resident = run(
+        cli, queued_state, "daemon", "resident",
+        "--loops", "2", "--idle-interval", "0s", "--turn-timeout", "5s",
+    ).stdout
+    require("Resident daemon stopped after 2 iteration(s)" in queued_resident, "queued freshness resident did not finish")
+    queued_history = run(cli, queued_state, "message", "read", "--channel", queued_target).stdout
+    require(queued_old in queued_history and queued_new in queued_history, "queued human facts disappeared")
+    require(queued_stale not in queued_history, "older queued wake published across a newer human")
+    require(queued_fresh in queued_history, "newer queued wake did not receive the fresh shared context")
+    queued_holds = daemon_event_details(queued_state, "turn_freshness_hold")
+    require(
+        any(detail.get("agent") == queued_agent for detail in queued_holds),
+        "pre-existing newer human did not freshness-hold the older wake",
+    )
+
 
 def probe_daemon_resident(cli: Path, state_dir: Path) -> None:
     agent = f"resident-{uuid.uuid4().hex[:8]}"

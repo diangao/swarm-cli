@@ -5341,13 +5341,13 @@ def wake_shared_channel_context(
     state: dict[str, Any],
     target: str | None,
     input_message_id: str | None,
-) -> str:
+) -> tuple[str, int]:
     """Return a bounded, ordered channel view through the current wake."""
     if not target or not input_message_id:
-        return ""
+        return "", 0
     trigger, trigger_error = message_by_id(state, input_message_id)
     if trigger_error is not None or trigger is None:
-        return ""
+        return "", 0
     trigger_seq = int(trigger["seq"])
     before_and_trigger: list[dict[str, Any]] = []
     after_trigger: list[dict[str, Any]] = []
@@ -5392,7 +5392,11 @@ def wake_shared_channel_context(
         kept = line[:remaining]
         bounded.append(kept)
         remaining -= len(kept) + 1
-    return "\n".join(reversed(bounded))
+    visible_head_seq = max(
+        (int(record.get("seq") or 0) for record in selected),
+        default=trigger_seq,
+    )
+    return "\n".join(reversed(bounded)), visible_head_seq
 
 
 def wake_live_presence_context(state: dict[str, Any]) -> str:
@@ -5471,6 +5475,7 @@ def prepare_daemon_turn(
         # that arrives while an unrelated/manual runtime is already executing
         # must survive that turn and be handled with its fresher channel view.
         consumes_wake = bool(wake is not None and wake.get("running"))
+        wake_context_head_seq: int | None = None
         input_message_id = payload_fields.get("input_message_id")
         input_text = explicit_input if explicit_input is not None else payload_fields.get("input_text", "")
         target = explicit_target if explicit_target is not None else payload_fields.get("target")
@@ -5482,7 +5487,7 @@ def prepare_daemon_turn(
                 if target is None:
                     target = str(active_record["target"])
                 if wake.get("active_reason") in {"attention", "mention"}:
-                    shared_context = wake_shared_channel_context(
+                    shared_context, wake_context_head_seq = wake_shared_channel_context(
                         state,
                         target,
                         input_message_id,
@@ -5510,7 +5515,15 @@ def prepare_daemon_turn(
                         + "\n\nLive agent presence snapshot (ledger at turn start):\n"
                         + (presence_context or "(no agent presence available)")
                     )
-        target_snapshot_seq = latest_target_message_seq(state, target)
+        # For a wake, freshness is relative to the newest fact actually
+        # included in that wake's bounded view. A newer human may already be
+        # queued before this older turn starts; using the absolute target head
+        # would incorrectly bless the old response as fresh.
+        target_snapshot_seq = (
+            wake_context_head_seq
+            if wake_context_head_seq is not None
+            else latest_target_message_seq(state, target)
+        )
         session_id = explicit_session_id or payload_fields.get("session_id")
         prior_done_sessions = [
             str(item["session_id"])
