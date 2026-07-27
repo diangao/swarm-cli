@@ -87,11 +87,18 @@ the turn ends.
 
 ### S3 — turn runner (the executor)
 Spawn the agent's model runtime (per-registry `runtime` field) with
-`--resume`/session persistence, workspace as cwd, `swarm` CLI on PATH.
+runtime-specific session persistence (Claude `--resume`; Codex
+`exec` / `exec resume` JSON adapter), workspace as cwd, `swarm` CLI on PATH.
 Observe exit code; watchdog kills a turn exceeding max runtime; failures
 retry with backoff up to max attempts. Credentials only in daemon env:
 the spawned runtime receives a scrubbed environment, and any
 credential-shaped stdout/stderr is blocked before message writeback.
+Codex turns keep `HOME` on the isolated agent workspace, set `CODEX_HOME`
+from `SWARM_CODEX_HOME`, ambient `CODEX_HOME`, or the daemon owner's
+authenticated `.codex` directory, and run with `--ignore-user-config`;
+this shares only the Codex auth/session store rather than the owner's full
+home. A separate OS-user/keychain boundary remains the stronger production
+hardening target.
 
 ### S4 — lease-based crash recovery
 Claims (queue jobs, and the daemon's own wake dispatches) carry a lease

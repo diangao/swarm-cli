@@ -3561,6 +3561,115 @@ def probe_daemon_turn_runner(cli: Path, state_dir: Path) -> None:
     require("exit=1" in failed_turns, "expired lease turn did not persist nonzero effective exit")
 
 
+def probe_codex_turn_adapter(cli: Path, state_dir: Path) -> None:
+    agent = f"codex-{uuid.uuid4().hex[:8]}"
+    fake_codex = state_dir / "codex"
+    thread_id = "123e4567-e89b-12d3-a456-426614174000"
+    fake_codex.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import json, os, sys",
+                "args = sys.argv[1:]",
+                "payload = sys.stdin.read()",
+                "if not args or args[0] != 'exec':",
+                "    raise SystemExit(21)",
+                "is_resume = len(args) > 1 and args[1] == 'resume'",
+                f"thread_id = {thread_id!r}",
+                "if is_resume and thread_id not in args:",
+                "    raise SystemExit(22)",
+                "required = {'--json', '--ignore-user-config', '--skip-git-repo-check', '-'}",
+                "if not required.issubset(set(args)):",
+                "    raise SystemExit(23)",
+                "print(json.dumps({'type': 'thread.started', 'thread_id': thread_id}))",
+                "print(json.dumps({'type': 'turn.started'}))",
+                "print(json.dumps({'type': 'item.completed', 'item': {",
+                "    'id': 'item_0',",
+                "    'type': 'agent_message',",
+                "    'text': ('codex resume: ' if is_resume else 'codex first: ') + payload",
+                "        + ' codex_home=' + str(bool(os.environ.get('CODEX_HOME'))),",
+                "}}))",
+                "print(json.dumps({'type': 'turn.completed', 'usage': {}}))",
+            ]
+        )
+        + "\n"
+    )
+    fake_codex.chmod(0o755)
+    run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        agent,
+        "--display-name",
+        "Codex Adapter Probe",
+        "--runtime",
+        str(fake_codex),
+        "--workspace",
+        f"agents/{agent}",
+    )
+
+    first = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--input",
+        "first",
+        "--target",
+        "#codex-adapter",
+        "--timeout",
+        "3s",
+    ).stdout
+    require("completed" in first and "message=" in first, "Codex first turn did not complete")
+    second = run(
+        cli,
+        state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--input",
+        "second",
+        "--target",
+        "#codex-adapter",
+        "--timeout",
+        "3s",
+    ).stdout
+    require("completed" in second and "message=" in second, "Codex resume turn did not complete")
+
+    history = run(cli, state_dir, "message", "read", "--channel", "#codex-adapter").stdout
+    require("codex first: first codex_home=True" in history, "Codex first-turn final message was not extracted")
+    require("codex resume: second codex_home=True" in history, "Codex resumed final message was not extracted")
+    require('"thread.started"' not in history, "Codex JSONL transport leaked into channel output")
+
+    conn = connect_state(state_dir)
+    try:
+        turns = conn.execute(
+            "SELECT session_id, command_json, stdout_text FROM daemon_turns WHERE agent = ? ORDER BY id",
+            (agent,),
+        ).fetchall()
+    finally:
+        conn.close()
+    require(len(turns) == 2, "Codex adapter did not persist exactly two turns")
+    require(all(row["session_id"] == thread_id for row in turns), "Codex thread id did not persist across resume")
+    first_command = json.loads(turns[0]["command_json"])
+    second_command = json.loads(turns[1]["command_json"])
+    require(first_command[1] == "exec" and "resume" not in first_command, "Codex first command used wrong CLI shape")
+    require(
+        second_command[1:3] == ["exec", "resume"] and thread_id in second_command,
+        "Codex resume command used wrong CLI shape",
+    )
+    entrypoint = state_dir / "agents" / agent / "AGENTS.md"
+    require(entrypoint.exists(), "Codex workspace did not receive AGENTS.md identity entrypoint")
+    require(f"@{agent}" in entrypoint.read_text(), "Codex AGENTS.md omitted agent identity")
+
+
 def agent_presence_row(state_dir: Path, agent_name: str) -> sqlite3.Row | None:
     conn = connect_state(state_dir)
     try:
@@ -4430,13 +4539,29 @@ def main() -> int:
         probe_slack_daemon_event_loop(cli, state_dir)
         probe_daemon_wake_router(cli, state_dir)
         probe_daemon_dispatch_lease(cli, state_dir)
-        probe_daemon_turn_runner(cli, state_dir)
-        probe_daemon_resident(cli, state_dir)
-        probe_attention_wakes(cli, state_dir)
-        probe_curator_workload(cli, state_dir)
-        probe_curator_grind_db_workload(cli, state_dir)
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, resident daemon presence/worker-retirement, attention wake-all/local reply policy, curator seed/schedule/queue-writeback workload, and Grind DB-backed curator scheduled workload")
+    with tempfile.TemporaryDirectory(prefix="swarm-turn-runner-") as tmp:
+        probe_daemon_turn_runner(cli, Path(tmp))
+
+    # Resident probes register channel-attention agents. Keep them isolated so
+    # wake-all semantics do not fan out into unrelated runtimes registered by
+    # earlier probes and turn the harness timeout into a cross-test artifact.
+    with tempfile.TemporaryDirectory(prefix="swarm-resident-") as tmp:
+        probe_daemon_resident(cli, Path(tmp))
+
+    with tempfile.TemporaryDirectory(prefix="swarm-attention-") as tmp:
+        probe_attention_wakes(cli, Path(tmp))
+
+    with tempfile.TemporaryDirectory(prefix="swarm-codex-adapter-") as tmp:
+        probe_codex_turn_adapter(cli, Path(tmp))
+
+    with tempfile.TemporaryDirectory(prefix="swarm-curator-") as tmp:
+        probe_curator_workload(cli, Path(tmp))
+
+    with tempfile.TemporaryDirectory(prefix="swarm-curator-grind-") as tmp:
+        probe_curator_grind_db_workload(cli, Path(tmp))
+
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, Codex exec/resume JSON adapter, resident daemon presence/worker-retirement, attention wake-all/local reply policy, curator seed/schedule/queue-writeback workload, and Grind DB-backed curator scheduled workload")
     return 0
 
 
