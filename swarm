@@ -2510,12 +2510,12 @@ def records_for_surface(state: dict[str, Any], target: str) -> list[dict[str, An
 
 
 def anchor_seq(records: list[dict[str, Any]], anchor: str) -> int | None:
-    if anchor.isdigit():
-        return int(anchor)
     for record in records:
         msg_id = str(record["id"])
         if msg_id == anchor or short_id(msg_id) == anchor:
             return int(record["seq"])
+    if anchor.isdigit():
+        return int(anchor)
     return None
 
 

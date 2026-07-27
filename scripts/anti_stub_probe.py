@@ -287,6 +287,22 @@ def probe_read_pagination(cli: Path, state_dir: Path) -> None:
     for body in bodies:
         sent_ids.append(parse_message_id(run(cli, state_dir, "message", "send", "--target", target, stdin=body).stdout))
 
+    # A UUID short id can be all digits. It must resolve as a message id before
+    # numeric seq fallback, otherwise --before intermittently includes the
+    # anchor and later records depending on random UUID shape.
+    numeric_short_id = "12345678"
+    numeric_full_id = numeric_short_id + sent_ids[2][8:]
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE messages SET id = ? WHERE id = ?",
+                (numeric_full_id, sent_ids[2]),
+            )
+    finally:
+        conn.close()
+    sent_ids[2] = numeric_full_id
+
     full = run(cli, state_dir, "message", "read", "--channel", target).stdout
     for body in bodies:
         require(body in full, f"full paged read missing body: {body}")
