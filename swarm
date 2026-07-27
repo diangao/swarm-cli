@@ -5351,9 +5351,9 @@ def wake_shared_channel_context(
     trigger_seq = int(trigger["seq"])
     before_and_trigger: list[dict[str, Any]] = []
     after_trigger: list[dict[str, Any]] = []
-    for record in sorted(state.get("messages", []), key=lambda item: int(item.get("seq") or 0)):
-        if str(record.get("target")) != target:
-            continue
+    # A thread inherits its root message exactly as the read surface does;
+    # replies remain isolated from unrelated parent-channel traffic.
+    for record in records_for_surface(state, target):
         author = str(record.get("author") or "")
         record_type = str(record.get("type") or "")
         if record_type not in {"human", "agent"} and not author.startswith("slack:"):

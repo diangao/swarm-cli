@@ -3993,6 +3993,114 @@ def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
     )
 
 
+def probe_thread_wake_inherits_root(cli: Path, state_dir: Path) -> None:
+    agent = f"thread-shared-{uuid.uuid4().hex[:8]}"
+    workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    bot_env = f"THREAD_BOT_{uuid.uuid4().hex[:6].upper()}"
+    app_env = f"THREAD_APP_{uuid.uuid4().hex[:6].upper()}"
+    root_text = f"thread root fact {uuid.uuid4()}"
+    reply_text = f"thread reply trigger {uuid.uuid4()}"
+    output_text = f"thread shared root visible {uuid.uuid4()}"
+    runtime = state_dir / "thread-shared-runtime.py"
+    runtime.write_text(
+        "import sys\n"
+        "payload = sys.stdin.read()\n"
+        f"if {reply_text!r} in payload:\n"
+        f"    assert {root_text!r} in payload\n"
+        "    assert 'Shared channel timeline' in payload\n"
+        f"    print({output_text!r})\n"
+        "else:\n"
+        "    print('SILENT')\n"
+    )
+    run(
+        cli, state_dir, "agent", "register",
+        "--name", agent, "--display-name", agent,
+        "--runtime", f"{sys.executable} {runtime}",
+        "--workspace", f"agents/{agent}",
+    )
+    run(
+        cli, state_dir, "slack", "configure",
+        "--workspace", workspace,
+        "--bot-token-env", bot_env,
+        "--app-token-env", app_env,
+        "--mode", "socket_mode",
+    )
+    root_ts = f"1762500200.{uuid.uuid4().int % 1_000_000:06d}"
+    reply_ts = f"1762500201.{uuid.uuid4().int % 1_000_000:06d}"
+    mock = state_dir / "thread-shared-mock.jsonl"
+    mock.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "events_api",
+                        "payload": {
+                            "team_id": workspace,
+                            "event": {
+                                "type": "message",
+                                "channel": channel_id,
+                                "user": "UTHREAD",
+                                "text": root_text,
+                                "ts": root_ts,
+                            },
+                        },
+                        "envelope_id": f"env-{uuid.uuid4().hex}",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "events_api",
+                        "payload": {
+                            "team_id": workspace,
+                            "event": {
+                                "type": "message",
+                                "channel": channel_id,
+                                "user": "UTHREAD",
+                                "text": reply_text,
+                                "ts": reply_ts,
+                                "thread_ts": root_ts,
+                            },
+                        },
+                        "envelope_id": f"env-{uuid.uuid4().hex}",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    run(
+        cli, state_dir,
+        "daemon", "slack",
+        "--workspace", workspace,
+        "--mock-socket-file", str(mock),
+        env_overrides={app_env: f"xapp-thread-{uuid.uuid4()}"},
+    )
+    resident = run(
+        cli, state_dir, "daemon", "resident",
+        "--loops", "2", "--idle-interval", "0s", "--turn-timeout", "5s",
+    ).stdout
+    require("Resident daemon stopped after 2 iteration(s)" in resident, "thread shared resident did not finish")
+    conn = connect_state(state_dir)
+    try:
+        root = conn.execute(
+            "SELECT id FROM messages WHERE target = ? AND body = ?",
+            (f"#slack-{channel_id.lower()}", root_text),
+        ).fetchone()
+        require(root is not None, "thread root was not imported")
+        thread_target = f"#slack-{channel_id.lower()}:{str(root['id'])[:8]}"
+        turn_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM daemon_turns WHERE agent = ?",
+            (agent,),
+        ).fetchone()
+        require(turn_count is not None and turn_count["count"] == 2, "thread root/reply wakes were not bounded")
+    finally:
+        conn.close()
+    history = run(cli, state_dir, "message", "read", "--channel", thread_target).stdout
+    require(root_text in history and reply_text in history, "thread read surface lost root or reply")
+    require(output_text in history, "thread reply wake did not inherit the root context")
+
+
 def probe_daemon_resident(cli: Path, state_dir: Path) -> None:
     agent = f"resident-{uuid.uuid4().hex[:8]}"
     runtime = state_dir / "resident-runtime.py"
@@ -4814,6 +4922,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="swarm-turn-freshness-") as tmp:
         probe_daemon_turn_freshness_hold(cli, Path(tmp))
+
+    with tempfile.TemporaryDirectory(prefix="swarm-thread-shared-") as tmp:
+        probe_thread_wake_inherits_root(cli, Path(tmp))
 
     with tempfile.TemporaryDirectory(prefix="swarm-codex-adapter-") as tmp:
         probe_codex_turn_adapter(cli, Path(tmp))
