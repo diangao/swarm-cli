@@ -3698,13 +3698,37 @@ def agent_presence_row(state_dir: Path, agent_name: str) -> sqlite3.Row | None:
 
 
 def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
-    silent_agent = f"att-silent-{uuid.uuid4().hex[:6]}"
-    vocal_agent = f"att-vocal-{uuid.uuid4().hex[:6]}"
-    silent_rt = state_dir / "att-silent-rt.py"
-    silent_rt.write_text("import sys\nsys.stdin.read()\nprint('SILENT')\n")
+    vocal_agent = f"att-01-vocal-{uuid.uuid4().hex[:6]}"
+    aware_agent = f"att-02-aware-{uuid.uuid4().hex[:6]}"
+    silent_agent = f"att-03-silent-{uuid.uuid4().hex[:6]}"
     vocal_rt = state_dir / "att-vocal-rt.py"
-    vocal_rt.write_text("import sys\npayload = sys.stdin.read()\nassert '[attention wake]' in payload\nprint('attention reply: noted')\n")
-    for name, rt in ((silent_agent, silent_rt), (vocal_agent, vocal_rt)):
+    vocal_rt.write_text(
+        "import sys\n"
+        "payload = sys.stdin.read()\n"
+        "assert '[attention wake]' in payload\n"
+        "assert 'No same-wake peer reply has been posted yet.' in payload\n"
+        "print('attention reply: noted')\n"
+    )
+    aware_rt = state_dir / "att-aware-rt.py"
+    aware_rt.write_text(
+        "import sys\n"
+        "payload = sys.stdin.read()\n"
+        "assert 'Same-wake peer replies already posted' in payload\n"
+        f"assert '@{vocal_agent}: attention reply: noted' in payload\n"
+        "print('peer-aware reply: saw prior agent')\n"
+    )
+    silent_rt = state_dir / "att-silent-rt.py"
+    silent_rt.write_text(
+        "import sys\n"
+        "payload = sys.stdin.read()\n"
+        "assert 'peer-aware reply: saw prior agent' in payload\n"
+        "print('SILENT')\n"
+    )
+    for name, rt in (
+        (vocal_agent, vocal_rt),
+        (aware_agent, aware_rt),
+        (silent_agent, silent_rt),
+    ):
         run(
             cli, state_dir, "agent", "register",
             "--name", name, "--display-name", name,
@@ -3738,14 +3762,15 @@ def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
         if r.get("reason") == "attention"
     }
     require(
-        attention_agents >= {silent_agent, vocal_agent},
-        "attention routing did not wake both non-mentioned agents",
+        attention_agents >= {vocal_agent, aware_agent, silent_agent},
+        "attention routing did not wake all non-mentioned agents",
     )
     silents = daemon_event_details(state_dir, "turn_silent")
     require(any(d.get("agent") == silent_agent for d in silents), "SILENT turn was not recorded in ledger")
     target = f"#slack-{channel_id.lower()}"
     history = run(cli, state_dir, "message", "read", "--channel", target).stdout
     require("attention reply: noted" in history, "vocal attention agent reply was not appended")
+    require("peer-aware reply: saw prior agent" in history, "later attention agent did not receive same-wake peer context")
     require(f"@{silent_agent}" not in history, "SILENT output leaked into the channel")
 
 
