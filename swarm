@@ -5337,36 +5337,92 @@ def finish_dispatch_after_turn(
     return None
 
 
-def attention_peer_reply_context(
+def wake_shared_channel_context(
     state: dict[str, Any],
     target: str | None,
     input_message_id: str | None,
-    agent_name: str,
 ) -> str:
-    """Return peer replies after this trigger and before the next human message."""
+    """Return a bounded, ordered channel view through the current wake."""
     if not target or not input_message_id:
         return ""
     trigger, trigger_error = message_by_id(state, input_message_id)
     if trigger_error is not None or trigger is None:
         return ""
     trigger_seq = int(trigger["seq"])
-    replies: list[str] = []
-    for record in state.get("messages", []):
-        if str(record.get("target")) != target or int(record.get("seq") or 0) <= trigger_seq:
+    before_and_trigger: list[dict[str, Any]] = []
+    after_trigger: list[dict[str, Any]] = []
+    for record in sorted(state.get("messages", []), key=lambda item: int(item.get("seq") or 0)):
+        if str(record.get("target")) != target:
             continue
         author = str(record.get("author") or "")
         record_type = str(record.get("type") or "")
+        if record_type not in {"human", "agent"} and not author.startswith("slack:"):
+            continue
+        record_seq = int(record.get("seq") or 0)
+        if record_seq <= trigger_seq:
+            before_and_trigger.append(record)
+            continue
         if record_type == "human" or author.startswith("slack:"):
             break
-        if record_type != "agent" or author == agent_name:
-            continue
-        body = str(record.get("body") or "").strip()
+        after_trigger.append(record)
+        if len(after_trigger) >= 8:
+            break
+
+    # channel-based collaboration shares channel facts, not model sessions. Keep
+    # the recent pre-trigger conversation plus peer outputs already committed
+    # in this wake. Exact-target scoping preserves channel/thread isolation.
+    selected = before_and_trigger[-12:] + after_trigger
+    rendered: list[str] = []
+    for record in selected:
+        body = str(record.get("body") or "").strip().replace("\r", "")
         if not body:
             continue
-        replies.append(f"- @{author}: {body[:1200].replace(chr(13), '')}")
-        if len(replies) >= 4:
+        author = str(record.get("author") or "")
+        record_type = str(record.get("type") or "")
+        speaker = "human" if record_type == "human" or author.startswith("slack:") else f"@{author}"
+        rendered.append(f"[seq={int(record.get('seq') or 0)}] {speaker}: {body[:1200]}")
+
+    # Bound the final prompt by bytes of useful recent history while always
+    # preferring the newest channel facts over stale runtime session memory.
+    bounded: list[str] = []
+    remaining = 12_000
+    for line in reversed(rendered):
+        if remaining <= 0:
             break
-    return "\n".join(replies)
+        kept = line[:remaining]
+        bounded.append(kept)
+        remaining -= len(kept) + 1
+    return "\n".join(reversed(bounded))
+
+
+def wake_live_presence_context(state: dict[str, Any]) -> str:
+    """Render the resident's current agent-presence ledger for a wake turn."""
+    lines: list[str] = []
+    for record in sorted(state.get("agents", []), key=lambda item: str(item.get("name") or "")):
+        name = str(record.get("name") or "")
+        presence = str(record.get("presence") or "unknown")
+        if presence in {"idle", "in_turn"}:
+            status = f"present ({presence})"
+        else:
+            status = presence
+        updated_at = str(record.get("presence_updated_at") or "unknown")
+        lines.append(f"- @{name}: {status}; updated={updated_at}")
+        if len(lines) >= 40:
+            break
+    return "\n".join(lines)
+
+
+def latest_target_message_seq(state: dict[str, Any], target: str | None) -> int:
+    if not target:
+        return 0
+    return max(
+        (
+            int(record.get("seq") or 0)
+            for record in state.get("messages", [])
+            if str(record.get("target")) == target
+        ),
+        default=0,
+    )
 
 
 def prepare_daemon_turn(
@@ -5411,6 +5467,10 @@ def prepare_daemon_turn(
             return {"error": "Agent runtime is empty", "code": "INVALID_ARG"}
 
         wake = daemon_wake_by_agent(state, agent_name)
+        # Bind wake consumption to the state observed at prepare time. A wake
+        # that arrives while an unrelated/manual runtime is already executing
+        # must survive that turn and be handled with its fresher channel view.
+        consumes_wake = bool(wake is not None and wake.get("running"))
         input_message_id = payload_fields.get("input_message_id")
         input_text = explicit_input if explicit_input is not None else payload_fields.get("input_text", "")
         target = explicit_target if explicit_target is not None else payload_fields.get("target")
@@ -5421,29 +5481,36 @@ def prepare_daemon_turn(
                 input_message_id = str(active_record["id"])
                 if target is None:
                     target = str(active_record["target"])
-                if wake.get("active_reason") == "attention":
-                    peer_context = attention_peer_reply_context(
+                if wake.get("active_reason") in {"attention", "mention"}:
+                    shared_context = wake_shared_channel_context(
                         state,
                         target,
                         input_message_id,
-                        agent_name,
+                    )
+                    presence_context = wake_live_presence_context(state)
+                    attention_instruction = (
+                        "You were not mentioned. Reply ONLY if you are addressed implicitly or have something "
+                        "genuinely useful to add; otherwise output exactly SILENT and nothing else."
+                        if wake.get("active_reason") == "attention"
+                        else "You were explicitly mentioned; respond to the request as appropriate."
                     )
                     input_text = (
-                        "[attention wake] New channel message below. You were not mentioned. "
-                        "Reply ONLY if you are addressed implicitly or have something genuinely useful to add; "
-                        "otherwise output exactly SILENT and nothing else. Multiple agents may answer sequentially. "
-                        "When speaking about another agent's presence, reachability, or reply, use only the "
-                        "same-wake peer snapshot below; never reuse an older session claim. If the snapshot has "
-                        "no evidence about a peer, speak only for yourself or output SILENT.\n\n"
+                        f"[{wake.get('active_reason')} wake] New channel message below. {attention_instruction} "
+                        "Multiple agents may answer sequentially. Agent identities and model sessions are "
+                        "independent, but the ordered shared channel timeline below is authoritative collaboration "
+                        "state and outranks older session memory. The live presence snapshot is the only authority "
+                        "for current agent availability; the timeline is the authority for what was said. A visible "
+                        "reply proves that reply happened; absent reply evidence does not prove a peer is "
+                        "unreachable. If neither shared surface contains evidence about a peer, speak only for "
+                        "yourself or output SILENT.\n\n"
                         "Trigger message:\n"
                         + input_text
-                        + (
-                            "\n\nSame-wake peer replies already posted (fresher than prior session memory):\n"
-                            + peer_context
-                            if peer_context
-                            else "\n\nNo same-wake peer reply has been posted yet."
-                        )
+                        + "\n\nShared channel timeline (authoritative, chronological; same exact target only):\n"
+                        + (shared_context or "(no channel history available)")
+                        + "\n\nLive agent presence snapshot (ledger at turn start):\n"
+                        + (presence_context or "(no agent presence available)")
                     )
+        target_snapshot_seq = latest_target_message_seq(state, target)
         session_id = explicit_session_id or payload_fields.get("session_id")
         prior_done_sessions = [
             str(item["session_id"])
@@ -5525,10 +5592,12 @@ def prepare_daemon_turn(
             "agent": agent_name,
             "dispatch_id": dispatch_id,
             "owner": owner_name,
+            "consumes_wake": consumes_wake,
             "workspace_path": workspace_path,
             "workspace_abs": str(state_dir() / workspace_path),
             "command": command,
             "target": target,
+            "target_snapshot_seq": target_snapshot_seq,
             "input_message_id": input_message_id,
             "input_text": input_text,
             "session_id": session_id,
@@ -5543,6 +5612,8 @@ def finalize_daemon_turn(
     dispatch_id: int | None,
     owner_name: str | None,
     target: str | None,
+    target_snapshot_seq: int,
+    consumes_wake: bool,
     status: str,
     exit_code: int | None,
     stdout_text: str | None,
@@ -5572,7 +5643,7 @@ def finalize_daemon_turn(
                 )
         wake_status = None
         wake = daemon_wake_by_agent(state, agent_name)
-        if wake is not None and wake.get("running"):
+        if consumes_wake and wake is not None and wake.get("running"):
             wake_status, _ = finish_daemon_wake(state, agent_name)
         effective_status = "failed" if dispatch_error is not None else status
         effective_error = "dispatch finalize failed" if dispatch_error is not None else error_text
@@ -5588,8 +5659,30 @@ def finalize_daemon_turn(
             turn["session_id"] = completed_session_id
         message_id = None
         stdout_clean = (stdout_text or "").strip()
+        current_target_seq = latest_target_message_seq(state, target)
+        freshness_held = (
+            dispatch_error is None
+            and status == "done"
+            and bool(target)
+            and bool(stdout_clean)
+            and stdout_clean != "SILENT"
+            and current_target_seq > target_snapshot_seq
+        )
         if stdout_clean == "SILENT":
             append_daemon_event(state, "turn_silent", {"id": turn_id, "agent": agent_name})
+        elif freshness_held:
+            append_daemon_event(
+                state,
+                "turn_freshness_hold",
+                {
+                    "id": turn_id,
+                    "agent": agent_name,
+                    "target": target,
+                    "snapshot_seq": target_snapshot_seq,
+                    "current_seq": current_target_seq,
+                    "output_chars": len(stdout_clean),
+                },
+            )
         elif dispatch_error is None and status == "done" and target and stdout_clean:
             record = append_message(state, target, stdout_clean, author=agent_name)
             message_id = record["id"]
@@ -5604,12 +5697,13 @@ def finalize_daemon_turn(
                 "status": effective_status,
                 "wake_status": wake_status,
                 "message_id": message_id,
+                "freshness_held": freshness_held,
                 "dispatch_error": dispatch_error,
             },
         )
         if dispatch_error is not None:
             return {"raw_error": dispatch_error}
-        return {"wake_status": wake_status, "message_id": message_id}
+        return {"wake_status": wake_status, "message_id": message_id, "freshness_held": freshness_held}
 
     return with_mutable_state_value(action)
 
@@ -5800,6 +5894,8 @@ def execute_daemon_turn(
         prepared.get("dispatch_id"),
         str(prepared["owner"]) if prepared.get("owner") is not None else None,
         prepared.get("target"),
+        int(prepared.get("target_snapshot_seq") or 0),
+        bool(prepared.get("consumes_wake")),
         status,
         exit_code,
         clipped_turn_output(stdout_text),
@@ -5819,6 +5915,7 @@ def execute_daemon_turn(
         "agent": str(prepared["agent"]),
         "message_id": finalized.get("message_id"),
         "wake_status": finalized.get("wake_status"),
+        "freshness_held": bool(finalized.get("freshness_held")),
     }
 
 

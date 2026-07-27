@@ -3701,19 +3701,32 @@ def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
     vocal_agent = f"att-01-vocal-{uuid.uuid4().hex[:6]}"
     aware_agent = f"att-02-aware-{uuid.uuid4().hex[:6]}"
     silent_agent = f"att-03-silent-{uuid.uuid4().hex[:6]}"
+    prior_fact = f"prior shared channel fact {uuid.uuid4()}"
+    trigger_text = f"no mention here {uuid.uuid4()}"
+    other_target_secret = f"must not cross targets {uuid.uuid4()}"
     vocal_rt = state_dir / "att-vocal-rt.py"
     vocal_rt.write_text(
         "import sys\n"
         "payload = sys.stdin.read()\n"
         "assert '[attention wake]' in payload\n"
-        "assert 'No same-wake peer reply has been posted yet.' in payload\n"
+        "assert 'Shared channel timeline' in payload\n"
+        "assert 'Live agent presence snapshot' in payload\n"
+        f"assert '@{aware_agent}: present (idle)' in payload\n"
+        f"assert {prior_fact!r} in payload\n"
+        f"assert {trigger_text!r} in payload\n"
+        f"assert {other_target_secret!r} not in payload\n"
         "print('attention reply: noted')\n"
     )
     aware_rt = state_dir / "att-aware-rt.py"
     aware_rt.write_text(
         "import sys\n"
         "payload = sys.stdin.read()\n"
-        "assert 'Same-wake peer replies already posted' in payload\n"
+        "assert 'Shared channel timeline' in payload\n"
+        "assert 'Live agent presence snapshot' in payload\n"
+        f"assert '@{vocal_agent}: present (idle)' in payload\n"
+        f"assert {prior_fact!r} in payload\n"
+        f"assert {trigger_text!r} in payload\n"
+        f"assert {other_target_secret!r} not in payload\n"
         f"assert '@{vocal_agent}: attention reply: noted' in payload\n"
         "print('peer-aware reply: saw prior agent')\n"
     )
@@ -3721,6 +3734,10 @@ def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
     silent_rt.write_text(
         "import sys\n"
         "payload = sys.stdin.read()\n"
+        "assert 'Live agent presence snapshot' in payload\n"
+        f"assert {prior_fact!r} in payload\n"
+        f"assert {trigger_text!r} in payload\n"
+        f"assert {other_target_secret!r} not in payload\n"
         "assert 'peer-aware reply: saw prior agent' in payload\n"
         "print('SILENT')\n"
     )
@@ -3740,10 +3757,13 @@ def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
     bot_env = f"ATT_BOT_{uuid.uuid4().hex[:6].upper()}"
     app_env = f"ATT_APP_{uuid.uuid4().hex[:6].upper()}"
     run(cli, state_dir, "slack", "configure", "--workspace", workspace, "--bot-token-env", bot_env, "--app-token-env", app_env, "--mode", "socket_mode")
+    target = f"#slack-{channel_id.lower()}"
+    run(cli, state_dir, "message", "send", "--target", target, stdin=prior_fact)
+    run(cli, state_dir, "message", "send", "--target", f"#other-{uuid.uuid4().hex[:8]}", stdin=other_target_secret)
     mock = state_dir / "att-mock.jsonl"
     mock.write_text(json.dumps({
         "type": "events_api",
-        "payload": {"team_id": workspace, "event": {"type": "message", "channel": channel_id, "user": "UATTN", "text": f"no mention here {uuid.uuid4()}", "ts": f"1762400000.{uuid.uuid4().int % 1_000_000:06d}"}},
+        "payload": {"team_id": workspace, "event": {"type": "message", "channel": channel_id, "user": "UATTN", "text": trigger_text, "ts": f"1762400000.{uuid.uuid4().int % 1_000_000:06d}"}},
         "envelope_id": f"env-{uuid.uuid4().hex}",
     }) + "\n")
     resident = run(
@@ -3767,11 +3787,128 @@ def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
     )
     silents = daemon_event_details(state_dir, "turn_silent")
     require(any(d.get("agent") == silent_agent for d in silents), "SILENT turn was not recorded in ledger")
-    target = f"#slack-{channel_id.lower()}"
     history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(prior_fact in history, "pre-trigger shared channel fact disappeared")
     require("attention reply: noted" in history, "vocal attention agent reply was not appended")
-    require("peer-aware reply: saw prior agent" in history, "later attention agent did not receive same-wake peer context")
+    require("peer-aware reply: saw prior agent" in history, "later attention agent did not receive shared channel context")
     require(f"@{silent_agent}" not in history, "SILENT output leaked into the channel")
+    conn = connect_state(state_dir)
+    try:
+        turn_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM daemon_turns WHERE agent IN (?, ?, ?)",
+            (vocal_agent, aware_agent, silent_agent),
+        ).fetchone()
+        wake_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM daemon_wakes "
+            "WHERE agent_name IN (?, ?, ?) AND (running = 1 OR pending_count > 0)",
+            (vocal_agent, aware_agent, silent_agent),
+        ).fetchone()
+        require(turn_count is not None and turn_count["count"] == 3, "agent output caused an attention wake cascade")
+        require(wake_count is not None and wake_count["count"] == 0, "attention wakes did not drain to a bounded state")
+    finally:
+        conn.close()
+
+
+def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
+    agent = f"fresh-turn-{uuid.uuid4().hex[:8]}"
+    workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    target = f"#slack-{channel_id.lower()}"
+    marker = state_dir / "fresh-turn-started"
+    runtime = state_dir / "fresh-turn-runtime.py"
+    stale_output = f"stale output must be held {uuid.uuid4()}"
+    newer_fact = f"newer target fact {uuid.uuid4()}"
+    fresh_output = f"fresh retry saw newer fact {uuid.uuid4()}"
+    runtime.write_text(
+        "import pathlib, sys, time\n"
+        f"pathlib.Path({str(marker)!r}).write_text('started')\n"
+        "payload = sys.stdin.read()\n"
+        f"if {newer_fact!r} in payload:\n"
+        f"    print({fresh_output!r})\n"
+        "else:\n"
+        "    time.sleep(0.4)\n"
+        f"    print({stale_output!r})\n"
+    )
+    run(
+        cli, state_dir, "agent", "register",
+        "--name", agent, "--display-name", agent,
+        "--runtime", f"{sys.executable} {runtime}",
+        "--workspace", f"agents/{agent}",
+    )
+    bot_env = f"FRESH_BOT_{uuid.uuid4().hex[:6].upper()}"
+    app_env = f"FRESH_APP_{uuid.uuid4().hex[:6].upper()}"
+    run(
+        cli, state_dir, "slack", "configure",
+        "--workspace", workspace,
+        "--bot-token-env", bot_env,
+        "--app-token-env", app_env,
+        "--mode", "socket_mode",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        turn = executor.submit(
+            run,
+            cli, state_dir,
+            "daemon", "turn", "run",
+            "--agent", agent,
+            "--input", "freshness probe",
+            "--target", target,
+            "--timeout", "5s",
+        )
+        deadline = time.time() + 3
+        while not marker.exists() and time.time() < deadline:
+            time.sleep(0.01)
+        require(marker.exists(), "freshness probe runtime did not start")
+        event = {
+            "team_id": workspace,
+            "event": {
+                "type": "message",
+                "channel": channel_id,
+                "user": "UFRESH",
+                "text": newer_fact,
+                "ts": f"1762500000.{uuid.uuid4().int % 1_000_000:06d}",
+            },
+        }
+        mock = state_dir / "fresh-turn-mock.jsonl"
+        mock.write_text(
+            json.dumps(
+                {
+                    "type": "events_api",
+                    "payload": event,
+                    "envelope_id": f"env-{uuid.uuid4().hex}",
+                }
+            )
+            + "\n"
+        )
+        run(
+            cli, state_dir,
+            "daemon", "slack",
+            "--workspace", workspace,
+            "--mock-socket-file", str(mock),
+            env_overrides={app_env: f"xapp-fresh-{uuid.uuid4()}"},
+        )
+        turn.result()
+
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(newer_fact in history, "newer target fact was not committed")
+    require(stale_output not in history, "stale turn output bypassed freshness hold")
+    holds = daemon_event_details(state_dir, "turn_freshness_hold")
+    require(
+        any(detail.get("agent") == agent and detail.get("current_seq", 0) > detail.get("snapshot_seq", 0) for detail in holds),
+        "stale turn output did not record a freshness hold",
+    )
+    wake = daemon_wake_row(state_dir, agent)
+    require(wake is not None and int(wake["running"]) == 1, "freshness hold consumed the newer human wake")
+    resident = run(
+        cli, state_dir, "daemon", "resident",
+        "--loops", "2", "--idle-interval", "0s", "--turn-timeout", "5s",
+    ).stdout
+    require("Resident daemon stopped after 2 iteration(s)" in resident, "freshness retry resident did not finish")
+    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
+    require(fresh_output in history, "freshness retry did not receive the newer shared channel fact")
+    require(stale_output not in history, "held stale output leaked after freshness retry")
+    wake = daemon_wake_row(state_dir, agent)
+    require(wake is not None and int(wake["running"]) == 0, "freshness retry wake did not drain")
 
 
 def probe_daemon_resident(cli: Path, state_dir: Path) -> None:
@@ -4593,6 +4730,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="swarm-attention-") as tmp:
         probe_attention_wakes(cli, Path(tmp))
 
+    with tempfile.TemporaryDirectory(prefix="swarm-turn-freshness-") as tmp:
+        probe_daemon_turn_freshness_hold(cli, Path(tmp))
+
     with tempfile.TemporaryDirectory(prefix="swarm-codex-adapter-") as tmp:
         probe_codex_turn_adapter(cli, Path(tmp))
 
@@ -4602,7 +4742,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="swarm-curator-grind-") as tmp:
         probe_curator_grind_db_workload(cli, Path(tmp))
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, Codex exec/resume JSON adapter, resident daemon presence/worker-retirement, attention wake-all/local reply policy, curator seed/schedule/queue-writeback workload, and Grind DB-backed curator scheduled workload")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, Codex exec/resume JSON adapter, resident daemon presence/worker-retirement, shared-channel attention/presence context, bounded no-runaway/SILENT collaboration, stale-output freshness hold and retry, curator seed/schedule/queue-writeback workload, and Grind DB-backed curator scheduled workload")
     return 0
 
 
