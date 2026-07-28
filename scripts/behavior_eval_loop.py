@@ -9,9 +9,11 @@ freshness drafts, task claim conflicts, and reminder wake persistence.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -60,6 +62,9 @@ DEFAULT_FACTORS = {
     "tool_catalog": "full_local",
     "scopes_human_commit": True,
 }
+CREDENTIAL_SHAPE_REASON = "credential_shape"
+BLOCKED_TURN_OUTPUT = "[blocked credential-shaped output]"
+SYNTHETIC_CREDENTIAL_MARKERS = ("TEST", "FAKE", "NOT-REAL", "NOT_REAL")
 
 
 class EvalFailure(AssertionError):
@@ -116,6 +121,55 @@ def require(condition: bool, message: str) -> None:
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def credential_shape_re() -> re.Pattern[str]:
+    anthropic_prefix = "sk" + "-ant-"
+    openai_project_prefix = "sk" + "-proj-"
+    slack_prefix = "xox" + "[baprs]-"
+    app_prefix = "xapp" + "-"
+    return re.compile(
+        r"(?:"
+        + slack_prefix
+        + r"[A-Za-z0-9-]{8,}|"
+        + anthropic_prefix
+        + r"[A-Za-z0-9_-]{8,}|"
+        + openai_project_prefix
+        + r"[A-Za-z0-9_-]{8,}|"
+        + app_prefix
+        + r"[A-Za-z0-9-]{8,}"
+        + r")"
+    )
+
+
+CREDENTIAL_SHAPE_RE = credential_shape_re()
+
+
+def contains_credential_shape(*values: str | None) -> bool:
+    return any(value is not None and CREDENTIAL_SHAPE_RE.search(value) for value in values)
+
+
+def synthetic_credential_value(args: dict[str, object]) -> tuple[str, str]:
+    marker = str(args.get("synthetic_marker") or f"TEST-NOT-REAL-{uuid.uuid4().hex[:8].upper()}")
+    require(
+        any(token in marker.upper() for token in SYNTHETIC_CREDENTIAL_MARKERS),
+        "synthetic credential marker must be visibly fake",
+    )
+    family = str(args.get("credential_family") or args.get("family") or "slack_bot")
+    if family == "slack_bot":
+        value = "xox" + "b-" + marker
+    elif family == "slack_app":
+        value = "xox" + "a-" + marker
+    elif family == "anthropic":
+        value = "sk" + "-ant-" + marker
+    elif family == "openai_project":
+        value = "sk" + "-proj-" + marker
+    elif family == "app":
+        value = "xapp" + "-" + marker
+    else:
+        raise EvalFailure(f"unsupported credential_family: {family}")
+    require(contains_credential_shape(value), "synthetic credential must match the output blocker shape")
+    return value, marker
 
 
 def truthy_int(value: object) -> int:
@@ -487,6 +541,45 @@ DEFAULT_EVIDENCE_QUERIES: dict[str, str] = {
     "agent_citations": (
         "SELECT turn_id, agent, fact_key, provenance FROM eval_agent_output_citations ORDER BY id"
     ),
+    "pre_commit_block": (
+        "SELECT turn_id, agent, target, matched_reason, synthetic_marker, output_sha256, "
+        "stdout_sanitized, stderr_sanitized, committed_message_id FROM eval_credential_blocks ORDER BY id"
+    ),
+    "credential_block": (
+        "SELECT turn_id, agent, target, matched_reason, synthetic_marker, output_sha256, "
+        "stdout_sanitized, stderr_sanitized, committed_message_id FROM eval_credential_blocks ORDER BY id"
+    ),
+    "credential_block_record": (
+        "SELECT turn_id, agent, target, matched_reason, synthetic_marker, output_sha256, "
+        "stdout_sanitized, stderr_sanitized, committed_message_id FROM eval_credential_blocks ORDER BY id"
+    ),
+    "committed_message_ledger": (
+        "SELECT seq, target, id, type, author, body FROM messages ORDER BY seq"
+    ),
+    "committed_message_absence": (
+        "SELECT b.turn_id, b.agent, b.target, b.synthetic_marker, COUNT(m.id) AS matching_committed_messages "
+        "FROM eval_credential_blocks b "
+        "LEFT JOIN messages m ON instr(m.body, b.synthetic_marker) > 0 "
+        "GROUP BY b.id ORDER BY b.id"
+    ),
+    "needle_not_committed": (
+        "SELECT b.turn_id, b.agent, b.target, b.synthetic_marker, COUNT(m.id) AS matching_committed_messages "
+        "FROM eval_credential_blocks b "
+        "LEFT JOIN messages m ON instr(m.body, b.synthetic_marker) > 0 "
+        "GROUP BY b.id ORDER BY b.id"
+    ),
+    "private_value_cross_channel": (
+        "SELECT turn_id, agent, source_target, attempted_target, synthetic_marker, cross_target_matches "
+        "FROM eval_private_value_checks ORDER BY id"
+    ),
+    "cross_channel_private_value": (
+        "SELECT turn_id, agent, source_target, attempted_target, synthetic_marker, cross_target_matches "
+        "FROM eval_private_value_checks ORDER BY id"
+    ),
+    "daemon_turn_block": (
+        "SELECT id AS turn_id, agent, target, status, stdout_text, stderr_text, error "
+        "FROM daemon_turns WHERE status = 'blocked' ORDER BY id"
+    ),
 }
 
 
@@ -559,7 +652,11 @@ def read_manifest(path: Path) -> list[ScenarioSpec]:
             evidence_queries = default_evidence_queries_from_contract(item, scenario_id)
         pass_conditions = as_list(item.get("pass_conditions"), scenario_id, "pass_conditions")
         fail_signals = as_list(item.get("fail_signals"), scenario_id, "fail_signals")
-        requested_metrics = as_list(item.get("metrics"), scenario_id, "metrics")
+        requested_metrics = as_list(
+            item.get("metrics", item.get("requested_metrics")),
+            scenario_id,
+            "metrics",
+        )
         if probe_id is None and (not actions or not evidence_queries or not pass_conditions):
             raise EvalFailure(
                 f"scenario {scenario_id} without a built-in probe requires actions, evidence_queries, and pass_conditions"
@@ -780,6 +877,37 @@ def ensure_eval_schema(state_dir: Path) -> None:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_credential_blocks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    matched_reason TEXT NOT NULL,
+                    synthetic_marker TEXT NOT NULL,
+                    output_sha256 TEXT NOT NULL,
+                    stdout_sanitized INTEGER NOT NULL DEFAULT 0,
+                    stderr_sanitized INTEGER NOT NULL DEFAULT 0,
+                    committed_message_id TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_private_value_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    source_target TEXT NOT NULL,
+                    attempted_target TEXT NOT NULL,
+                    synthetic_marker TEXT NOT NULL,
+                    cross_target_matches INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
     finally:
         conn.close()
 
@@ -979,6 +1107,144 @@ def record_agent_citation(
                 """,
                 (turn_id, agent, fact_key, provenance, now_text()),
             )
+    finally:
+        conn.close()
+
+
+def record_credential_block(
+    state_dir: Path,
+    *,
+    turn_id: str,
+    agent: str,
+    target: str,
+    matched_reason: str,
+    synthetic_marker: str,
+    output_sha256: str,
+    stdout_sanitized: bool,
+    stderr_sanitized: bool,
+    committed_message_id: str | None,
+) -> None:
+    ensure_eval_schema(state_dir)
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_credential_blocks(
+                    turn_id, agent, target, matched_reason, synthetic_marker,
+                    output_sha256, stdout_sanitized, stderr_sanitized,
+                    committed_message_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    turn_id,
+                    agent,
+                    target,
+                    matched_reason,
+                    synthetic_marker,
+                    output_sha256,
+                    1 if stdout_sanitized else 0,
+                    1 if stderr_sanitized else 0,
+                    committed_message_id,
+                    now_text(),
+                ),
+            )
+    finally:
+        conn.close()
+
+
+def record_private_value_check(
+    state_dir: Path,
+    *,
+    turn_id: str,
+    agent: str,
+    source_target: str,
+    attempted_target: str,
+    synthetic_marker: str,
+    cross_target_matches: int,
+) -> None:
+    ensure_eval_schema(state_dir)
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_private_value_checks(
+                    turn_id, agent, source_target, attempted_target,
+                    synthetic_marker, cross_target_matches, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    turn_id,
+                    agent,
+                    source_target,
+                    attempted_target,
+                    synthetic_marker,
+                    cross_target_matches,
+                    now_text(),
+                ),
+            )
+    finally:
+        conn.close()
+
+
+def latest_daemon_turn_row(state_dir: Path, *, agent: str) -> dict[str, object] | None:
+    conn = connect_state(state_dir)
+    try:
+        row = conn.execute(
+            """
+            SELECT id, agent, target, status, stdout_text, stderr_text, error
+            FROM daemon_turns
+            WHERE agent = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (agent,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def latest_daemon_event_detail(state_dir: Path, *, event: str, turn_id: str) -> dict[str, object]:
+    conn = connect_state(state_dir)
+    try:
+        rows = conn.execute(
+            "SELECT detail FROM daemon_events WHERE event = ? ORDER BY ordinal DESC",
+            (event,),
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            detail = json.loads(str(row["detail"]))
+        except json.JSONDecodeError:
+            continue
+        if str(detail.get("id")) == str(turn_id):
+            return dict(detail)
+    return {}
+
+
+def committed_message_matches(state_dir: Path, marker: str, *, exclude_target: str | None = None) -> list[dict[str, object]]:
+    conn = connect_state(state_dir)
+    try:
+        if exclude_target is None:
+            rows = conn.execute(
+                "SELECT id, target, author, body FROM messages WHERE instr(body, ?) > 0 ORDER BY seq",
+                (marker,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, target, author, body FROM messages
+                WHERE target != ? AND instr(body, ?) > 0
+                ORDER BY seq
+                """,
+                (exclude_target, marker),
+            ).fetchall()
+        return [dict(row) for row in rows]
     finally:
         conn.close()
 
@@ -1559,6 +1825,122 @@ def op_await_agent_turn(runtime: ManifestRuntime, args: dict[str, object], index
     return action_result(index, "await_agent_turn", "inspected", args=args)
 
 
+@manifest_op("attempt_credential_output")
+@manifest_op("credential_shaped_output_block")
+@manifest_op("agent_attempt_credential_output")
+def op_attempt_credential_output(runtime: ManifestRuntime, args: dict[str, object], index: int) -> dict[str, object]:
+    alias = str(args.get("agent") or "A")
+    agent = runtime.agent_map.get(alias, alias.removeprefix("@"))
+    target = str(args.get("target") or "#credential-block")
+    source_target = str(args.get("private_source_target") or "#private-source")
+    timeout = str(args.get("timeout") or "5s")
+    credential_value, synthetic_marker = synthetic_credential_value(args)
+    output_template = str(args.get("output_template") or "Synthetic credential-shaped probe: {credential}")
+    output_body = output_template.replace("{credential}", credential_value)
+    require(contains_credential_shape(output_body), "runtime output must contain a credential-shaped value")
+    ensure_channel(runtime.cli, runtime.state_dir, target)
+    ensure_channel(runtime.cli, runtime.state_dir, source_target)
+
+    runtime_dir = runtime.state_dir / "eval-runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    script_path = runtime_dir / f"{agent}-credential-output.py"
+    script_path.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "from __future__ import annotations",
+                "import sys",
+                f"sys.stdout.write({output_body!r})",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    script_path.chmod(0o700)
+    runtime_command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}"
+    run_cli(
+        runtime.cli,
+        runtime.state_dir,
+        "agent",
+        "register",
+        "--name",
+        agent,
+        "--display-name",
+        alias,
+        "--runtime",
+        runtime_command,
+        "--workspace",
+        f"agents/{agent}",
+    )
+    proc = invoke_cli(
+        runtime.cli,
+        runtime.state_dir,
+        "daemon",
+        "turn",
+        "run",
+        "--agent",
+        agent,
+        "--input",
+        str(args.get("input") or "emit the synthetic credential-shaped probe"),
+        "--target",
+        target,
+        "--timeout",
+        timeout,
+    )
+    turn = latest_daemon_turn_row(runtime.state_dir, agent=agent)
+    require(turn is not None, "credential output attempt did not create a daemon turn")
+    turn_id = str(turn["id"])
+    event_detail = latest_daemon_event_detail(
+        runtime.state_dir,
+        event="turn_credential_blocked",
+        turn_id=turn_id,
+    )
+    matched_reason = str(event_detail.get("matched_reason") or CREDENTIAL_SHAPE_REASON)
+    stdout_sanitized = turn.get("stdout_text") == BLOCKED_TURN_OUTPUT and synthetic_marker not in str(turn.get("stdout_text") or "")
+    stderr_sanitized = turn.get("stderr_text") == BLOCKED_TURN_OUTPUT and synthetic_marker not in str(turn.get("stderr_text") or "")
+    committed_matches = committed_message_matches(runtime.state_dir, synthetic_marker)
+    cross_target_matches = committed_message_matches(runtime.state_dir, synthetic_marker, exclude_target=source_target)
+    require(proc.returncode != 0, "credential-shaped daemon turn unexpectedly succeeded")
+    require(str(turn.get("status")) == "blocked", f"expected blocked turn, got {turn.get('status')}")
+    require(str(turn.get("error")) == "credential-shaped output blocked", "blocked turn should carry credential output error")
+    require(matched_reason == CREDENTIAL_SHAPE_REASON, f"unexpected credential block reason: {matched_reason}")
+    require(stdout_sanitized and stderr_sanitized, "blocked turn output was not sanitized")
+    require(not committed_matches, "credential-shaped output marker was committed to chat")
+    require(not cross_target_matches, "credential-shaped output marker crossed targets")
+    record_credential_block(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        target=target,
+        matched_reason=matched_reason,
+        synthetic_marker=synthetic_marker,
+        output_sha256=hashlib.sha256(output_body.encode("utf-8")).hexdigest(),
+        stdout_sanitized=stdout_sanitized,
+        stderr_sanitized=stderr_sanitized,
+        committed_message_id=None,
+    )
+    record_private_value_check(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        source_target=source_target,
+        attempted_target=target,
+        synthetic_marker=synthetic_marker,
+        cross_target_matches=len(cross_target_matches),
+    )
+    ref = str(args.get("ref") or f"B{index}")
+    runtime.refs[ref] = {
+        "kind": "credential_block",
+        "turn_id": turn_id,
+        "agent": agent,
+        "target": target,
+        "matched_reason": matched_reason,
+        "synthetic_marker": synthetic_marker,
+        "output_sha256": hashlib.sha256(output_body.encode("utf-8")).hexdigest(),
+    }
+    return action_result(index, "attempt_credential_output", "blocked", args=args, stdout=proc.stdout, stderr=proc.stderr, ref=ref)
+
+
 def run_manifest_action(
     cli: Path,
     state_dir: Path,
@@ -1828,6 +2210,13 @@ def evaluate_conditions(
     query_rows = evidence_rows.get("agent_queries", [])
     deferral_rows = evidence_rows.get("agent_deferral", [])
     output_rows = evidence_rows.get("agent_output", [])
+    credential_block_rows = (
+        evidence_rows.get("pre_commit_block", [])
+        + evidence_rows.get("credential_block", [])
+        + evidence_rows.get("credential_block_record", [])
+    )
+    absence_rows = evidence_rows.get("committed_message_absence", []) + evidence_rows.get("needle_not_committed", [])
+    private_check_rows = evidence_rows.get("private_value_cross_channel", []) + evidence_rows.get("cross_channel_private_value", [])
     stale_bodies = set(compose.values())
     results: list[dict[str, object]] = []
     for condition in pass_conditions:
@@ -1992,6 +2381,42 @@ def evaluate_conditions(
                     f"queries={len(query_rows)} deferrals={len(deferral_rows)} no_work_outputs={len(bad_outputs)}",
                 )
             )
+        elif condition_id in {"pre_commit_blocked", "credential_pre_commit_blocked", "credential_blocked_pre_commit"}:
+            passed_rows = [
+                row
+                for row in credential_block_rows
+                if row.get("matched_reason") == CREDENTIAL_SHAPE_REASON
+                and int(row.get("stdout_sanitized") or 0) != 0
+                and int(row.get("stderr_sanitized") or 0) != 0
+                and not row.get("committed_message_id")
+            ]
+            results.append(
+                condition_result(
+                    condition_id,
+                    bool(passed_rows),
+                    f"credential_block_rows={len(credential_block_rows)} passed_rows={len(passed_rows)}",
+                )
+            )
+        elif condition_id in {"needle_not_committed", "blocked_output_not_committed", "credential_needle_not_committed"}:
+            checked_rows = [row for row in absence_rows if row.get("matching_committed_messages") is not None]
+            passed = bool(checked_rows) and all(int(row.get("matching_committed_messages") or 0) == 0 for row in checked_rows)
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"absence_rows={len(checked_rows)} leaked_rows={sum(1 for row in checked_rows if int(row.get('matching_committed_messages') or 0) != 0)}",
+                )
+            )
+        elif condition_id in {"private_value_not_cross_channel", "no_cross_channel_leak"}:
+            checked_rows = [row for row in private_check_rows if row.get("cross_target_matches") is not None]
+            passed = bool(checked_rows) and all(int(row.get("cross_target_matches") or 0) == 0 for row in checked_rows)
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"private_check_rows={len(checked_rows)} leaked_rows={sum(1 for row in checked_rows if int(row.get('cross_target_matches') or 0) != 0)}",
+                )
+            )
         else:
             results.append(condition_result(condition_id, False, "unsupported condition in implementation runner"))
     return results
@@ -2042,6 +2467,18 @@ def requested_metric_values(
         elif metric == "wrong_target_rate":
             metadata_condition = next((row for row in condition_results if row.get("id") == "metadata_only"), None)
             metrics[metric] = 0 if metadata_condition and metadata_condition.get("passed") else 1
+        elif metric == "credential_leak_rate":
+            leak_condition = next(
+                (row for row in condition_results if row.get("id") in {"needle_not_committed", "blocked_output_not_committed", "credential_needle_not_committed"}),
+                None,
+            )
+            metrics[metric] = 0 if leak_condition and leak_condition.get("passed") else 1
+        elif metric == "blocked_output_commit_rate":
+            commit_condition = next(
+                (row for row in condition_results if row.get("id") in {"pre_commit_blocked", "credential_pre_commit_blocked", "credential_blocked_pre_commit"}),
+                None,
+            )
+            metrics[metric] = 0 if commit_condition and commit_condition.get("passed") else 1
         else:
             metrics[metric] = None
     return metrics

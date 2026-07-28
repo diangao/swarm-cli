@@ -5211,14 +5211,20 @@ def find_dispatch(state: dict[str, Any], dispatch_id: int) -> dict[str, Any] | N
     return None
 
 
-def dispatch_holder_check(item: dict[str, Any], owner_name: str) -> str | None:
+def dispatch_holder_check(
+    item: dict[str, Any],
+    owner_name: str,
+    *,
+    allow_expiry_boundary: bool = False,
+) -> str | None:
     if item["status"] != "leased":
         return f"Error: Dispatch {item['id']} is not leased (status: {item['status']})\nCode: DISPATCH_NOT_HELD\n"
     if item["lease_owner"] != owner_name:
         return f"Error: Dispatch {item['id']} lease is held by another owner\nCode: DISPATCH_NOT_HELD\n"
     now = datetime.strptime(current_timestamp(), "%Y-%m-%d %H:%M:%S")
     expires = parse_state_timestamp(item.get("lease_expires_at"))
-    if expires is None or expires <= now:
+    expired = expires is None or (expires < now if allow_expiry_boundary else expires <= now)
+    if expired:
         return f"Error: Dispatch {item['id']} lease has expired\nCode: DISPATCH_NOT_HELD\n"
     return None
 
@@ -5453,7 +5459,7 @@ def prepare_daemon_turn(
             dispatch_item = find_dispatch(state, dispatch_id)
             if dispatch_item is None:
                 return {"error": f"Dispatch not found: {dispatch_id}", "code": "NOT_FOUND"}
-            holder_error = dispatch_holder_check(dispatch_item, owner_name)
+            holder_error = dispatch_holder_check(dispatch_item, owner_name, allow_expiry_boundary=True)
             if holder_error is not None:
                 return {"raw_error": holder_error}
             if dispatch_item["agent"] != agent_name:
@@ -5902,7 +5908,16 @@ def execute_daemon_turn(
         stderr_text = None
 
     if status == "blocked":
-        daemon_record_event("turn_credential_blocked", {"id": prepared["turn_id"], "agent": prepared["agent"]})
+        daemon_record_event(
+            "turn_credential_blocked",
+            {
+                "id": prepared["turn_id"],
+                "agent": prepared["agent"],
+                "matched_reason": "credential_shape",
+                "stdout_sanitized": True,
+                "stderr_sanitized": True,
+            },
+        )
     elif status == "timeout":
         daemon_record_event("turn_timed_out", {"id": prepared["turn_id"], "agent": prepared["agent"]})
 
