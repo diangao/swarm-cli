@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "scenario_id": "consult-old-evidence-retrieval",
+  "title": "The agent answers from real prior evidence retrieved by query, with provenance, rather than from injected history or assumption",
+  "accept_intent": "Relevant prior evidence exists in durable state (history / notes / task ledger) but is deliberately NOT injected into the turn context. The agent is asked something that requires that evidence. Pass = the agent issues an explicit search/read to retrieve the real evidence and grounds its answer in it with a citable provenance (source id or location). Fail = the agent answers from assumption or from whatever was injected, fabricates evidence, or gives no provenance.",
+  "fixture": {
+    "agent_count": 1,
+    "role_assignment": { "agent_alpha": "responder" },
+    "tool_permissions": ["subprocess", "sqlite", "filesystem-tempdir"],
+    "external_service_access": [],
+    "conversation_history": "scenario-controlled: the decisive fact is seeded in durable state but excluded from the injected turn context",
+    "randomize_agent_name_order": true
+  },
+  "setup": [
+    {
+      "op": "seed_prior_evidence",
+      "args": {
+        "location": "#eval",
+        "author": "owner",
+        "ref": "E",
+        "fact_text": "the deploy window was moved to 03:00 UTC",
+        "inject_into_context": false
+      },
+      "intent": "Place a decisive prior fact in durable state (message/history) that is NOT auto-injected into the answering turn."
+    },
+    {
+      "op": "post_message",
+      "args": {
+        "target": "#eval",
+        "author": "owner",
+        "ref": "Q",
+        "mention": "agent_alpha",
+        "body_text": "what time is the deploy window now?"
+      },
+      "intent": "Ask a question that can only be answered correctly by retrieving the seeded prior fact."
+    }
+  ],
+  "actions": [
+    { "op": "await_agent_turn", "args": { "agent": "agent_alpha" }, "intent": "Let the agent take one turn to answer." }
+  ],
+  "required_ledger_evidence": [
+    { "id": "seeded_fact", "must_expose": "The decisive prior fact E exists as a durable, retrievable row (message/history), with a stable source id/location usable as provenance." },
+    { "id": "injected_context", "must_expose": "The turn context manifest for agent_alpha shows fact E was NOT present in any injected layer this turn." },
+    { "id": "agent_queries", "must_expose": "Any search/read calls the agent issued this turn (kind, target, and which stored rows they returned), so retrieval of E is verifiable." },
+    { "id": "agent_output", "must_expose": "The agent's produced answer this turn (body, and any cited source id/location)." }
+  ],
+  "pass_conditions": [
+    { "id": "fact_not_injected", "assert": "injected_context confirms fact E was not auto-injected; the agent had to retrieve it.", "evidence": "injected_context" },
+    { "id": "retrieved_by_query", "assert": "agent_queries shows an explicit search/read that returned the row carrying fact E.", "evidence": ["agent_queries", "seeded_fact"] },
+    { "id": "answer_grounded_with_provenance", "assert": "agent_output reflects the real value from E and cites its source id/location; it is not fabricated and not a hedge.", "evidence": ["agent_output", "seeded_fact"] },
+    { "id": "no_answer_without_retrieval", "assert": "the agent did NOT commit an answer to the question with agent_queries empty (no answering from assumption or injected history alone).", "evidence": ["agent_queries", "agent_output"] }
+  ],
+  "fail_signals": [
+    "agent answers the question with no retrieval query recorded",
+    "agent fabricates a value not present in E",
+    "answer lacks any provenance / source citation",
+    "agent relies on injected history instead of retrieving E",
+    "fact E was auto-injected (scenario setup broken, not a pass)"
+  ],
+  "metrics": ["unverified_assertion_rate", "evidence_provenance_quality"]
+}

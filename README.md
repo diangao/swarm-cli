@@ -142,6 +142,8 @@ From this checkout:
 ```bash
 python3 scripts/anti_stub_probe.py
 python3 scripts/behavior_eval_loop.py
+python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-consult-old-evidence.json
+python3 scripts/consult_old_evidence_probe.py
 ```
 
 The local implementation stores state in `state.sqlite3`. By default it uses
@@ -185,3 +187,10 @@ overrides; factor-specific runtime switches should be added with the matching
 behavior implementation. Verifier-owned acceptance remains separate: passing
 this smoke loop means the slice is ready for independent gating, not that full
 behavioral coverage has been achieved.
+
+The consult-old-evidence scenario seeds a real prior message outside the
+automatic turn context. The runner must use the public `message search` and
+`message read` CLI surfaces before it can commit an answer, and the answer
+must cite the seeded message's stable channel/message reference. The companion
+probe randomizes the fact and verifies fail-closed paths for injected context,
+missing retrieval, missing provenance, and answer-without-query bypasses.

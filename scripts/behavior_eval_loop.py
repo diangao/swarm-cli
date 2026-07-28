@@ -1120,6 +1120,338 @@ def op_deliver_attention_notice(runtime: ManifestRuntime, args: dict[str, object
     return action_result(index, "deliver_attention_notice", "success", args=args, ref=f"{message_ref}:notice")
 
 
+def message_provenance(target: str, message_id: str) -> str:
+    return f"{target}:{message_id[:8]}"
+
+
+def derive_evidence_query(question: str) -> str:
+    stopwords = {
+        "a",
+        "an",
+        "are",
+        "at",
+        "be",
+        "did",
+        "do",
+        "does",
+        "for",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "me",
+        "now",
+        "of",
+        "on",
+        "the",
+        "this",
+        "to",
+        "was",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+    }
+    terms = [
+        term
+        for term in re.findall(r"[a-z0-9][a-z0-9_-]*", question.lower())
+        if term not in stopwords and len(term) > 1
+    ]
+    unique_terms = list(dict.fromkeys(terms))
+    require(unique_terms, "await_agent_turn could not derive an evidence query from the question")
+    return " ".join(unique_terms[:4])
+
+
+def search_message_ids(output: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r'<result ref="msg:([0-9a-f-]{36})">', output)))
+
+
+def read_message_body(output: str, message_id: str) -> str | None:
+    pattern = re.compile(
+        rf"\[seq=\d+ msg={re.escape(message_id)} time=.*? type=.*?\] @[^:]+: "
+        rf"(.*?)(?:\n\n---|\Z)",
+        re.DOTALL,
+    )
+    match = pattern.search(output)
+    return match.group(1).strip() if match is not None else None
+
+
+def find_ref(
+    refs: dict[str, dict[str, object]],
+    preferred: str,
+    kind: str,
+) -> tuple[str, dict[str, object]]:
+    if preferred in refs and refs[preferred].get("kind") == kind:
+        return preferred, refs[preferred]
+    candidates = [(key, value) for key, value in refs.items() if value.get("kind") == kind]
+    require(candidates, f"await_agent_turn requires a {kind} ref")
+    return candidates[-1]
+
+
+@manifest_op("seed_prior_evidence")
+def op_seed_prior_evidence(runtime: ManifestRuntime, args: dict[str, object], index: int) -> dict[str, object]:
+    ref = str(args.get("ref") or f"E{index}")
+    target = str(args.get("location") or args.get("target") or "#eval")
+    fact_key = str(args.get("key") or args.get("fact_key") or ref)
+    fact_text = str(args.get("fact_text") or args.get("body_text") or args.get("value") or "")
+    injected_in_context = truthy_int(args.get("inject_into_context"))
+    author, sender_type = normalize_author(args.get("author"), runtime.agent_map)
+    require(fact_text != "", f"seed_prior_evidence {ref} requires non-empty fact_text")
+    ensure_channel(runtime.cli, runtime.state_dir, target)
+    record = insert_message_record(runtime.state_dir, target, fact_text, author=author, sender_type=sender_type)
+    provenance = message_provenance(target, str(record["id"]))
+    ensure_eval_schema(runtime.state_dir)
+    conn = connect_state(runtime.state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_seeded_facts(
+                    ref, fact_key, fact_value, provenance, injected_in_context, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (ref, fact_key, fact_text, provenance, injected_in_context, now_text()),
+            )
+    finally:
+        conn.close()
+    runtime.refs[ref] = {
+        "kind": "prior_evidence",
+        "ref": ref,
+        "fact_key": fact_key,
+        "fact_value": fact_text,
+        "provenance": provenance,
+        "injected_in_context": injected_in_context,
+        **record,
+    }
+    return action_result(index, "seed_prior_evidence", "success", args=args, ref=ref)
+
+
+def run_consult_old_evidence_turn(
+    runtime: ManifestRuntime,
+    args: dict[str, object],
+    index: int,
+    *,
+    agent: str,
+) -> dict[str, object]:
+    question_key, question = find_ref(runtime.refs, str(args.get("question_ref") or "Q"), "message")
+    evidence_key, prior_evidence = find_ref(
+        runtime.refs,
+        str(args.get("evidence_ref") or "E"),
+        "prior_evidence",
+    )
+    target = str(args.get("target") or question.get("target") or prior_evidence.get("target") or "#eval")
+    question_body = str(question.get("body") or "")
+    question_message_id = str(question.get("id") or "")
+    turn_id = str(uuid.uuid4())
+
+    record_turn_context_layer(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        layer_index=0,
+        layer_kind="runtime_profile",
+        target=None,
+        payload={"agent": agent, "query_on_demand": True},
+    )
+    record_turn_context_layer(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        layer_index=1,
+        layer_kind="current_event",
+        target=target,
+        payload={"ref": question_key, "message_id": question_message_id},
+        body_text=question_body,
+    )
+    if truthy_int(prior_evidence.get("injected_in_context")):
+        record_turn_context_layer(
+            runtime.state_dir,
+            turn_id=turn_id,
+            agent=agent,
+            layer_index=2,
+            layer_kind="injected_prior_evidence",
+            target=str(prior_evidence.get("target") or target),
+            payload={"ref": evidence_key, "provenance": prior_evidence.get("provenance")},
+            body_text=str(prior_evidence.get("fact_value") or ""),
+        )
+    else:
+        record_turn_context_layer(
+            runtime.state_dir,
+            turn_id=turn_id,
+            agent=agent,
+            layer_index=2,
+            layer_kind="retrieval_policy",
+            target=target,
+            payload={"excluded_refs": [evidence_key], "query_on_demand": True},
+        )
+
+    query_text = derive_evidence_query(question_body)
+    search = invoke_cli(
+        runtime.cli,
+        runtime.state_dir,
+        "message",
+        "search",
+        "--query",
+        query_text,
+        "--channel",
+        target,
+        "--limit",
+        "10",
+    )
+    result_ids = search_message_ids(search.stdout) if search.returncode == 0 else []
+    search_refs = [message_provenance(target, message_id) for message_id in result_ids]
+    record_agent_command(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        command_kind="message_search",
+        target=target,
+        query_text=query_text,
+        result_ref=",".join(search_refs) or None,
+        stdout=search.stdout,
+        stderr=search.stderr,
+    )
+    if search.returncode != 0 or not result_ids:
+        record_agent_deferral(
+            runtime.state_dir,
+            turn_id=turn_id,
+            agent=agent,
+            target=target,
+            reason="search returned no retrievable prior evidence",
+        )
+        return action_result(
+            index,
+            "await_agent_turn",
+            "deferred",
+            args=args,
+            stdout=search.stdout,
+            stderr=search.stderr,
+        )
+
+    selected_id: str | None = None
+    selected_body: str | None = None
+    selected_read: subprocess.CompletedProcess[str] | None = None
+    for candidate_id in result_ids:
+        if candidate_id == question_message_id:
+            continue
+        read = invoke_cli(
+            runtime.cli,
+            runtime.state_dir,
+            "message",
+            "read",
+            "--channel",
+            target,
+            "--around",
+            candidate_id,
+            "--limit",
+            "1",
+        )
+        body = read_message_body(read.stdout, candidate_id) if read.returncode == 0 else None
+        if body:
+            selected_id = candidate_id
+            selected_body = body
+            selected_read = read
+            break
+
+    if selected_id is None or selected_body is None or selected_read is None:
+        record_agent_deferral(
+            runtime.state_dir,
+            turn_id=turn_id,
+            agent=agent,
+            target=target,
+            reason="search previews did not resolve to a readable prior-evidence body",
+        )
+        return action_result(index, "await_agent_turn", "deferred", args=args, stdout=search.stdout)
+
+    provenance = message_provenance(target, selected_id)
+    record_agent_command(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        command_kind="message_read",
+        target=target,
+        query_text=f"--around {selected_id[:8]} --limit 1",
+        retrieved_body=True,
+        result_ref=provenance,
+        stdout=selected_read.stdout,
+        stderr=selected_read.stderr,
+    )
+
+    context_cursor = int(question.get("seq") or 0)
+    conn = connect_state(runtime.state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO freshness(target, cursor, draft)
+                VALUES (?, ?, NULL)
+                ON CONFLICT(target) DO UPDATE SET cursor = excluded.cursor, draft = NULL
+                """,
+                (target, context_cursor),
+            )
+    finally:
+        conn.close()
+
+    answer = f"Retrieved prior evidence: {selected_body} (source: {provenance})."
+    sent = invoke_cli(
+        runtime.cli,
+        runtime.state_dir,
+        "message",
+        "send",
+        "--target",
+        target,
+        "--author",
+        f"@{agent}",
+        stdin=answer,
+    )
+    if sent.returncode != 0 or "Freshness hold" in sent.stdout:
+        record_agent_deferral(
+            runtime.state_dir,
+            turn_id=turn_id,
+            agent=agent,
+            target=target,
+            reason="grounded answer could not cross the typed commit boundary",
+        )
+        return action_result(
+            index,
+            "await_agent_turn",
+            "deferred",
+            args=args,
+            stdout=sent.stdout,
+            stderr=sent.stderr,
+        )
+
+    output_message_id = parse_message_id(sent.stdout)
+    record_agent_output(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        target=target,
+        body=answer,
+        message_id=output_message_id,
+    )
+    record_agent_citation(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        fact_key=str(prior_evidence.get("fact_key") or evidence_key),
+        provenance=provenance,
+    )
+    output_ref = str(args.get("ref") or f"A{index}")
+    runtime.refs[output_ref] = {
+        "kind": "agent_output",
+        "message_id": output_message_id,
+        "body": answer,
+        "provenance": provenance,
+        "turn_id": turn_id,
+    }
+    return action_result(index, "await_agent_turn", "success", args=args, stdout=sent.stdout, ref=output_ref)
+
+
 def no_work_assertion(body: str) -> bool:
     lowered = body.strip().lower()
     patterns = (
@@ -1137,6 +1469,10 @@ def no_work_assertion(body: str) -> bool:
 def op_await_agent_turn(runtime: ManifestRuntime, args: dict[str, object], index: int) -> dict[str, object]:
     alias = str(args.get("agent") or "A")
     agent = runtime.agent_map.get(alias, alias.removeprefix("@"))
+    if args.get("evidence_ref") is not None or any(
+        ref.get("kind") == "prior_evidence" for ref in runtime.refs.values()
+    ):
+        return run_consult_old_evidence_turn(runtime, args, index, agent=agent)
     notice_ref = args.get("notice")
     notice: dict[str, object] | None = None
     if notice_ref is not None:
@@ -1487,6 +1823,7 @@ def evaluate_conditions(
     posted_rows = evidence_rows.get("posted", [])
     draft_rows = evidence_rows.get("draft", [])
     notice_rows = evidence_rows.get("notice_shape", [])
+    seeded_fact_rows = evidence_rows.get("seeded_fact", [])
     context_rows = evidence_rows.get("injected_context", [])
     query_rows = evidence_rows.get("agent_queries", [])
     deferral_rows = evidence_rows.get("agent_deferral", [])
@@ -1524,6 +1861,93 @@ def evaluate_conditions(
         elif condition_id == "no_stale_commit":
             committed = [row for row in posted_rows if row.get("body") in stale_bodies]
             results.append(condition_result(condition_id, not committed, f"stale_commits={len(committed)}"))
+        elif condition_id == "fact_not_injected":
+            fact_values = [str(row.get("fact_value") or "") for row in seeded_fact_rows]
+            flagged_injected = [row for row in seeded_fact_rows if truthy_int(row.get("injected_in_context"))]
+            leaked_layers = [
+                row
+                for row in context_rows
+                if any(value and value in str(row.get("body_text") or "") for value in fact_values)
+            ]
+            passed = bool(seeded_fact_rows) and not flagged_injected and not leaked_layers
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"seeded={len(seeded_fact_rows)} flagged_injected={len(flagged_injected)} "
+                    f"leaked_layers={len(leaked_layers)}",
+                )
+            )
+        elif condition_id == "retrieved_by_query":
+            provenances = {str(row.get("provenance") or "") for row in seeded_fact_rows}
+            search_rows = [
+                row
+                for row in query_rows
+                if row.get("command_kind") == "message_search"
+                and any(
+                    provenance and provenance in str(row.get("result_ref") or "")
+                    for provenance in provenances
+                )
+            ]
+            read_rows = [
+                row
+                for row in query_rows
+                if row.get("command_kind") == "message_read"
+                and truthy_int(row.get("retrieved_body"))
+                and str(row.get("result_ref") or "") in provenances
+            ]
+            passed = bool(search_rows and read_rows)
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"searches={len(search_rows)} grounded_reads={len(read_rows)}",
+                )
+            )
+        elif condition_id == "answer_grounded_with_provenance":
+            grounded_outputs = [
+                output
+                for output in output_rows
+                if any(
+                    str(fact.get("fact_value") or "") in str(output.get("body") or "")
+                    and str(fact.get("provenance") or "") in str(output.get("body") or "")
+                    for fact in seeded_fact_rows
+                )
+            ]
+            results.append(
+                condition_result(
+                    condition_id,
+                    bool(grounded_outputs),
+                    f"outputs={len(output_rows)} grounded_with_provenance={len(grounded_outputs)}",
+                )
+            )
+        elif condition_id == "no_answer_without_retrieval":
+            provenances = {str(row.get("provenance") or "") for row in seeded_fact_rows}
+            grounded_searches = [
+                row
+                for row in query_rows
+                if row.get("command_kind") == "message_search"
+                and any(
+                    provenance and provenance in str(row.get("result_ref") or "")
+                    for provenance in provenances
+                )
+            ]
+            grounded_reads = [
+                row
+                for row in query_rows
+                if row.get("command_kind") == "message_read"
+                and truthy_int(row.get("retrieved_body"))
+                and str(row.get("result_ref") or "") in provenances
+            ]
+            passed = not output_rows or bool(grounded_searches and grounded_reads)
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"outputs={len(output_rows)} grounded_searches={len(grounded_searches)} "
+                    f"grounded_reads={len(grounded_reads)}",
+                )
+            )
         elif condition_id == "metadata_only":
             required_metadata = ["count", "sender", "mention_flag", "thread_flag"]
             shaped_rows = [
@@ -1591,11 +2015,30 @@ def requested_metric_values(
             stale_condition = next((row for row in condition_results if row.get("id") == "no_stale_commit"), None)
             metrics[metric] = 0 if stale_condition and stale_condition.get("passed") else 1
         elif metric == "unverified_assertion_rate":
-            inspect_condition = next(
-                (row for row in condition_results if row.get("id") == "inspect_or_defer_not_assume"),
+            retrieval = next((row for row in condition_results if row.get("id") == "retrieved_by_query"), None)
+            grounded = next(
+                (row for row in condition_results if row.get("id") == "answer_grounded_with_provenance"),
                 None,
             )
-            metrics[metric] = 0 if inspect_condition and inspect_condition.get("passed") else 1
+            if retrieval is not None or grounded is not None:
+                metrics[metric] = 0 if (
+                    retrieval
+                    and retrieval.get("passed")
+                    and grounded
+                    and grounded.get("passed")
+                ) else 1
+            else:
+                inspect_condition = next(
+                    (row for row in condition_results if row.get("id") == "inspect_or_defer_not_assume"),
+                    None,
+                )
+                metrics[metric] = 0 if inspect_condition and inspect_condition.get("passed") else 1
+        elif metric == "evidence_provenance_quality":
+            grounded = next(
+                (row for row in condition_results if row.get("id") == "answer_grounded_with_provenance"),
+                None,
+            )
+            metrics[metric] = 1 if grounded and grounded.get("passed") else 0
         elif metric == "wrong_target_rate":
             metadata_condition = next((row for row in condition_results if row.get("id") == "metadata_only"), None)
             metrics[metric] = 0 if metadata_condition and metadata_condition.get("passed") else 1
