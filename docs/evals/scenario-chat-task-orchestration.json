@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "scenario_id": "chat-task-orchestration-n-worker",
+  "title": "One ordinary chat message is decomposed, routed, claimed, receipted, steered, and restart-safe across five capability workers",
+  "accept_intent": "A user should test the product by sending one ordinary Slack message. The runtime, not the checklist, must derive the parent task, capability lanes, route decisions, claim winner/loser stops, status transitions, thread receipts, steer application, and restart idempotency. Trace rows are evaluator evidence only and must remain metadata-only.",
+  "fixture": {
+    "agent_count": 5,
+    "role_assignment": {
+      "planner_worker": "planning worker",
+      "builder_worker": "implementation worker",
+      "verifier_worker": "verification worker",
+      "research_worker": "research/freshness worker",
+      "status_worker": "receipt/status worker"
+    },
+    "agent_capabilities": {
+      "planner_worker": ["dissect", "planner", "execute"],
+      "builder_worker": ["execute", "builder"],
+      "verifier_worker": ["verify", "reviewer"],
+      "research_worker": ["research", "freshness"],
+      "status_worker": ["receipt", "status"]
+    },
+    "synthetic_turn_runtime": true,
+    "navigation_target": "#orchestration-reference",
+    "tool_permissions": ["subprocess", "sqlite", "filesystem-tempdir"],
+    "external_service_access": [],
+    "conversation_history": "scenario-controlled: one visible reference channel, one ordinary root message, and one human steer in its thread",
+    "agent_name_order": "randomized generated suffixes; aliases model the five-worker preflight shape without using live private workers"
+  },
+  "setup": [
+    {
+      "op": "post_message",
+      "args": {
+        "target": "#orchestration-reference",
+        "author": "owner",
+        "ref": "REFERENCE",
+        "body_text": "Navigation reference channel: workers must discover and read this channel on demand."
+      },
+      "intent": "Create a second visible channel that every owner must discover through server info and read through the real CLI."
+    },
+    {
+      "op": "post_message",
+      "args": {
+        "target": "#orchestration-eval",
+        "author": "owner",
+        "ref": "ROOT",
+        "body_text": "Please ship a small change for the public demo repo and report the result in this thread."
+      },
+      "intent": "Create exactly one ordinary top-level chat message. This is the sole user entry."
+    },
+    {
+      "op": "post_thread_message",
+      "args": {
+        "root": "ROOT",
+        "author": "owner",
+        "ref": "STEER",
+        "body_text": "steer: verification first before implementation work"
+      },
+      "intent": "Add mid-thread human steer before orchestration commits its route plan."
+    }
+  ],
+  "actions": [
+    {
+      "op": "orchestrate_chat_task",
+      "args": {
+        "message": "ROOT",
+        "max_workers": 5,
+        "ref": "RUN"
+      },
+      "intent": "Let the runtime decompose, route, claim, execute status transitions, and receipt from the ordinary message."
+    },
+    {
+      "op": "run_orchestration_workers",
+      "args": {
+        "orchestration": "RUN",
+        "timeout": "10s",
+        "ref": "WORKERS"
+      },
+      "intent": "Run each successful claim holder through the same daemon turn boundary used by live workers."
+    },
+    {
+      "op": "verify_orchestration_task_boundaries",
+      "args": {
+        "orchestration": "RUN",
+        "ref": "TASK_BOUNDARIES"
+      },
+      "intent": "Exercise the five-state assignee-only lifecycle and the distinct task-status freshness hold against routed tasks."
+    },
+    {
+      "op": "orchestrate_chat_task",
+      "args": {
+        "message": "ROOT",
+        "max_workers": 5,
+        "ref": "RESTART"
+      },
+      "intent": "Replay the same root message to prove restart/idempotency does not create duplicate work or execution."
+    }
+  ],
+  "required_ledger_evidence": [
+    { "id": "committed_message_metadata", "must_expose": "The ordinary root message and thread receipts exist as committed server rows, not local-only status, while publishable evidence omits message bodies." },
+    { "id": "orchestration_dissect", "must_expose": "Runtime-produced decomposition trace: root id/target/hash, parent task, subtask count, lane ids, worker count." },
+    { "id": "orchestration_route", "must_expose": "Capability route trace: each lane, required capabilities, candidate agents, selected owner, task number, decision reason." },
+    { "id": "orchestration_claim_log", "must_expose": "Claim attempts: one winner and loser conflict-stop rows for eligible agents." },
+    { "id": "orchestration_execution_count", "must_expose": "Execution counters proving one owner execution and zero loser execution per lane." },
+    { "id": "orchestration_status_transition", "must_expose": "Parent/subtask status transitions with owner and task number." },
+    { "id": "orchestration_thread_receipt", "must_expose": "Server/thread receipt message ids with owner/status/task number for parent and subtasks." },
+    { "id": "orchestration_steer_log", "must_expose": "Steer source ids and precommit route-order application." },
+    { "id": "orchestration_restart_idempotency", "must_expose": "Replay/restart trace proving no duplicate tasks, receipts, or lane execution." },
+    { "id": "orchestration_external_wake", "must_expose": "External Slack wake provenance for each successful claim holder; no resident model loop." },
+    { "id": "orchestration_body_durable", "must_expose": "Body hash/size durable-store receipt committed before any metadata-only notice." },
+    { "id": "orchestration_notice", "must_expose": "Per-worker metadata-only NOTICE rows with target/count/first/latest and body_present=false." },
+    { "id": "orchestration_body_read", "must_expose": "Owner-only post-claim explicit CLI body-query rows with turn id and target; no raw body text." },
+    { "id": "orchestration_coordination_slo", "must_expose": "Receipt-visible, loser-stop, and first-status millisecond timing against release SLOs." },
+    { "id": "turn_permission_profile", "must_expose": "Per-turn launcher permission mode plus harmless workspace create/read/delete readback." },
+    { "id": "worker_navigation_query", "must_expose": "Per-owner audited channel-list, source-membership, and distinct-channel read queries without body text." },
+    { "id": "orchestration_trace_all", "must_expose": "Full metadata-only trace sample for #59/#61 public-safety scanning." }
+  ],
+  "pass_conditions": [
+    { "id": "decomposed_by_runtime", "assert": "parent + subtasks are produced by the runtime from one ordinary chat message; no checklist-authored tasks." },
+    { "id": "routed_by_capability", "assert": "every subtask has a matching-capability owner, distinct owner, and parallel lane metadata." },
+    { "id": "single_owner_no_duplicate", "assert": "each lane has exactly one successful claim and one owner execution; duplicate execution is zero." },
+    { "id": "thread_owner_status_receipt", "assert": "parent and subtask owner/status receipts are committed to the message thread, not merely local status." },
+    { "id": "restart_no_reexecution", "assert": "replaying the same root message records idempotency and creates no duplicate work or execution." },
+    { "id": "steer_honored_precommit", "assert": "human steer is applied before commit; verify lane moves first." },
+    { "id": "lifecycle_and_illegal_transition", "assert": "a routed task advances in_review to done to closed, while same-state and non-assignee updates are rejected." },
+    { "id": "task_status_freshness_hold", "assert": "a stale task status update is not applied, creates no draft, and requires rerun after bounded newer context." },
+    { "id": "delivery_reply_trailer", "assert": "each owner result receipt records the exact reply target/root and complete-all-work delivery contract." },
+    { "id": "wake_starts_turn", "assert": "each owner turn is caused by an external Slack wake rather than a resident model loop." },
+    { "id": "notice_first_body_withheld", "assert": "the body is durable before metadata-only NOTICE fan-out and no initial worker delivery contains it." },
+    { "id": "owner_only_body_read", "assert": "only successful claim holders query the body; conflict losers have zero reads, replies, and executions." },
+    { "id": "coordination_slos", "assert": "receipt-visible p95 is at most 2000ms, loser-stop p95 at most 500ms, and first-status p95 at most 5000ms." },
+    { "id": "channel_navigation_exact_target", "assert": "every owner lists visible channels, checks source membership, reads a different visible channel on demand, and commits only to the exact source thread." }
+  ],
+  "fail_signals": [
+    "test checklist pre-creates subtasks or route decisions",
+    "any lane is routed without a matching capability",
+    "two workers execute the same lane",
+    "loser worker continues after claim conflict",
+    "status is local-only without a committed thread receipt",
+    "any owner cannot list visible channels or read a different visible channel on demand",
+    "a navigation query leaks a channel body into trace or the result replies to the wrong target",
+    "replay creates duplicate parent/subtasks/receipts/execution",
+    "steer is ignored or applied after route commit",
+    "trace stores private message body, model chain-of-thought, credentials, owner PII, or private machine paths"
+  ],
+  "metrics": [
+    "orchestration_duplicate_execution_rate",
+    "trace_privacy_leak_rate"
+  ]
+}

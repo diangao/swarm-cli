@@ -1,0 +1,432 @@
+{
+  "schema_version": 2,
+  "coverage_manifest_version": "chat-task-orchestration-coverage-v2",
+  "runtime_flow_contract": {
+    "version": "swarm-runtime-flow-v1",
+    "source_policy": "private acceptance inputs are not embedded or identified in the public tree",
+    "raw_source_public_surface": false,
+    "raw_source_in_trace": false
+  },
+  "candidate": {
+    "intent": "Wire an ordinary Slack message through the live single-host runtime: durable ingest, metadata-only notice, atomic owner selection, owner-only body query, native turn, freshness-aware typed commit, thread receipt, and restart recovery.",
+    "live_user_test": "Start five real workers on one exact public SHA, then send an ordinary Slack message. The eval runner is preflight evidence, not the user-facing product surface.",
+    "host_boundary": "one resident daemon and one canonical SQLite state host"
+  },
+  "rows": [
+    {
+      "row": 1,
+      "state": "external_wake",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/anti_stub_probe.py",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "daemon_ingest_slack_payload",
+        "route_live_orchestration_wakes",
+        "enqueue_daemon_wake",
+        "command_daemon_resident"
+      ],
+      "input": "external Slack message event",
+      "output": "one wake per successful lane owner; no resident model loop",
+      "trace": [
+        "orchestration_external_wake.source",
+        "orchestration_external_wake.resident_model_loop",
+        "orchestration_external_wake.wake_epoch_ms"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["wake_starts_turn"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 2,
+      "state": "daemon_only_durable_ingest",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "ingest_normalized_slack_event",
+        "route_live_orchestration_wakes"
+      ],
+      "input": "Slack message body plus stable Slack ids",
+      "output": "canonical message row exists before worker delivery; worker delivery has no body",
+      "trace": [
+        "orchestration_body_durable.root_message_id",
+        "orchestration_body_durable.body_sha256",
+        "orchestration_body_durable.body_bytes",
+        "orchestration_body_durable.stored_epoch_ms"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["notice_first_body_withheld"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 3,
+      "state": "metadata_only_notice",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/anti_stub_probe.py",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "route_live_orchestration_wakes",
+        "route_live_orchestration_steer"
+      ],
+      "input": "durable message reference and registered worker set",
+      "output": "per-worker target/count/first/latest/thread/mention notice with body_present=false",
+      "trace": [
+        "orchestration_notice.agent",
+        "orchestration_notice.target",
+        "orchestration_notice.pending_count",
+        "orchestration_notice.first_message_id",
+        "orchestration_notice.latest_message_id",
+        "orchestration_notice.body_present"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["notice_first_body_withheld", "owner_only_body_read"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 4,
+      "state": "owner_query_context_and_navigation",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/anti_stub_probe.py",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "orchestration_assignment_for_agent",
+        "prepare_daemon_turn",
+        "command_message_read",
+        "wake_shared_channel_context",
+        "wake_navigation_contract",
+        "append_worker_navigation_query"
+      ],
+      "input": "successful claim plus message reference",
+      "output": "the prompt remains metadata-only until the successful owner explicitly queries the source thread; the same seat can list visible channels and read another channel on demand",
+      "trace": [
+        "orchestration_body_read.agent",
+        "orchestration_body_read.after_claim",
+        "orchestration_body_read.body_sha256",
+        "orchestration_body_read.read_epoch_ms",
+        "orchestration_body_read.explicit_query",
+        "orchestration_body_read.query_turn_id",
+        "worker_navigation_query.operation",
+        "worker_navigation_query.target",
+        "worker_navigation_query.body_in_trace"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["owner_only_body_read", "channel_navigation_exact_target"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 5,
+      "state": "runtime_decomposition_capability_route_and_atomic_claim",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "live_orchestration_lane_specs",
+        "choose_live_lane_owners",
+        "route_live_orchestration_wakes"
+      ],
+      "input": "metadata notice, capability registry, optional explicit mention",
+      "output": "distinct matching owners, one successful claim per lane, conflict-stop losers",
+      "trace": [
+        "orchestration_routed",
+        "orchestration_claim",
+        "orchestration_coordination_slo.loser_stop_ms"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": [
+          "decomposed_by_runtime",
+          "routed_by_capability",
+          "single_owner_no_duplicate",
+          "owner_only_body_read"
+        ],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 6,
+      "state": "native_harness_run",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/anti_stub_probe.py",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "execute_daemon_turn",
+        "prepare_daemon_turn",
+        "parse_codex_json_stream"
+      ],
+      "input": "owner query result plus lane/task receipt",
+      "output": "one native runtime turn for each owner",
+      "trace": [
+        "turn_started",
+        "turn_completed",
+        "orchestration_execution.execution_count"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["single_owner_no_duplicate"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 7,
+      "state": "steer_and_freshness",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/anti_stub_probe.py",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "route_live_orchestration_steer",
+        "prepare_daemon_turn",
+        "finalize_daemon_turn",
+        "render_task_freshness_hold"
+      ],
+      "input": "newer human thread steer or newer channel fact before commit",
+      "output": "newer steer is queried; stale result/status is held instead of committed",
+      "trace": [
+        "orchestration_steer_received",
+        "orchestration_steer_applied",
+        "orchestration_task_status_freshness_hold"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["steer_honored_precommit", "task_status_freshness_hold"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 8,
+      "state": "typed_commit",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "finalize_daemon_turn",
+        "append_message"
+      ],
+      "input": "fresh successful owner output",
+      "output": "canonical server message id and assignee-authorized in_review transition",
+      "trace": [
+        "orchestration_status_transition.server_message_id",
+        "orchestration_thread_receipt.message_id",
+        "orchestration_thread_receipt.committed_epoch_ms"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["thread_owner_status_receipt", "task_status_freshness_hold"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 9,
+      "state": "durable_thread_receipt",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "append_thread_task_for_author",
+        "route_live_orchestration_wakes",
+        "finalize_daemon_turn"
+      ],
+      "input": "parent acceptance, lane acceptance, or owner result",
+      "output": "same-thread owner/status/task receipt with exact reply target/root trailer",
+      "trace": [
+        "orchestration_thread_receipt.thread",
+        "orchestration_thread_receipt.delivery_reply_target",
+        "orchestration_thread_receipt.delivery_root_message_id",
+        "orchestration_thread_receipt.complete_all_work_before_stopping"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["thread_owner_status_receipt", "delivery_reply_trailer"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 10,
+      "state": "recovery_and_idempotency",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "orchestration_run_for_message",
+        "command_agent_orchestrate",
+        "finalize_daemon_turn"
+      ],
+      "input": "same root replay or failed owner turn",
+      "output": "receipt-driven skip for completed work or a bounded recovery wake",
+      "trace": [
+        "orchestration_restart_idempotent",
+        "orchestration_recovery_scheduled"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["restart_no_reexecution"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 11,
+      "state": "task_lifecycle_boundary",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/anti_stub_probe.py",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "command_task_update",
+        "finalize_daemon_turn"
+      ],
+      "input": "assignee-authenticated task transition",
+      "output": "todo → in_progress → in_review → done → closed; illegal and non-assignee transitions rejected",
+      "trace": [
+        "orchestration_status_transition",
+        "tasks.status",
+        "tasks.assignee"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["lifecycle_and_illegal_transition"],
+        "result": "pass"
+      },
+      "remaining_gap": null
+    },
+    {
+      "row": 12,
+      "state": "privacy_repro_and_permission_profile",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/anti_stub_probe.py",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/platform-contract-coverage-chat-orchestration.json",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "safe_turn_env",
+        "workspace_write_smoke",
+        "execute_daemon_turn",
+        "contains_credential_shape"
+      ],
+      "input": "native runtime launch on the single chosen host",
+      "output": "OS write parity with approval/sandbox bypass, credential-scrubbed child env, credential-shaped outbound block, metadata-only public trace",
+      "trace": [
+        "turn_permission_profile.permission_flag_present",
+        "turn_permission_profile.workspace_create_read_delete",
+        "turn_credential_blocked",
+        "orchestration_trace_all"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["coordination_slos"],
+        "result": "pass",
+        "release_time_live_checks": [
+          "five native seat permission readbacks",
+          "real coordination p50/p95"
+        ]
+      },
+      "remaining_gap": "exact native model/profile and host permission readback are release-time live checks, not fixture claims"
+    }
+  ],
+  "release_slos_ms": {
+    "receipt_visible_p95": 2000,
+    "loser_stop_p95": 500,
+    "first_status_p95": 5000
+  },
+  "acceptance_condition_rows": {
+    "decomposed_by_runtime": [5],
+    "routed_by_capability": [5],
+    "single_owner_no_duplicate": [5, 6],
+    "thread_owner_status_receipt": [8, 9],
+    "restart_no_reexecution": [10],
+    "steer_honored_precommit": [7],
+    "lifecycle_and_illegal_transition": [11],
+    "task_status_freshness_hold": [7, 8],
+    "delivery_reply_trailer": [9],
+    "wake_starts_turn": [1],
+    "notice_first_body_withheld": [2, 3],
+    "owner_only_body_read": [3, 4, 5],
+    "coordination_slos": [12],
+    "channel_navigation_exact_target": [4]
+  },
+  "acceptance_conditions": [
+    "decomposed_by_runtime",
+    "routed_by_capability",
+    "single_owner_no_duplicate",
+    "thread_owner_status_receipt",
+    "restart_no_reexecution",
+    "steer_honored_precommit",
+    "lifecycle_and_illegal_transition",
+    "task_status_freshness_hold",
+    "delivery_reply_trailer",
+    "wake_starts_turn",
+    "notice_first_body_withheld",
+    "owner_only_body_read",
+    "coordination_slos",
+    "channel_navigation_exact_target"
+  ]
+}

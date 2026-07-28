@@ -556,6 +556,10 @@ DEFAULT_EVIDENCE_QUERIES: dict[str, str] = {
     "committed_message_ledger": (
         "SELECT seq, target, id, type, author, body FROM messages ORDER BY seq"
     ),
+    "committed_message_metadata": (
+        "SELECT seq, target, id, type, author, length(body) AS body_bytes "
+        "FROM messages ORDER BY seq"
+    ),
     "committed_message_absence": (
         "SELECT b.turn_id, b.agent, b.target, b.synthetic_marker, COUNT(m.id) AS matching_committed_messages "
         "FROM eval_credential_blocks b "
@@ -579,6 +583,88 @@ DEFAULT_EVIDENCE_QUERIES: dict[str, str] = {
     "daemon_turn_block": (
         "SELECT id AS turn_id, agent, target, status, stdout_text, stderr_text, error "
         "FROM daemon_turns WHERE status = 'blocked' ORDER BY id"
+    ),
+    "orchestration_dissect": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_dissected' ORDER BY ordinal"
+    ),
+    "orchestration_route": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_routed' ORDER BY ordinal"
+    ),
+    "orchestration_claim_log": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_claim' ORDER BY ordinal"
+    ),
+    "orchestration_execution_count": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_execution' ORDER BY ordinal"
+    ),
+    "orchestration_thread_receipt": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_thread_receipt' ORDER BY ordinal"
+    ),
+    "orchestration_status_transition": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_status_transition' ORDER BY ordinal"
+    ),
+    "orchestration_restart_idempotency": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_restart_idempotent' ORDER BY ordinal"
+    ),
+    "orchestration_steer_log": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_steer_applied' ORDER BY ordinal"
+    ),
+    "orchestration_run_ready": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_run_ready' ORDER BY ordinal"
+    ),
+    "orchestration_external_wake": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_external_wake' ORDER BY ordinal"
+    ),
+    "orchestration_body_durable": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_body_durable' ORDER BY ordinal"
+    ),
+    "orchestration_notice": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_notice' ORDER BY ordinal"
+    ),
+    "orchestration_body_read": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_body_read' ORDER BY ordinal"
+    ),
+    "orchestration_coordination_slo": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_coordination_slo' ORDER BY ordinal"
+    ),
+    "orchestration_task_status_freshness": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_task_status_freshness_hold' ORDER BY ordinal"
+    ),
+    "orchestration_tasks": (
+        "SELECT number, channel, title, status, author, assignee, message_id "
+        "FROM tasks WHERE title LIKE '[orch_%' ORDER BY number"
+    ),
+    "turn_permission_profile": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'turn_permission_profile' ORDER BY ordinal"
+    ),
+    "worker_navigation_query": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'worker_navigation_query' ORDER BY ordinal"
+    ),
+    "orchestration_trace_all": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event LIKE 'orchestration_%' ORDER BY ordinal"
+    ),
+    "orchestration_platform_contract": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event LIKE 'orchestration_%' "
+        "AND instr(detail, 'swarm-runtime-flow-v1') > 0 "
+        "ORDER BY ordinal"
     ),
 }
 
@@ -921,6 +1007,46 @@ def clean_agent_name(alias: str) -> str:
 
 def materialize_agents(cli: Path, state_dir: Path, fixture: dict[str, object]) -> dict[str, str]:
     assignment = fixture.get("role_assignment")
+    capability_fixture = fixture.get("agent_capabilities")
+    runtime_value = "codex"
+    if fixture.get("synthetic_turn_runtime") is True:
+        navigation_target = str(fixture.get("navigation_target") or "")
+        runtime_path = state_dir / "swarm-eval-turn-runtime"
+        runtime_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import re\n"
+            "import subprocess\n"
+            "import sys\n"
+            "prompt = sys.stdin.read()\n"
+            f"navigation_target = {navigation_target!r}\n"
+            "def query(*args):\n"
+            "    completed = subprocess.run(['swarm', *args], text=True, capture_output=True)\n"
+            "    if completed.returncode != 0:\n"
+            "        sys.stderr.write(completed.stderr)\n"
+            "        raise SystemExit(41)\n"
+            "    return completed.stdout\n"
+            "source_match = re.search(r'Delivery trailer: reply to exact target ([^ ]+)', prompt)\n"
+            "root_match = re.search(r'for root msg=([A-Za-z0-9_-]+)', prompt)\n"
+            "if not source_match or not root_match:\n"
+            "    raise SystemExit(42)\n"
+            "source_target = source_match.group(1)\n"
+            "source_channel = source_target.split(':', 1)[0]\n"
+            "query('message', 'read', '--channel', source_target, '--around', root_match.group(1))\n"
+            "if navigation_target:\n"
+            "    channel_list = query('server', 'info')\n"
+            "    if navigation_target == source_channel or navigation_target not in channel_list:\n"
+            "        raise SystemExit(43)\n"
+            "    query('channel', 'members', '--target', source_channel)\n"
+            "    query('message', 'read', '--channel', navigation_target)\n"
+            "match = re.search(r'run=([^ ]+) lane=([^ ]+) task=([^ ]+)', prompt)\n"
+            "if match:\n"
+            "    print(f'completed lane={match.group(2)} task={match.group(3)} run={match.group(1)} navigation=ok')\n"
+            "else:\n"
+            "    print('completed claimed chat lane')\n",
+            encoding="utf-8",
+        )
+        runtime_path.chmod(0o755)
+        runtime_value = str(runtime_path)
     aliases: list[str] = []
     if isinstance(assignment, dict):
         aliases = [str(key) for key in assignment.keys()]
@@ -930,9 +1056,12 @@ def materialize_agents(cli: Path, state_dir: Path, fixture: dict[str, object]) -
     agent_map: dict[str, str] = {}
     for alias in aliases:
         name = clean_agent_name(alias)
-        run_cli(
-            cli,
-            state_dir,
+        capabilities: list[str] = []
+        if isinstance(capability_fixture, dict):
+            raw_capabilities = capability_fixture.get(alias, [])
+            if isinstance(raw_capabilities, list):
+                capabilities = [str(value) for value in raw_capabilities if str(value).strip()]
+        register_args = [
             "agent",
             "register",
             "--name",
@@ -940,9 +1069,16 @@ def materialize_agents(cli: Path, state_dir: Path, fixture: dict[str, object]) -
             "--display-name",
             alias,
             "--runtime",
-            "codex",
+            runtime_value,
             "--workspace",
             f"agents/{name}",
+        ]
+        for capability in capabilities:
+            register_args.extend(["--capability", capability])
+        run_cli(
+            cli,
+            state_dir,
+            *register_args,
         )
         agent_map[alias] = name
     return agent_map
@@ -1384,6 +1520,327 @@ def op_deliver_attention_notice(runtime: ManifestRuntime, args: dict[str, object
         "message_ref": message_ref,
     }
     return action_result(index, "deliver_attention_notice", "success", args=args, ref=f"{message_ref}:notice")
+
+
+@manifest_op("post_thread_message")
+def op_post_thread_message(runtime: ManifestRuntime, args: dict[str, object], index: int) -> dict[str, object]:
+    root_ref = str(args.get("root") or args.get("message") or "")
+    root = short_ref_record(runtime.refs, root_ref)
+    require(str(root.get("kind")) == "message", f"post_thread_message ref {root_ref} is not a message")
+    channel = str(root["target"]).split(":", 1)[0]
+    thread = f"{channel}:{str(root['id'])[:8]}"
+    ref = str(args.get("ref") or f"TH{index}")
+    author, sender_type = normalize_author(args.get("author"), runtime.agent_map)
+    body = str(args.get("body") or args.get("body_text") or f"{ref} body {uuid.uuid4()}")
+    ensure_channel(runtime.cli, runtime.state_dir, channel)
+    record = insert_message_record(runtime.state_dir, thread, body, author=author, sender_type=sender_type)
+    runtime.refs[ref] = {
+        "kind": "message",
+        "root_ref": root_ref,
+        "root_message_id": root["id"],
+        **record,
+    }
+    return action_result(index, "post_thread_message", "success", args=args, ref=ref)
+
+
+@manifest_op("orchestrate_chat_task")
+def op_orchestrate_chat_task(runtime: ManifestRuntime, args: dict[str, object], index: int) -> dict[str, object]:
+    message_ref = str(args.get("message") or args.get("root") or "")
+    root = short_ref_record(runtime.refs, message_ref)
+    require(str(root.get("kind")) == "message", f"orchestrate_chat_task ref {message_ref} is not a message")
+    channel = str(args.get("channel") or root["target"]).split(":", 1)[0]
+    ref = str(args.get("ref") or f"O{index}")
+    cli_args = [
+        "agent",
+        "orchestrate",
+        "--channel",
+        channel,
+        "--message-id",
+        str(root["id"]),
+    ]
+    max_workers = args.get("max_workers")
+    if max_workers is not None:
+        cli_args.extend(["--max-workers", str(max_workers)])
+    ensure_channel(runtime.cli, runtime.state_dir, channel)
+    proc = run_cli(runtime.cli, runtime.state_dir, *cli_args)
+    run_match = re.search(r"Run ID: ([A-Za-z0-9_-]+)", proc.stdout)
+    runtime.refs[ref] = {
+        "kind": "orchestration",
+        "root_ref": message_ref,
+        "root_message_id": root["id"],
+        "target": channel,
+        "run_id": run_match.group(1) if run_match else None,
+        "stdout": proc.stdout,
+    }
+    return action_result(index, "orchestrate_chat_task", "success", args=args, stdout=proc.stdout, ref=ref)
+
+
+@manifest_op("run_orchestration_workers")
+def op_run_orchestration_workers(
+    runtime: ManifestRuntime,
+    args: dict[str, object],
+    index: int,
+) -> dict[str, object]:
+    orchestration_ref = str(args.get("orchestration") or args.get("run") or "")
+    orchestration = short_ref_record(runtime.refs, orchestration_ref)
+    require(
+        str(orchestration.get("kind")) == "orchestration",
+        f"run_orchestration_workers ref {orchestration_ref} is not an orchestration",
+    )
+    run_id = str(orchestration.get("run_id") or "")
+    require(bool(run_id), "run_orchestration_workers orchestration has no run_id")
+    conn = connect_state(runtime.state_dir)
+    try:
+        rows = conn.execute(
+            """
+            SELECT detail
+            FROM daemon_events
+            WHERE event = 'orchestration_routed'
+              AND instr(detail, ?) > 0
+            ORDER BY ordinal
+            """,
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    owners: list[str] = []
+    for row in rows:
+        try:
+            detail = json.loads(str(row["detail"]))
+        except json.JSONDecodeError:
+            continue
+        owner = str(detail.get("owner") or "") if isinstance(detail, dict) else ""
+        if owner and owner not in owners:
+            owners.append(owner)
+    require(bool(owners), "run_orchestration_workers found no routed owners")
+    outputs: list[str] = []
+    timeout = str(args.get("timeout") or "10s")
+    for owner in owners:
+        proc = run_cli(
+            runtime.cli,
+            runtime.state_dir,
+            "daemon",
+            "turn",
+            "run",
+            "--agent",
+            owner,
+            "--timeout",
+            timeout,
+        )
+        outputs.append(proc.stdout.strip())
+    ref = str(args.get("ref") or f"W{index}")
+    runtime.refs[ref] = {
+        "kind": "orchestration_workers",
+        "run_id": run_id,
+        "owners": owners,
+        "stdout": "\n".join(outputs),
+    }
+    return action_result(
+        index,
+        "run_orchestration_workers",
+        "success",
+        args=args,
+        stdout="\n".join(outputs),
+        ref=ref,
+    )
+
+
+@manifest_op("verify_orchestration_task_boundaries")
+def op_verify_orchestration_task_boundaries(
+    runtime: ManifestRuntime,
+    args: dict[str, object],
+    index: int,
+) -> dict[str, object]:
+    orchestration_ref = str(args.get("orchestration") or args.get("run") or "")
+    orchestration = short_ref_record(runtime.refs, orchestration_ref)
+    require(
+        str(orchestration.get("kind")) == "orchestration",
+        f"verify_orchestration_task_boundaries ref {orchestration_ref} is not an orchestration",
+    )
+    run_id = str(orchestration.get("run_id") or "")
+    require(bool(run_id), "verify_orchestration_task_boundaries orchestration has no run_id")
+    conn = connect_state(runtime.state_dir)
+    try:
+        route_rows = conn.execute(
+            """
+            SELECT detail
+            FROM daemon_events
+            WHERE event = 'orchestration_routed'
+              AND instr(detail, ?) > 0
+            ORDER BY ordinal
+            """,
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    routes: list[dict[str, object]] = []
+    for row in route_rows:
+        try:
+            detail = json.loads(str(row["detail"]))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(detail, dict):
+            routes.append(detail)
+    require(len(routes) >= 2, "task boundary probe requires at least two routed tasks")
+    channel = str(orchestration.get("target") or "")
+    require(channel.startswith("#"), "task boundary probe requires a channel target")
+
+    def set_cursor_to_head() -> None:
+        conn = connect_state(runtime.state_dir)
+        try:
+            with conn:
+                head = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS seq FROM messages WHERE target = ?",
+                    (channel,),
+                ).fetchone()
+                cursor = int(head["seq"] if head is not None else 0)
+                conn.execute(
+                    """
+                    INSERT INTO freshness(target, cursor, draft)
+                    VALUES (?, ?, NULL)
+                    ON CONFLICT(target) DO UPDATE SET cursor = excluded.cursor, draft = NULL
+                    """,
+                    (channel, cursor),
+                )
+        finally:
+            conn.close()
+
+    lifecycle = routes[0]
+    lifecycle_number = int(lifecycle.get("task_number") or 0)
+    lifecycle_owner = str(lifecycle.get("owner") or "")
+    other_owner = str(routes[1].get("owner") or "")
+    require(lifecycle_number > 0 and lifecycle_owner and other_owner, "lifecycle route is incomplete")
+    set_cursor_to_head()
+    done_proc = invoke_cli(
+        runtime.cli,
+        runtime.state_dir,
+        "task",
+        "update",
+        "--channel",
+        channel,
+        "--number",
+        str(lifecycle_number),
+        "--status",
+        "done",
+        "--assignee",
+        f"@{lifecycle_owner}",
+    )
+    closed_proc = invoke_cli(
+        runtime.cli,
+        runtime.state_dir,
+        "task",
+        "update",
+        "--channel",
+        channel,
+        "--number",
+        str(lifecycle_number),
+        "--status",
+        "closed",
+        "--assignee",
+        f"@{lifecycle_owner}",
+    )
+    same_state_proc = invoke_cli(
+        runtime.cli,
+        runtime.state_dir,
+        "task",
+        "update",
+        "--channel",
+        channel,
+        "--number",
+        str(lifecycle_number),
+        "--status",
+        "closed",
+        "--assignee",
+        f"@{lifecycle_owner}",
+    )
+    wrong_owner_proc = invoke_cli(
+        runtime.cli,
+        runtime.state_dir,
+        "task",
+        "update",
+        "--channel",
+        channel,
+        "--number",
+        str(lifecycle_number),
+        "--status",
+        "done",
+        "--assignee",
+        f"@{other_owner}",
+    )
+
+    stale = routes[1]
+    stale_number = int(stale.get("task_number") or 0)
+    stale_owner = str(stale.get("owner") or "")
+    require(stale_number > 0 and stale_owner, "freshness route is incomplete")
+    set_cursor_to_head()
+    correction = insert_message_record(
+        runtime.state_dir,
+        channel,
+        f"newer human correction {uuid.uuid4().hex}",
+        author="owner",
+        sender_type="human",
+    )
+    stale_proc = invoke_cli(
+        runtime.cli,
+        runtime.state_dir,
+        "task",
+        "update",
+        "--channel",
+        channel,
+        "--number",
+        str(stale_number),
+        "--status",
+        "done",
+        "--assignee",
+        f"@{stale_owner}",
+    )
+    conn = connect_state(runtime.state_dir)
+    try:
+        lifecycle_row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE channel = ? AND number = ?",
+            (channel, lifecycle_number),
+        ).fetchone()
+        stale_row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE channel = ? AND number = ?",
+            (channel, stale_number),
+        ).fetchone()
+        freshness_row = conn.execute(
+            "SELECT draft FROM freshness WHERE target = ?",
+            (channel,),
+        ).fetchone()
+    finally:
+        conn.close()
+    result = {
+        "run_id": run_id,
+        "lifecycle_task": lifecycle_number,
+        "lifecycle_owner": lifecycle_owner,
+        "done_ok": done_proc.returncode == 0,
+        "closed_ok": closed_proc.returncode == 0,
+        "final_status": str(lifecycle_row["status"] if lifecycle_row is not None else ""),
+        "same_state_rejected": same_state_proc.returncode != 0
+        and "UPDATE_FAILED" in same_state_proc.stderr,
+        "wrong_owner_rejected": wrong_owner_proc.returncode != 0
+        and "only the assignee" in wrong_owner_proc.stderr,
+        "stale_task": stale_number,
+        "stale_message_id": correction["id"],
+        "stale_hold_visible": stale_proc.returncode == 0
+        and "Freshness hold:" in stale_proc.stdout
+        and "was not applied" in stale_proc.stdout,
+        "stale_status_unchanged": str(stale_row["status"] if stale_row is not None else "")
+        == "in_review",
+        "stale_draft_absent": freshness_row is not None and freshness_row["draft"] is None,
+        "rerun_instruction": "rerun the task update command" in stale_proc.stdout,
+    }
+    ref = str(args.get("ref") or f"L{index}")
+    runtime.refs[ref] = {"kind": "orchestration_task_boundaries", **result}
+    return action_result(
+        index,
+        "verify_orchestration_task_boundaries",
+        "success",
+        args=args,
+        stdout=json.dumps(result, sort_keys=True),
+        ref=ref,
+    )
 
 
 def message_provenance(target: str, message_id: str) -> str:
@@ -2185,6 +2642,35 @@ def rows_by_evidence_id(evidence: list[dict[str, object]]) -> dict[str, list[dic
     return {str(item["id"]): list(item.get("rows", [])) for item in evidence}
 
 
+def decoded_event_details(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    for row in rows:
+        try:
+            detail = json.loads(str(row.get("detail") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(detail, dict):
+            merged = dict(detail)
+            if "ordinal" in row:
+                merged["_ordinal"] = row["ordinal"]
+            if "time" in row:
+                merged["_time"] = row["time"]
+            details.append(merged)
+    return details
+
+
+def grouped_by_lane_and_task(details: list[dict[str, object]]) -> dict[tuple[str, int], list[dict[str, object]]]:
+    grouped: dict[tuple[str, int], list[dict[str, object]]] = {}
+    for detail in details:
+        lane = str(detail.get("lane_id") or "")
+        try:
+            task_number = int(detail.get("task_number") or 0)
+        except (TypeError, ValueError):
+            task_number = 0
+        grouped.setdefault((lane, task_number), []).append(detail)
+    return grouped
+
+
 def condition_result(
     condition_id: str,
     passed: bool,
@@ -2217,6 +2703,28 @@ def evaluate_conditions(
     )
     absence_rows = evidence_rows.get("committed_message_absence", []) + evidence_rows.get("needle_not_committed", [])
     private_check_rows = evidence_rows.get("private_value_cross_channel", []) + evidence_rows.get("cross_channel_private_value", [])
+    ledger_rows = evidence_rows.get("committed_message_ledger", []) + evidence_rows.get("committed_message_metadata", [])
+    dissect_details = decoded_event_details(evidence_rows.get("orchestration_dissect", []))
+    route_details = decoded_event_details(evidence_rows.get("orchestration_route", []))
+    claim_details = decoded_event_details(evidence_rows.get("orchestration_claim_log", []))
+    execution_details = decoded_event_details(evidence_rows.get("orchestration_execution_count", []))
+    receipt_details = decoded_event_details(evidence_rows.get("orchestration_thread_receipt", []))
+    status_details = decoded_event_details(evidence_rows.get("orchestration_status_transition", []))
+    restart_details = decoded_event_details(evidence_rows.get("orchestration_restart_idempotency", []))
+    steer_details = decoded_event_details(evidence_rows.get("orchestration_steer_log", []))
+    platform_contract_details = decoded_event_details(evidence_rows.get("orchestration_platform_contract", []))
+    external_wake_details = decoded_event_details(evidence_rows.get("orchestration_external_wake", []))
+    body_durable_details = decoded_event_details(evidence_rows.get("orchestration_body_durable", []))
+    notice_details = decoded_event_details(evidence_rows.get("orchestration_notice", []))
+    body_read_details = decoded_event_details(evidence_rows.get("orchestration_body_read", []))
+    coordination_slo_details = decoded_event_details(evidence_rows.get("orchestration_coordination_slo", []))
+    task_freshness_details = decoded_event_details(
+        evidence_rows.get("orchestration_task_status_freshness", [])
+    )
+    navigation_details = decoded_event_details(
+        evidence_rows.get("worker_navigation_query", [])
+    )
+    trace_rows = evidence_rows.get("orchestration_trace_all", [])
     stale_bodies = set(compose.values())
     results: list[dict[str, object]] = []
     for condition in pass_conditions:
@@ -2417,6 +2925,508 @@ def evaluate_conditions(
                     f"private_check_rows={len(checked_rows)} leaked_rows={sum(1 for row in checked_rows if int(row.get('cross_target_matches') or 0) != 0)}",
                 )
             )
+        elif condition_id == "decomposed_by_runtime":
+            orchestrations = [row for row in action_results if row.get("op") == "orchestrate_chat_task" and row.get("outcome") == "success"]
+            preauthored_tasks = [row for row in action_results if row.get("op") == "create_task"]
+            latest = dissect_details[-1] if dissect_details else {}
+            lane_ids = latest.get("lane_ids") if isinstance(latest.get("lane_ids"), list) else []
+            passed = (
+                bool(orchestrations)
+                and not preauthored_tasks
+                and truthy_int(latest.get("ordinary_message")) == 1
+                and truthy_int(latest.get("n_worker_extensible")) == 1
+                and int(latest.get("parent_task") or 0) > 0
+                and int(latest.get("subtask_count") or 0) >= 3
+                and int(latest.get("worker_count") or 0) == int(latest.get("subtask_count") or 0)
+                and len(lane_ids) == int(latest.get("subtask_count") or 0)
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"orchestrations={len(orchestrations)} preauthored_tasks={len(preauthored_tasks)} "
+                    f"parent={latest.get('parent_task')} subtasks={latest.get('subtask_count')} workers={latest.get('worker_count')}",
+                )
+            )
+        elif condition_id == "routed_by_capability":
+            latest = dissect_details[-1] if dissect_details else {}
+            expected = int(latest.get("subtask_count") or 0)
+            owners = [str(row.get("owner") or "") for row in route_details]
+            valid_routes = [
+                row
+                for row in route_details
+                if str(row.get("capability") or "") in {str(value) for value in row.get("owner_capabilities", [])}
+                and str(row.get("capability") or "") in {str(value) for value in row.get("required_capabilities", [])}
+                and truthy_int(row.get("parallel_lane")) == 1
+                and int(row.get("task_number") or 0) > 0
+            ]
+            passed = bool(expected) and len(route_details) == expected and len(valid_routes) == expected and len(set(owners)) == len(owners)
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"routes={len(route_details)} expected={expected} valid={len(valid_routes)} distinct_owners={len(set(owners))}",
+                )
+            )
+        elif condition_id == "five_worker_routing":
+            owners = {str(row.get("owner") or "") for row in route_details if row.get("owner")}
+            unroutable = [row for row in route_details if not row.get("owner") or not row.get("capability")]
+            passed = len(route_details) >= 5 and len(owners) >= 5 and not unroutable
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"routes={len(route_details)} owners={len(owners)} unroutable={len(unroutable)}",
+                )
+            )
+        elif condition_id == "single_owner_no_duplicate":
+            grouped_claims = grouped_by_lane_and_task(claim_details)
+            grouped_execs = grouped_by_lane_and_task(execution_details)
+            duplicate_success_groups = 0
+            missing_success_groups = 0
+            executed_more_than_once = 0
+            for key, rows in grouped_claims.items():
+                successes = [row for row in rows if row.get("outcome") == "success"]
+                if len(successes) != 1:
+                    missing_success_groups += 1
+                if len(successes) > 1:
+                    duplicate_success_groups += 1
+            for rows in grouped_execs.values():
+                if sum(int(row.get("execution_count") or 0) for row in rows) != 1:
+                    executed_more_than_once += 1
+                if any(int(row.get("loser_execution_count") or 0) != 0 for row in rows):
+                    executed_more_than_once += 1
+            passed = (
+                bool(grouped_claims)
+                and bool(grouped_execs)
+                and not missing_success_groups
+                and not duplicate_success_groups
+                and not executed_more_than_once
+                and len(grouped_execs) == len(route_details)
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"claim_groups={len(grouped_claims)} exec_groups={len(grouped_execs)} "
+                    f"missing_success={missing_success_groups} duplicate_success={duplicate_success_groups} bad_exec={executed_more_than_once}",
+                )
+            )
+        elif condition_id == "herd_control":
+            herd_routes = [
+                row
+                for row in route_details
+                if isinstance(row.get("candidate_agents"), list) and len(row.get("candidate_agents", [])) >= 2
+            ]
+            herd_ok = 0
+            for route in herd_routes:
+                lane_id = str(route.get("lane_id") or "")
+                task_number = int(route.get("task_number") or 0)
+                candidates = {str(value) for value in route.get("candidate_agents", [])}
+                claims = [
+                    row
+                    for row in claim_details
+                    if str(row.get("lane_id") or "") == lane_id and int(row.get("task_number") or 0) == task_number
+                ]
+                winners = {str(row.get("agent") or "") for row in claims if row.get("outcome") == "success"}
+                stopped = {str(row.get("agent") or "") for row in claims if row.get("outcome") == "conflict_stop"}
+                if len(winners) == 1 and winners.issubset(candidates) and candidates.difference(winners).issubset(stopped):
+                    herd_ok += 1
+            passed = bool(herd_routes) and herd_ok == len(herd_routes)
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"herd_routes={len(herd_routes)} herd_ok={herd_ok}",
+                )
+            )
+        elif condition_id == "thread_owner_status_receipt":
+            latest = dissect_details[-1] if dissect_details else {}
+            expected = int(latest.get("subtask_count") or 0) + 1
+            receipt_ids = {str(row.get("message_id") or "") for row in receipt_details if row.get("message_id")}
+            ledger_ids = {str(row.get("id") or "") for row in ledger_rows}
+            valid_receipts = [
+                row
+                for row in receipt_details
+                if row.get("owner")
+                and row.get("status")
+                and row.get("thread")
+                and row.get("message_id")
+                and int(row.get("task_number") or 0) > 0
+            ]
+            committed_receipts = receipt_ids.intersection(ledger_ids) if ledger_ids else receipt_ids
+            has_parent = any(
+                row.get("lane_id") == "parent"
+                and row.get("receipt_kind") in {"parent", "accepted"}
+                for row in receipt_details
+            )
+            has_transitions = len(status_details) >= expected
+            passed = (
+                bool(expected)
+                and len(valid_receipts) >= expected
+                and len(committed_receipts) >= expected
+                and has_parent
+                and has_transitions
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"receipts={len(receipt_details)} valid={len(valid_receipts)} committed={len(committed_receipts)} "
+                    f"expected={expected} parent={has_parent} transitions={len(status_details)}",
+                )
+            )
+        elif condition_id == "restart_no_reexecution":
+            latest = restart_details[-1] if restart_details else {}
+            extra_execs = len(execution_details) != len(route_details)
+            passed = bool(restart_details) and not extra_execs and all(
+                int(latest.get(field) or 0) == 0
+                for field in ("duplicate_parent_tasks", "duplicate_subtasks", "duplicate_receipts", "reexecuted_lanes")
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"restart_rows={len(restart_details)} extra_execs={extra_execs} detail={latest}",
+                )
+            )
+        elif condition_id == "steer_honored_precommit":
+            latest = steer_details[-1] if steer_details else {}
+            lane_order = latest.get("lane_order") if isinstance(latest.get("lane_order"), list) else []
+            rules = latest.get("applied_rules") if isinstance(latest.get("applied_rules"), list) else []
+            passed = (
+                bool(latest)
+                and truthy_int(latest.get("applied")) == 1
+                and truthy_int(latest.get("precommit")) == 1
+                and "verify_first" in {str(rule) for rule in rules}
+                and bool(lane_order)
+                and lane_order[0] == "verify"
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"applied={latest.get('applied')} precommit={latest.get('precommit')} "
+                    f"rules={rules} lane_order={lane_order}",
+                )
+            )
+        elif condition_id == "lifecycle_and_illegal_transition":
+            boundary_actions = [
+                row
+                for row in action_results
+                if row.get("op") == "verify_orchestration_task_boundaries"
+                and row.get("outcome") == "success"
+            ]
+            detail = {}
+            if boundary_actions:
+                try:
+                    decoded = json.loads(str(boundary_actions[-1].get("stdout") or "{}"))
+                    if isinstance(decoded, dict):
+                        detail = decoded
+                except json.JSONDecodeError:
+                    detail = {}
+            passed = (
+                truthy_int(detail.get("done_ok")) == 1
+                and truthy_int(detail.get("closed_ok")) == 1
+                and detail.get("final_status") == "closed"
+                and truthy_int(detail.get("same_state_rejected")) == 1
+                and truthy_int(detail.get("wrong_owner_rejected")) == 1
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"done={detail.get('done_ok')} closed={detail.get('closed_ok')} "
+                    f"final={detail.get('final_status')} same_state_rejected={detail.get('same_state_rejected')} "
+                    f"wrong_owner_rejected={detail.get('wrong_owner_rejected')}",
+                )
+            )
+        elif condition_id == "task_status_freshness_hold":
+            boundary_actions = [
+                row
+                for row in action_results
+                if row.get("op") == "verify_orchestration_task_boundaries"
+                and row.get("outcome") == "success"
+            ]
+            detail = {}
+            if boundary_actions:
+                try:
+                    decoded = json.loads(str(boundary_actions[-1].get("stdout") or "{}"))
+                    if isinstance(decoded, dict):
+                        detail = decoded
+                except json.JSONDecodeError:
+                    detail = {}
+            passed = (
+                truthy_int(detail.get("stale_hold_visible")) == 1
+                and truthy_int(detail.get("stale_status_unchanged")) == 1
+                and truthy_int(detail.get("stale_draft_absent")) == 1
+                and truthy_int(detail.get("rerun_instruction")) == 1
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"hold={detail.get('stale_hold_visible')} unchanged={detail.get('stale_status_unchanged')} "
+                    f"draft_absent={detail.get('stale_draft_absent')} rerun={detail.get('rerun_instruction')} "
+                    f"live_hold_rows={len(task_freshness_details)}",
+                )
+            )
+        elif condition_id == "delivery_reply_trailer":
+            result_receipts = [
+                row
+                for row in receipt_details
+                if row.get("receipt_kind") == "result"
+            ]
+            valid = [
+                row
+                for row in result_receipts
+                if row.get("delivery_reply_target") == row.get("thread")
+                and row.get("delivery_root_message_id")
+                and truthy_int(row.get("complete_all_work_before_stopping")) == 1
+                and row.get("message_id")
+            ]
+            passed = len(result_receipts) == len(route_details) and len(valid) == len(route_details)
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"result_receipts={len(result_receipts)} valid_trailers={len(valid)} routes={len(route_details)}",
+                )
+            )
+        elif condition_id == "wake_starts_turn":
+            route_owners = {str(row.get("owner") or "") for row in route_details}
+            wake_agents = {str(row.get("agent") or "") for row in external_wake_details}
+            valid = [
+                row
+                for row in external_wake_details
+                if row.get("source") == "slack_event"
+                and row.get("resident_model_loop") is False
+                and int(row.get("wake_epoch_ms") or 0) > 0
+            ]
+            passed = (
+                bool(route_owners)
+                and wake_agents == route_owners
+                and len(valid) == len(route_details)
+                and len(body_read_details) == len(route_details)
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"wakes={len(external_wake_details)} valid={len(valid)} route_owners={len(route_owners)} "
+                    f"body_reads={len(body_read_details)}",
+                )
+            )
+        elif condition_id == "notice_first_body_withheld":
+            durable = body_durable_details[-1] if body_durable_details else {}
+            durable_ordinal = int(durable.get("_ordinal") or 0)
+            notice_ordinals = [int(row.get("_ordinal") or 0) for row in notice_details]
+            claim_ordinals = [int(row.get("_ordinal") or 0) for row in claim_details]
+            body_read_ordinals = [int(row.get("_ordinal") or 0) for row in body_read_details]
+            valid_notices = [
+                row
+                for row in notice_details
+                if row.get("delivery_kind") == "metadata_only_notice"
+                and row.get("body_present") is False
+                and row.get("target")
+                and row.get("first_message_id")
+                and row.get("latest_message_id")
+                and "body" not in row
+            ]
+            passed = (
+                bool(durable)
+                and truthy_int(durable.get("stored_before_notice")) == 1
+                and int(durable.get("body_bytes") or 0) > 0
+                and len(valid_notices) >= len(route_details)
+                and bool(notice_ordinals)
+                and durable_ordinal < min(notice_ordinals)
+                and (not claim_ordinals or max(notice_ordinals) < min(claim_ordinals))
+                and (not body_read_ordinals or max(notice_ordinals) < min(body_read_ordinals))
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"durable={bool(durable)} notices={len(notice_details)} valid={len(valid_notices)} "
+                    f"routes={len(route_details)} durable_before_notice={durable_ordinal < min(notice_ordinals) if notice_ordinals else False}",
+                )
+            )
+        elif condition_id == "owner_only_body_read":
+            route_owners = {str(row.get("owner") or "") for row in route_details}
+            read_agents = [str(row.get("agent") or "") for row in body_read_details]
+            explicit_owner_reads = [
+                row
+                for row in body_read_details
+                if row.get("explicit_query") is True
+                and row.get("after_claim") is True
+                and str(row.get("query_target") or "").startswith("#")
+                and row.get("queried_message_id")
+                and row.get("query_turn_id")
+            ]
+            losers = [
+                row
+                for row in claim_details
+                if row.get("outcome") == "conflict_stop"
+            ]
+            losers_clean = all(
+                int(row.get("body_reads") or 0) == 0
+                and int(row.get("outward_replies") or 0) == 0
+                and int(row.get("executions") or 0) == 0
+                for row in losers
+            )
+            loser_agents = {str(row.get("agent") or "") for row in losers}
+            passed = (
+                len(read_agents) == len(route_details)
+                and set(read_agents) == route_owners
+                and len(explicit_owner_reads) == len(route_details)
+                and not set(read_agents).intersection(loser_agents.difference(route_owners))
+                and bool(losers)
+                and losers_clean
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"reads={len(read_agents)} explicit={len(explicit_owner_reads)} "
+                    f"owners={len(route_owners)} losers={len(losers)} losers_clean={losers_clean}",
+                )
+            )
+        elif condition_id == "coordination_slos":
+            latest = coordination_slo_details[-1] if coordination_slo_details else {}
+            receipt_value = latest.get("receipt_visible_ms")
+            loser_value = latest.get("loser_stop_ms")
+            first_status_value = latest.get("first_status_ms")
+            receipt_ms = int(receipt_value) if receipt_value is not None else -1
+            loser_ms = int(loser_value) if loser_value is not None else -1
+            first_status_ms = int(first_status_value) if first_status_value is not None else -1
+            passed = (
+                bool(latest)
+                and 0 <= receipt_ms <= 2000
+                and 0 <= loser_ms <= 500
+                and 0 <= first_status_ms <= 5000
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"receipt_visible_ms={receipt_ms} loser_stop_ms={loser_ms} first_status_ms={first_status_ms}",
+                )
+            )
+        elif condition_id == "channel_navigation_exact_target":
+            route_owners = {str(row.get("owner") or "") for row in route_details}
+            result_receipts = [
+                row
+                for row in receipt_details
+                if row.get("receipt_kind") == "result"
+            ]
+            source_channels = {
+                str(row.get("thread") or "").split(":", 1)[0]
+                for row in result_receipts
+                if row.get("thread")
+            }
+            valid_agents: set[str] = set()
+            for owner in route_owners:
+                owner_queries = [
+                    row
+                    for row in navigation_details
+                    if str(row.get("agent") or "") == owner
+                    and row.get("success") is True
+                    and row.get("body_in_trace") is False
+                ]
+                lists = [
+                    row
+                    for row in owner_queries
+                    if row.get("operation") == "channel_list"
+                    and int(row.get("result_count") or 0) >= 2
+                ]
+                members = [
+                    row
+                    for row in owner_queries
+                    if row.get("operation") == "channel_members"
+                    and str(row.get("target") or "") in source_channels
+                ]
+                cross_reads = [
+                    row
+                    for row in owner_queries
+                    if row.get("operation") == "message_read"
+                    and str(row.get("target") or "").startswith("#")
+                    and str(row.get("target") or "").split(":", 1)[0] not in source_channels
+                ]
+                exact_receipt = any(
+                    str(row.get("owner") or "") == owner
+                    and row.get("delivery_reply_target") == row.get("thread")
+                    and row.get("delivery_root_message_id")
+                    and row.get("message_id")
+                    for row in result_receipts
+                )
+                if lists and members and cross_reads and exact_receipt:
+                    valid_agents.add(owner)
+            passed = (
+                bool(route_owners)
+                and valid_agents == route_owners
+                and len(result_receipts) == len(route_details)
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"owners={len(route_owners)} navigation_rows={len(navigation_details)} "
+                    f"fully_valid={len(valid_agents)} source_channels={sorted(source_channels)}",
+                )
+            )
+        elif condition_id == "trace_public_safe_metadata_only":
+            trace_text = json.dumps(trace_rows, sort_keys=True)
+            body_values = []
+            for row in action_results:
+                args = row.get("args") if isinstance(row.get("args"), dict) else {}
+                for key in ("body", "body_text"):
+                    value = args.get(key)
+                    if isinstance(value, str) and len(value.strip()) >= 12:
+                        body_values.append(value.strip())
+            body_hits = [value for value in body_values if value in trace_text]
+            forbidden_hits = [
+                marker
+                for marker in (
+                    "/Users/",
+                    "private-owner-name",
+                    "private-local-account",
+                    "chain-of-thought",
+                    "private body",
+                )
+                if marker.lower() in trace_text.lower()
+            ]
+            credential_hit = contains_credential_shape(trace_text)
+            passed = bool(trace_rows) and not body_hits and not forbidden_hits and not credential_hit
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"trace_rows={len(trace_rows)} body_hits={len(body_hits)} forbidden_hits={forbidden_hits} credential_hit={credential_hit}",
+                )
+            )
+        elif condition_id == "platform_contract_bound":
+            expected_version = "swarm-runtime-flow-v1"
+            expected_coverage = "chat-task-orchestration-coverage-v2"
+            contract_rows = [
+                detail.get("platform_contract")
+                for detail in platform_contract_details
+                if isinstance(detail.get("platform_contract"), dict)
+            ]
+            matching = [
+                contract
+                for contract in contract_rows
+                if contract.get("version") == expected_version
+                and contract.get("coverage_manifest_version") == expected_coverage
+                and contract.get("source_material_embedded") is False
+            ]
+            passed = bool(contract_rows) and len(matching) == len(contract_rows)
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"contract_rows={len(contract_rows)} matching={len(matching)} version={expected_version}",
+                )
+            )
         else:
             results.append(condition_result(condition_id, False, "unsupported condition in implementation runner"))
     return results
@@ -2479,6 +3489,24 @@ def requested_metric_values(
                 None,
             )
             metrics[metric] = 0 if commit_condition and commit_condition.get("passed") else 1
+        elif metric == "orchestration_duplicate_execution_rate":
+            no_duplicate = next((row for row in condition_results if row.get("id") == "single_owner_no_duplicate"), None)
+            restart_safe = next((row for row in condition_results if row.get("id") == "restart_no_reexecution"), None)
+            metrics[metric] = 0 if (
+                no_duplicate
+                and no_duplicate.get("passed")
+                and restart_safe
+                and restart_safe.get("passed")
+            ) else 1
+        elif metric == "trace_privacy_leak_rate":
+            body_withheld = next((row for row in condition_results if row.get("id") == "notice_first_body_withheld"), None)
+            owner_only = next((row for row in condition_results if row.get("id") == "owner_only_body_read"), None)
+            metrics[metric] = 0 if (
+                body_withheld
+                and body_withheld.get("passed")
+                and owner_only
+                and owner_only.get("passed")
+            ) else 1
         else:
             metrics[metric] = None
     return metrics

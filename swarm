@@ -29,7 +29,7 @@ from typing import Any, Callable
 SCHEMA_VERSION = 22
 CONTEXT_MANIFEST_VERSION = 1
 STATE_FILE = "state.sqlite3"
-TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
+TASK_STATUSES = {"todo", "in_progress", "in_review", "done", "closed"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 DRAFT_PREFIX = "__SWARM_DRAFT_V1__"
 CREDENTIAL_SHAPE_RE = re.compile(
@@ -2831,6 +2831,33 @@ def append_task_for_author(
     return task
 
 
+def append_thread_task_for_author(
+    state: dict[str, Any],
+    channel: str,
+    thread: str,
+    title: str,
+    author: str,
+) -> dict[str, Any]:
+    """Create channel task state while keeping its visible receipt in the source thread."""
+    record = append_message(state, thread, title, author=author)
+    number = int(state.get("next_task_number", 1))
+    state["next_task_number"] = number + 1
+    now = current_timestamp()
+    task = task_item(
+        number,
+        channel,
+        title.strip(),
+        "todo",
+        author,
+        None,
+        record["id"],
+        now,
+        now,
+    )
+    state.setdefault("tasks", []).append(task)
+    return task
+
+
 def append_task_from_message(state: dict[str, Any], channel: str, record: dict[str, Any]) -> dict[str, Any]:
     number = int(state.get("next_task_number", 1))
     state["next_task_number"] = number + 1
@@ -3020,32 +3047,14 @@ def finish_daemon_wake(state: dict[str, Any], agent_name: str) -> tuple[str | No
 
 
 def route_message_wakes(state: dict[str, Any], record: dict[str, Any]) -> list[dict[str, str]]:
-    routed: list[dict[str, str]] = []
-    mentioned = mentioned_agent_names(state, str(record.get("body", "")))
-    for agent_name in mentioned:
-        status = enqueue_daemon_wake(state, agent_name, "mention", str(record["id"]))
-        routed.append({"agent": agent_name, "status": status, "reason": "mention"})
-    if not mentioned and "@" in str(record.get("body", "")):
-        append_daemon_event(
-            state,
-            "wake_route_miss",
-            {
-                "reason": "mention",
-                "message_id": record["id"],
-                "target": record["target"],
-            },
-        )
-    # Full-attention routing wakes every other registered agent for human
-    # channel messages; the reply/silence judgment lives in the agent turn.
     author = str(record.get("author") or "")
-    if str(record.get("type") or "") == "human" or author.startswith("slack:"):
-        for agent in state.get("agents", []):
-            agent_name = str(agent["name"])
-            if agent_name in mentioned or agent_name == author:
-                continue
-            status = enqueue_daemon_wake(state, agent_name, "attention", str(record["id"]))
-            routed.append({"agent": agent_name, "status": status, "reason": "attention"})
-    return routed
+    if str(record.get("type") or "") != "human" and not author.startswith("slack:"):
+        return []
+    # Human chat enters the live orchestration boundary. The daemon persists
+    # the body, fans out metadata-only NOTICE rows, atomically chooses owners,
+    # and wakes only successful claim holders. Non-owners stop before a body
+    # query or model turn instead of receiving raw-message fan-out.
+    return route_live_orchestration_wakes(state, record)
 
 
 def route_reminder_wake(state: dict[str, Any], reminder: dict[str, Any], record: dict[str, Any] | None) -> str | None:
@@ -3610,6 +3619,30 @@ def known_surface(state: dict[str, Any], target: str) -> bool:
     return any(record["target"] == target for record in state["messages"])
 
 
+def append_worker_navigation_query(
+    state: dict[str, Any],
+    operation: str,
+    *,
+    target: str | None = None,
+    result_count: int | None = None,
+) -> None:
+    agent_name = str(os.environ.get("SWARM_AGENT_NAME") or "").removeprefix("@")
+    if not agent_name:
+        return
+    detail: dict[str, Any] = {
+        "agent": agent_name,
+        "turn_id": str(os.environ.get("SWARM_TURN_ID") or ""),
+        "operation": operation,
+        "target": target,
+        "success": True,
+        "body_in_trace": False,
+        "query_epoch_ms": epoch_milliseconds(),
+    }
+    if result_count is not None:
+        detail["result_count"] = result_count
+    append_daemon_event(state, "worker_navigation_query", detail)
+
+
 def command_message_read(argv: list[str]) -> int:
     channel = arg_value(argv, "--channel")
     if channel is None:
@@ -3621,12 +3654,83 @@ def command_message_read(argv: list[str]) -> int:
     def action(state: dict[str, Any]) -> int:
         if not known_surface(state, channel):
             return write_stderr(f"Error: Channel not found: {channel}\nCode: NOT_FOUND\n")
+        channel_record_value = top_level_channel_record(state, channel.split(":", 1)[0])
+        if (
+            channel_record_value is not None
+            and bool(channel_record_value.get("private"))
+            and not bool(channel_record_value.get("joined"))
+        ):
+            return write_stderr("Error: Channel is not visible to this worker\nCode: READ_FAILED\n")
 
         all_records = records_for_surface(state, channel)
         total_records = len(all_records)
         records, anchor_error = bounded_records(all_records, argv, limit)
         if anchor_error is not None:
             return write_stderr(f"Error: {anchor_error}\nCode: NOT_FOUND\n")
+        navigation_agent = str(os.environ.get("SWARM_AGENT_NAME") or "").removeprefix("@")
+        if navigation_agent and target_is_thread(channel):
+            orchestration_root, orchestration_run = orchestration_root_for_thread(state, channel)
+            if orchestration_root is not None and orchestration_run is not None:
+                assignment = orchestration_assignment_for_agent(
+                    state,
+                    str(orchestration_root["id"]),
+                    navigation_agent,
+                )
+                if assignment is None:
+                    return write_stderr(
+                        "Error: orchestration body is restricted to the successful claim owner\n"
+                        "Code: READ_FAILED\n"
+                    )
+                around = arg_value(argv, "--around")
+                if around is None:
+                    return write_stderr(
+                        "Error: owner body query requires --around with the noticed message id\n"
+                        "Code: READ_FAILED\n"
+                    )
+                queried_record = next(
+                    (
+                        record
+                        for record in all_records
+                        if str(record["id"]) == around or short_id(str(record["id"])) == around
+                    ),
+                    None,
+                )
+                if queried_record is None:
+                    return write_stderr("Error: noticed message not found in thread\nCode: NOT_FOUND\n")
+                run_id = str(orchestration_run.get("run_id") or "")
+                existing_reads = orchestration_event_details(state, "orchestration_body_read", run_id)
+                if not any(
+                    str(detail.get("agent") or "") == navigation_agent
+                    and str(detail.get("queried_message_id") or "") == str(queried_record["id"])
+                    for detail in existing_reads
+                ):
+                    append_daemon_event(
+                        state,
+                        "orchestration_body_read",
+                        {
+                            "run_id": run_id,
+                            "root_message_id": orchestration_root["id"],
+                            "queried_message_id": queried_record["id"],
+                            "lane_id": assignment.get("lane_id"),
+                            "agent": navigation_agent,
+                            "task_number": assignment.get("task_number"),
+                            "after_claim": True,
+                            "explicit_query": True,
+                            "query_target": channel,
+                            "query_turn_id": str(os.environ.get("SWARM_TURN_ID") or ""),
+                            "body_sha256": hashlib.sha256(
+                                str(queried_record.get("body") or "").encode("utf-8")
+                            ).hexdigest(),
+                            "body_bytes": len(str(queried_record.get("body") or "").encode("utf-8")),
+                            "read_epoch_ms": epoch_milliseconds(),
+                        },
+                    )
+        append_worker_navigation_query(
+            state,
+            "message_read",
+            target=channel,
+            result_count=len(records),
+        )
         if channel == "#general":
             last_read = state.get("last_read", {}).get("#general", 0)
             header = (
@@ -3942,16 +4046,16 @@ def render_freshness_hold(
     )
 
 
-def render_task_freshness_hold(state: dict[str, Any], channel: str) -> int:
+def render_task_freshness_hold(state: dict[str, Any], channel: str, action: str = "claim") -> int:
     blocking = freshness_blockers(state, channel)
     visible = blocking[-1:]
     history_rows = "\n".join(format_history_row(record) for record in visible)
     return write_stdout(
         f"Freshness hold: showing latest {len(visible)} of {len(blocking)} newer message.\n"
-        "Your task claim was not applied. Review the bounded context shown here, then choose one path.\n"
+        f"Your task {action} was not applied. Review the bounded context shown here, then choose one path.\n"
         f"## Message History for {channel} ({len(visible)} messages)\n\n"
         f"{history_rows}\n\n"
-        "After reviewing the newer context, rerun the task claim command if it is still correct.\n"
+        f"After reviewing the newer context, rerun the task {action} command if it is still correct.\n"
     )
 
 
@@ -4024,10 +4128,10 @@ def command_task_list(argv: list[str]) -> int:
         return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
     status_values = arg_values(argv, "--status")
     if flag_missing_value(argv, "--status"):
-        return write_stderr("Error: --status must be one of todo, in_progress, in_review, done\nCode: INVALID_ARG\n")
+        return write_stderr("Error: --status must be one of todo, in_progress, in_review, done, closed\nCode: INVALID_ARG\n")
     invalid_statuses = [status for status in status_values if status not in TASK_STATUSES]
     if invalid_statuses:
-        return write_stderr("Error: --status must be one of todo, in_progress, in_review, done\nCode: INVALID_ARG\n")
+        return write_stderr("Error: --status must be one of todo, in_progress, in_review, done, closed\nCode: INVALID_ARG\n")
     statuses = set(status_values) if status_values else None
     assignee = arg_value(argv, "--assignee")
     if flag_missing_value(argv, "--assignee"):
@@ -4276,8 +4380,8 @@ def command_task_unclaim(argv: list[str]) -> int:
         if freshness_blockers(state, channel):
             return render_task_freshness_hold(state, channel)
         for task in tasks:
-            if task["status"] == "done":
-                return write_stderr("Error: done tasks cannot be unclaimed\nCode: UNCLAIM_FAILED\n")
+            if task["status"] in {"done", "closed"}:
+                return write_stderr(f"Error: {task['status']} tasks cannot be unclaimed\nCode: UNCLAIM_FAILED\n")
             if task.get("assignee") != assignee:
                 return write_stderr(
                     f"Error: task #{task['number']} is not claimed by @{assignee}\n"
@@ -4298,22 +4402,50 @@ def command_task_update(argv: list[str]) -> int:
         return write_stderr("Error: --channel is required\nCode: INVALID_ARG\n")
     status = arg_value(argv, "--status")
     if status not in TASK_STATUSES:
-        return write_stderr("Error: --status must be one of todo, in_progress, in_review, done\nCode: INVALID_ARG\n")
+        return write_stderr("Error: --status must be one of todo, in_progress, in_review, done, closed\nCode: INVALID_ARG\n")
+    if flag_missing_value(argv, "--assignee"):
+        return write_stderr("Error: --assignee requires a value\nCode: INVALID_ARG\n")
+    assignee = (arg_value(argv, "--assignee") or "candidate").removeprefix("@")
+    if not assignee:
+        return write_stderr("Error: --assignee requires a value\nCode: INVALID_ARG\n")
 
     def action(state: dict[str, Any]) -> int:
         if not channel_has_task_surface(state, channel):
             return write_stderr("Error: Agent or channel not found\nCode: UPDATE_FAILED\n")
+        assignee_profile = profile_by_name(state, assignee)
+        if (
+            assignee != "candidate"
+            and agent_by_name(state, assignee) is None
+            and (assignee_profile is None or assignee_profile.get("kind") != "agent")
+        ):
+            return write_stderr("Error: Assignee not found\nCode: NOT_FOUND\n")
+        if freshness_blockers(state, channel):
+            return render_task_freshness_hold(state, channel, "update")
         task = resolve_task_arg(state, channel, argv)
         if task is None:
             return write_stderr("Error: Task not found\nCode: NOT_FOUND\n")
+        if task.get("assignee") != assignee:
+            return write_stderr("Error: only the assignee can update status\nCode: UPDATE_FAILED\n")
         if task["status"] == status:
             return write_stderr(
                 f"Error: cannot transition from {task['status']} to {status}\n"
                 "Code: UPDATE_FAILED\n"
             )
-        if task["status"] == "done":
+        if task["status"] == "closed":
             return write_stderr(
-                f"Error: cannot transition from done to {status}\n"
+                f"Error: cannot transition from closed to {status}\n"
+                "Code: UPDATE_FAILED\n"
+            )
+        allowed_next = {
+            "todo": {"in_progress", "closed"},
+            "in_progress": {"in_review", "closed"},
+            "in_review": {"done", "closed"},
+            "done": {"closed"},
+            "closed": set(),
+        }
+        if status not in allowed_next.get(str(task["status"]), set()):
+            return write_stderr(
+                f"Error: cannot transition from {task['status']} to {status}\n"
                 "Code: UPDATE_FAILED\n"
             )
         old_status = task["status"]
@@ -4727,7 +4859,11 @@ def read_mock_socket_frames(path_text: str) -> tuple[list[dict[str, Any]] | None
     return None, "mock socket file must be a JSON object, JSON array, or JSONL objects"
 
 
-def daemon_ingest_slack_payload(workspace: str, payload: dict[str, Any]) -> tuple[str | None, str | None]:
+def daemon_ingest_slack_payload(
+    workspace: str,
+    payload: dict[str, Any],
+    flush_outbound: bool = False,
+) -> tuple[str | None, str | None]:
     event, event_error = normalized_slack_event(payload)
     if event_error is not None:
         daemon_record_event("slack_socket_skip", {"workspace": workspace, "reason": event_error})
@@ -4795,6 +4931,19 @@ def daemon_ingest_slack_payload(workspace: str, payload: dict[str, Any]) -> tupl
     with_mutable_state(action)
     if "error" in result:
         return None, str(result["error"])
+    if flush_outbound and result.get("status") == "imported":
+        for outbound_target in pending_outbound_targets(workspace):
+            send_result = command_slack_send(
+                ["--workspace", workspace, "--target", outbound_target]
+            )
+            daemon_record_event(
+                "resident_outbound",
+                {
+                    "target": outbound_target,
+                    "exit": send_result,
+                    "source": "socket_ingest",
+                },
+            )
     return str(result.get("status", "skipped")), None
 
 
@@ -4873,7 +5022,11 @@ def run_real_slack_socket(
                     payload = slack_socket_payload_from_frame(frame)
                     if payload is None:
                         continue
-                    status, error = daemon_ingest_slack_payload(workspace, payload)
+                    status, error = daemon_ingest_slack_payload(
+                        workspace,
+                        payload,
+                        flush_outbound=True,
+                    )
                     if error is not None:
                         return write_stderr(f"Error: {error}\nCode: SLACK_SOCKET_INGEST_FAILED\n")
                     if status != "skipped":
@@ -5427,6 +5580,28 @@ def wake_live_presence_context(state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def wake_navigation_contract(state: dict[str, Any], target: str) -> str:
+    source_channel = target.split(":", 1)[0]
+    other_channels = [
+        str(record["name"])
+        for record in sorted(state.get("channels", []), key=lambda row: str(row.get("name") or ""))
+        if str(record.get("name") or "") != source_channel
+        and not bool(record.get("private"))
+        and bool(record.get("joined"))
+    ]
+    suggested = other_channels[0] if other_channels else "(no second visible public channel)"
+    return (
+        "Channel navigation is part of this turn contract. Use the same-state CLI that is already on PATH: "
+        "`swarm server info`; `swarm channel members --target "
+        + source_channel
+        + "`; and `swarm message read --channel "
+        + suggested
+        + "`. The first command must enumerate visible channels, the second must confirm source-channel "
+        "membership, and the third must be an on-demand read of a different visible channel. These read-only "
+        "queries are audited. Do not copy unrelated channel bodies into your reply."
+    )
+
+
 def latest_target_message_seq(state: dict[str, Any], target: str | None) -> int:
     if not target:
         return 0
@@ -5493,11 +5668,159 @@ def prepare_daemon_turn(
         if not input_text and wake is not None and wake.get("active_message_id"):
             active_record, active_error = message_by_id(state, str(wake["active_message_id"]))
             if active_error is None and active_record is not None:
-                input_text = str(active_record.get("body", ""))
-                input_message_id = str(active_record["id"])
-                if target is None:
+                active_reason = str(wake.get("active_reason") or "")
+                active_message_id = str(active_record["id"])
+                if active_reason.startswith("orchestration_owner:"):
+                    assignment = orchestration_assignment_for_agent(
+                        state,
+                        active_message_id,
+                        agent_name,
+                    )
+                    queried_record = message_by_full_id(state, active_message_id)
+                    if queried_record is None or assignment is None:
+                        return {
+                            "error": "orchestration owner wake has no successful claim",
+                            "code": "CLAIM_REQUIRED",
+                        }
+                    input_message_id = active_message_id
+                    target = reply_thread_target(
+                        str(queried_record["target"]),
+                        active_message_id,
+                    )
+                    wake_context_head_seq = latest_target_message_seq(state, target)
+                    presence_context = wake_live_presence_context(state)
+                    notice = {
+                        "target": queried_record["target"],
+                        "pending_count": 1,
+                        "first_message_id": active_message_id,
+                        "latest_message_id": active_message_id,
+                        "thread": False,
+                        "body_present": False,
+                    }
+                    input_text = (
+                        "[metadata-only NOTICE]\n"
+                        + json.dumps(notice, sort_keys=True, separators=(",", ":"))
+                        + "\n\n[atomic claim receipt]\n"
+                        + f"run={assignment.get('run_id')} lane={assignment.get('lane_id')} "
+                        + f"task={assignment.get('task_number')} owner=@{agent_name}\n\n"
+                        + "[owner QUERY required]\n"
+                        + "The message body is still withheld. Before executing the lane, explicitly run "
+                        + '`swarm message read --channel "'
+                        + target
+                        + '" --around "'
+                        + short_id(active_message_id)
+                        + '"`. This is the owner-only body query and is audited after the successful claim. '
+                        + "If the query fails, stop without producing a result.\n\n"
+                        + "Complete the assigned lane through your native harness. Do not restate the "
+                        + "request generically. Produce the concrete result or a useful progress/status receipt "
+                        + "for your lane. Other workers have separate claims; do not speak for them.\n\n"
+                        + "Live agent presence snapshot (ledger at turn start):\n"
+                        + (presence_context or "(no agent presence available)")
+                        + "\n\n"
+                        + wake_navigation_contract(state, target)
+                        + "\n\nDelivery trailer: reply to exact target "
+                        + target
+                        + " for root msg="
+                        + short_id(active_message_id)
+                        + ". Complete all work you can safely finish before stopping."
+                    )
+                elif active_reason.startswith("orchestration_steer:"):
+                    root_record, run = orchestration_root_for_thread(
+                        state,
+                        str(active_record.get("target") or ""),
+                    )
+                    if root_record is None or run is None:
+                        return {"error": "orchestration steer has no root run", "code": "NOT_FOUND"}
+                    run_id = str(run.get("run_id") or "")
+                    assignment = next(
+                        (
+                            row
+                            for row in orchestration_event_details(state, "orchestration_routed", run_id)
+                            if str(row.get("owner") or "") == agent_name
+                        ),
+                        None,
+                    )
+                    if assignment is None:
+                        return {
+                            "error": "orchestration steer owner has no successful claim",
+                            "code": "CLAIM_REQUIRED",
+                        }
+                    input_message_id = str(root_record["id"])
                     target = str(active_record["target"])
-                if wake.get("active_reason") in {"attention", "mention"}:
+                    wake_context_head_seq = latest_target_message_seq(state, target)
+                    input_text = (
+                        "[metadata-only NOTICE]\n"
+                        + json.dumps(
+                            {
+                                "target": target,
+                                "pending_count": 1,
+                                "first_message_id": active_message_id,
+                                "latest_message_id": active_message_id,
+                                "thread": True,
+                                "body_present": False,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n\n[owner QUERY required: newer human steer]\n"
+                        + "The steer body is still withheld. Explicitly run "
+                        + '`swarm message read --channel "'
+                        + target
+                        + '" --around "'
+                        + short_id(active_message_id)
+                        + '"` before re-evaluating the lane. The read is owner-only and audited.\n\n'
+                        + "Re-evaluate your claimed lane against the newer steer before any status/result "
+                        + "commit. If the earlier result is stale, replace it; do not send the stale result.\n\n"
+                        + "Delivery trailer: reply to exact target "
+                        + target
+                        + " for root msg="
+                        + short_id(str(root_record["id"]))
+                        + ". Complete all work you can safely finish before stopping."
+                    )
+                elif active_reason == "notice_query":
+                    input_message_id = active_message_id
+                    target = str(active_record["target"])
+                    append_daemon_event(
+                        state,
+                        "notice_owner_body_read",
+                        {
+                            "message_id": active_message_id,
+                            "agent": agent_name,
+                            "target": target,
+                            "body_sha256": hashlib.sha256(
+                                str(active_record.get("body") or "").encode("utf-8")
+                            ).hexdigest(),
+                            "read_epoch_ms": epoch_milliseconds(),
+                        },
+                    )
+                    input_text = (
+                        "[metadata-only NOTICE]\n"
+                        + json.dumps(
+                            {
+                                "target": target,
+                                "pending_count": 1,
+                                "first_message_id": active_message_id,
+                                "latest_message_id": active_message_id,
+                                "thread": ":" in target,
+                                "body_present": False,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n\n[owner QUERY result]\n"
+                        + str(active_record.get("body") or "")
+                        + "\n\nRespond only if useful. Delivery trailer: reply to exact target "
+                        + target
+                        + " for msg="
+                        + short_id(active_message_id)
+                        + "."
+                    )
+                else:
+                    input_text = str(active_record.get("body", ""))
+                    input_message_id = active_message_id
+                    if target is None:
+                        target = str(active_record["target"])
+                if active_reason in {"attention", "mention"}:
                     shared_context, wake_context_head_seq = wake_shared_channel_context(
                         state,
                         target,
@@ -5507,18 +5830,12 @@ def prepare_daemon_turn(
                     attention_instruction = (
                         "You were not mentioned. Reply ONLY if you are addressed implicitly or have something "
                         "genuinely useful to add; otherwise output exactly SILENT and nothing else."
-                        if wake.get("active_reason") == "attention"
+                        if active_reason == "attention"
                         else "You were explicitly mentioned; respond to the request as appropriate."
                     )
                     input_text = (
-                        f"[{wake.get('active_reason')} wake] New channel message below. {attention_instruction} "
-                        "Multiple agents may answer sequentially. Agent identities and model sessions are "
-                        "independent, but the ordered shared channel timeline below is authoritative collaboration "
-                        "state and outranks older session memory. The live presence snapshot is the only authority "
-                        "for current agent availability; the timeline is the authority for what was said. A visible "
-                        "reply proves that reply happened; absent reply evidence does not prove a peer is "
-                        "unreachable. If neither shared surface contains evidence about a peer, speak only for "
-                        "yourself or output SILENT.\n\n"
+                        f"[{active_reason} wake] New channel message below. {attention_instruction} "
+                        "The ordered shared channel timeline below is authoritative collaboration state.\n\n"
                         "Trigger message:\n"
                         + input_text
                         + "\n\nShared channel timeline (authoritative, chronological; same exact target only):\n"
@@ -5549,9 +5866,21 @@ def prepare_daemon_turn(
             # Real claude CLI: --resume only accepts an existing session; first
             # turns must create the session via --session-id (print mode).
             if resumable:
-                command = [*command, "-p", "--resume", session_id]
+                command = [
+                    *command,
+                    "-p",
+                    "--dangerously-skip-permissions",
+                    "--resume",
+                    session_id,
+                ]
             else:
-                command = [*command, "-p", "--session-id", session_id]
+                command = [
+                    *command,
+                    "-p",
+                    "--dangerously-skip-permissions",
+                    "--session-id",
+                    session_id,
+                ]
         elif runtime_kind == "codex":
             # Codex 0.144+ exposes non-interactive persistence through
             # `codex exec` / `codex exec resume`, not a root `--resume` flag.
@@ -5564,6 +5893,7 @@ def prepare_daemon_turn(
                     "resume",
                     "--json",
                     "--ignore-user-config",
+                    "--dangerously-bypass-approvals-and-sandbox",
                     "--skip-git-repo-check",
                     session_id,
                     "-",
@@ -5574,6 +5904,7 @@ def prepare_daemon_turn(
                     "exec",
                     "--json",
                     "--ignore-user-config",
+                    "--dangerously-bypass-approvals-and-sandbox",
                     "--skip-git-repo-check",
                     "-",
                 ]
@@ -5665,13 +5996,57 @@ def finalize_daemon_turn(
                     status == "done",
                     error_text,
                 )
+        orchestration_assignment = None
+        orchestration_root_id = str(turn.get("input_message_id") or "")
+        if orchestration_root_id:
+            orchestration_assignment = orchestration_assignment_for_agent(
+                state,
+                orchestration_root_id,
+                agent_name,
+            )
+        owner_query_error = None
+        if orchestration_assignment is not None and status == "done":
+            run_id = str(orchestration_assignment.get("run_id") or "")
+            body_reads = orchestration_event_details(state, "orchestration_body_read", run_id)
+            owner_query_satisfied = any(
+                str(detail.get("agent") or "") == agent_name
+                and detail.get("explicit_query") is True
+                and str(detail.get("query_turn_id") or "") == str(turn_id)
+                and str(detail.get("query_target") or "") == str(target or "")
+                for detail in body_reads
+            )
+            if not owner_query_satisfied:
+                owner_query_error = "successful owner did not explicitly query the noticed message body"
+                append_daemon_event(
+                    state,
+                    "orchestration_owner_query_missing",
+                    {
+                        "run_id": run_id,
+                        "root_message_id": orchestration_root_id,
+                        "lane_id": orchestration_assignment.get("lane_id"),
+                        "agent": agent_name,
+                        "task_number": orchestration_assignment.get("task_number"),
+                        "turn_id": turn_id,
+                        "target": target,
+                        "result_committed": False,
+                    },
+                )
         wake_status = None
         wake = daemon_wake_by_agent(state, agent_name)
         if consumes_wake and wake is not None and wake.get("running"):
             wake_status, _ = finish_daemon_wake(state, agent_name)
-        effective_status = "failed" if dispatch_error is not None else status
-        effective_error = "dispatch finalize failed" if dispatch_error is not None else error_text
-        effective_exit_code = 1 if dispatch_error is not None and (exit_code is None or exit_code == 0) else exit_code
+        effective_status = "failed" if dispatch_error is not None or owner_query_error else status
+        effective_error = (
+            "dispatch finalize failed"
+            if dispatch_error is not None
+            else owner_query_error or error_text
+        )
+        effective_exit_code = (
+            1
+            if (dispatch_error is not None or owner_query_error)
+            and (exit_code is None or exit_code == 0)
+            else exit_code
+        )
         turn["status"] = effective_status
         turn["updated_at"] = now
         turn["finished_at"] = now
@@ -5683,10 +6058,18 @@ def finalize_daemon_turn(
             turn["session_id"] = completed_session_id
         message_id = None
         stdout_clean = (stdout_text or "").strip()
+        outbound_text = stdout_clean
+        if orchestration_assignment is not None and target and stdout_clean and stdout_clean != "SILENT":
+            delivery_trailer = (
+                f"[delivery target={target} root={short_id(orchestration_root_id)} "
+                "complete_all_work_before_stopping=true]"
+            )
+            if delivery_trailer not in outbound_text:
+                outbound_text = f"{outbound_text}\n\n{delivery_trailer}"
         current_target_seq = latest_target_message_seq(state, target)
         freshness_held = (
             dispatch_error is None
-            and status == "done"
+            and effective_status == "done"
             and bool(target)
             and bool(stdout_clean)
             and stdout_clean != "SILENT"
@@ -5704,12 +6087,125 @@ def finalize_daemon_turn(
                     "target": target,
                     "snapshot_seq": target_snapshot_seq,
                     "current_seq": current_target_seq,
-                    "output_chars": len(stdout_clean),
+                    "output_chars": len(outbound_text),
                 },
             )
-        elif dispatch_error is None and status == "done" and target and stdout_clean:
-            record = append_message(state, target, stdout_clean, author=agent_name)
+        elif dispatch_error is None and effective_status == "done" and target and stdout_clean:
+            record = append_message(state, target, outbound_text, author=agent_name)
             message_id = record["id"]
+        if orchestration_assignment is not None:
+            run_id = str(orchestration_assignment.get("run_id") or "")
+            lane_id = str(orchestration_assignment.get("lane_id") or "")
+            task_number = int(orchestration_assignment.get("task_number") or 0)
+            if freshness_held:
+                append_daemon_event(
+                    state,
+                    "orchestration_task_status_freshness_hold",
+                    {
+                        "run_id": run_id,
+                        "root_message_id": orchestration_root_id,
+                        "lane_id": lane_id,
+                        "agent": agent_name,
+                        "task_number": task_number,
+                        "status_applied": False,
+                        "draft_created": False,
+                        "rerun_required": True,
+                        "snapshot_seq": target_snapshot_seq,
+                        "current_seq": current_target_seq,
+                    },
+                )
+            elif effective_status == "done" and message_id is not None:
+                prior_executions = [
+                    row
+                    for row in orchestration_event_details(
+                        state,
+                        "orchestration_execution",
+                        run_id,
+                    )
+                    if str(row.get("lane_id") or "") == lane_id
+                ]
+                if not prior_executions:
+                    append_daemon_event(
+                        state,
+                        "orchestration_execution",
+                        {
+                            "run_id": run_id,
+                            "root_message_id": orchestration_root_id,
+                            "lane_id": lane_id,
+                            "agent": agent_name,
+                            "task_number": task_number,
+                            "execution_count": 1,
+                            "loser_execution_count": 0,
+                            "executed_epoch_ms": epoch_milliseconds(),
+                        },
+                    )
+                task = next(
+                    (
+                        row
+                        for row in state.get("tasks", [])
+                        if int(row.get("number") or 0) == task_number
+                        and str(row.get("channel") or "") == str(target or "").split(":", 1)[0]
+                    ),
+                    None,
+                )
+                if task is not None and str(task.get("assignee") or "") == agent_name:
+                    prior_status = str(task.get("status") or "")
+                    if prior_status == "in_progress":
+                        task["status"] = "in_review"
+                        task["updated_at"] = now
+                        append_daemon_event(
+                            state,
+                            "orchestration_status_transition",
+                            {
+                                "run_id": run_id,
+                                "lane_id": lane_id,
+                                "task_number": task_number,
+                                "from": prior_status,
+                                "to": "in_review",
+                                "owner": agent_name,
+                                "assignee_authorized": True,
+                                "server_message_id": message_id,
+                            },
+                        )
+                append_daemon_event(
+                    state,
+                    "orchestration_thread_receipt",
+                    {
+                        "run_id": run_id,
+                        "lane_id": lane_id,
+                        "owner": agent_name,
+                        "task_number": task_number,
+                        "status": "in_review",
+                        "thread": target,
+                        "message_id": message_id,
+                        "receipt_kind": "result",
+                        "delivery_reply_target": target,
+                        "delivery_root_message_id": orchestration_root_id,
+                        "complete_all_work_before_stopping": True,
+                        "committed_epoch_ms": epoch_milliseconds(),
+                    },
+                )
+            elif effective_status not in {"done"}:
+                retry_status = enqueue_daemon_wake(
+                    state,
+                    agent_name,
+                    f"orchestration_owner:{run_id}:{lane_id}",
+                    orchestration_root_id,
+                )
+                append_daemon_event(
+                    state,
+                    "orchestration_recovery_scheduled",
+                    {
+                        "run_id": run_id,
+                        "root_message_id": orchestration_root_id,
+                        "lane_id": lane_id,
+                        "agent": agent_name,
+                        "task_number": task_number,
+                        "failed_turn_id": turn_id,
+                        "wake_status": retry_status,
+                        "receipt_driven": True,
+                    },
+                )
         event_name = "turn_completed" if effective_status == "done" else "turn_failed"
         append_daemon_event(
             state,
@@ -5808,6 +6304,24 @@ def ensure_agent_runtime_entrypoint(
     entrypoint.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def workspace_write_smoke(workspace: Path, turn_id: int) -> tuple[bool, str | None]:
+    probe_dir = workspace / "runtime"
+    probe_path = probe_dir / f".permission-probe-{turn_id}-{uuid.uuid4().hex[:8]}"
+    try:
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        probe_path.write_text("swarm workspace write smoke\n", encoding="utf-8")
+        if probe_path.read_text(encoding="utf-8") != "swarm workspace write smoke\n":
+            return False, "workspace write smoke readback mismatch"
+        probe_path.unlink()
+        return True, None
+    except OSError as exc:
+        try:
+            probe_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, f"workspace write smoke failed: {type(exc).__name__}"
+
+
 def execute_daemon_turn(
     agent: str,
     dispatch_id: int | None,
@@ -5841,6 +6355,61 @@ def execute_daemon_turn(
         workspace,
         runtime_kind,
     )
+    permission_flag_present = (
+        "--dangerously-bypass-approvals-and-sandbox" in command_list
+        if runtime_kind == "codex"
+        else "--dangerously-skip-permissions" in command_list
+        if runtime_kind == "claude"
+        else True
+    )
+    write_smoke_ok, write_smoke_error = workspace_write_smoke(
+        workspace,
+        int(prepared["turn_id"]),
+    )
+    daemon_record_event(
+        "turn_permission_profile",
+        {
+            "id": prepared["turn_id"],
+            "agent": prepared["agent"],
+            "runtime": runtime_kind,
+            "approval_mode": "never"
+            if runtime_kind in {"codex", "claude"}
+            else "runtime_defined",
+            "filesystem_sandbox": "disabled"
+            if runtime_kind in {"codex", "claude"}
+            else "runtime_defined",
+            "permission_flag_present": permission_flag_present,
+            "workspace_create_read_delete": write_smoke_ok,
+        },
+    )
+    if not permission_flag_present or not write_smoke_ok:
+        permission_error = (
+            "runtime permission bypass flag missing"
+            if not permission_flag_present
+            else write_smoke_error or "workspace write smoke failed"
+        )
+        finalized = finalize_daemon_turn(
+            int(prepared["turn_id"]),
+            str(prepared["agent"]),
+            prepared.get("dispatch_id"),
+            str(prepared["owner"]) if prepared.get("owner") is not None else None,
+            prepared.get("target"),
+            int(prepared.get("target_snapshot_seq") or 0),
+            bool(prepared.get("consumes_wake")),
+            "failed",
+            1,
+            None,
+            None,
+            permission_error,
+            None,
+        )
+        if finalized.get("raw_error"):
+            return {"ok": False, "raw_error": str(finalized["raw_error"])}
+        return {
+            "ok": False,
+            "error": permission_error,
+            "code": "TURN_PERMISSION_FAILED",
+        }
     # The claude runtime authenticates via the OS user's keychain/HOME and
     # cannot run from an isolated HOME; Slack transport tokens stay scrubbed
     # from the child env either way. Follow-up hardening tracked for S7.
@@ -6297,6 +6866,19 @@ def command_daemon_resident(argv: list[str]) -> int:
                         "error": result.get("error") or result.get("raw_error"),
                     },
                 )
+                if workspace and mock_file is None:
+                    for outbound_target in pending_outbound_targets(workspace):
+                        send_result = command_slack_send(
+                            ["--workspace", workspace, "--target", outbound_target]
+                        )
+                        daemon_record_event(
+                            "resident_outbound",
+                            {
+                                "target": outbound_target,
+                                "exit": send_result,
+                                "source": "turn_finalize",
+                            },
+                        )
             if workspace and mock_file is None:
                 for outbound_target in pending_outbound_targets(workspace):
                     send_result = command_slack_send(["--workspace", workspace, "--target", outbound_target])
@@ -6828,6 +7410,780 @@ def command_agent_collab_smoke(argv: list[str]) -> int:
         return write_stdout(
             "## Agent Collab Smoke\n\n"
             f"{json.dumps(result, sort_keys=True, separators=(',', ':'))}\n"
+        )
+
+    return with_mutable_state(action)
+
+
+ORCHESTRATION_LANES = [
+    {
+        "id": "dissect",
+        "capabilities": ("dissect", "planner", "orchestrator"),
+        "title": "dissect the ordinary chat goal into executable work",
+    },
+    {
+        "id": "research",
+        "capabilities": ("research", "scout", "freshness", "context"),
+        "title": "gather source/context freshness for the routed goal",
+    },
+    {
+        "id": "execute",
+        "capabilities": ("execute", "worker", "builder", "build", "implement"),
+        "title": "execute the routed implementation lane",
+    },
+    {
+        "id": "verify",
+        "capabilities": ("verify", "verifier", "reviewer", "review"),
+        "title": "verify the result against acceptance criteria",
+    },
+    {
+        "id": "receipt",
+        "capabilities": ("receipt", "scribe", "status", "report"),
+        "title": "publish owner/status receipts and handoff state",
+    },
+]
+
+ORCHESTRATION_PLATFORM_CONTRACT = {
+    "version": "swarm-runtime-flow-v1",
+    "coverage_manifest_version": "chat-task-orchestration-coverage-v2",
+    "source_material_embedded": False,
+}
+
+ORCHESTRATION_DELIVERY_TRAILER = {
+    "exact_target_and_msg_required": True,
+    "complete_all_work_before_stopping": True,
+    "raw_trailer_in_trace": False,
+}
+
+ORCHESTRATION_NOTICE_FIRST_DELIVERY = {
+    "content_free_notice_first": True,
+    "notice_includes_body": False,
+    "body_requires_owner_query": True,
+    "losers_read_body": False,
+    "raw_body_fanout": False,
+}
+
+
+def epoch_milliseconds() -> int:
+    return int(time.time() * 1000)
+
+
+def orchestration_event_details(
+    state: dict[str, Any],
+    event_name: str,
+    run_id: str | None = None,
+) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for event in state.get("daemon_events", []):
+        if event.get("event") != event_name:
+            continue
+        try:
+            detail = json.loads(str(event.get("detail") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(detail, dict):
+            continue
+        if run_id is not None and str(detail.get("run_id") or "") != run_id:
+            continue
+        details.append(detail)
+    return details
+
+
+def orchestration_summary(body: str) -> str:
+    compact = re.sub(r"\s+", " ", body).strip()
+    if not compact:
+        return "chat goal"
+    return compact[:160]
+
+
+def live_orchestration_lane_specs(state: dict[str, Any], body: str) -> list[dict[str, Any]]:
+    """Choose a small body-aware lane set without exposing the body to workers."""
+    all_lanes = orchestration_lane_specs(state)
+    by_id = {str(lane["id"]): lane for lane in all_lanes}
+    normalized = re.sub(r"\s+", " ", body).strip().lower()
+    words = re.findall(r"[a-z0-9_'-]+|[\u3400-\u9fff]", normalized)
+    greeting_only = bool(
+        normalized
+        and len(words) <= 7
+        and re.fullmatch(
+            r"(?:@[\w-]+\s*)?(?:hi|hello|hey|yo|你好|嗨|在吗|回来|test|ping)[!！?.。\s]*",
+            normalized,
+        )
+    )
+    if greeting_only:
+        lane_ids = ["dissect"]
+    else:
+        action_markers = (
+            "build",
+            "implement",
+            "fix",
+            "ship",
+            "create",
+            "write",
+            "change",
+            "deploy",
+            "review",
+            "test",
+            "做",
+            "实现",
+            "修",
+            "写",
+            "上线",
+            "继续",
+        )
+        research_markers = (
+            "research",
+            "latest",
+            "current",
+            "compare",
+            "source",
+            "http://",
+            "https://",
+            "调研",
+            "最新",
+            "查",
+            "比较",
+        )
+        substantive = len(words) >= 8 or any(marker in normalized for marker in action_markers)
+        lane_ids = ["dissect"]
+        if substantive:
+            lane_ids.extend(["research", "execute", "verify", "receipt"])
+        elif any(marker in normalized for marker in research_markers):
+            lane_ids.extend(["research", "receipt"])
+        else:
+            lane_ids.append("receipt")
+    return [dict(by_id[lane_id]) for lane_id in lane_ids if lane_id in by_id]
+
+
+def choose_live_lane_owners(
+    state: dict[str, Any],
+    lanes: list[dict[str, Any]],
+    mentioned: list[str],
+) -> list[dict[str, Any]]:
+    used: set[str] = set()
+    routes: list[dict[str, Any]] = []
+    all_agents = sorted(state.get("agents", []), key=lambda row: str(row.get("name") or ""))
+    for lane_index, lane in enumerate(lanes):
+        accepted = {str(value).lower() for value in lane["capabilities"]}
+        matching: list[tuple[dict[str, Any], set[str]]] = []
+        for agent in all_agents:
+            caps = agent_capability_set(agent)
+            if caps.intersection(accepted):
+                matching.append((agent, caps))
+        selected: tuple[dict[str, Any], set[str]] | None = None
+        if lane_index == 0 and mentioned:
+            mentioned_agent = agent_by_name(state, mentioned[0])
+            if mentioned_agent is not None:
+                selected = (mentioned_agent, agent_capability_set(mentioned_agent))
+        if selected is None:
+            selected = next(
+                ((agent, caps) for agent, caps in matching if str(agent["name"]) not in used),
+                None,
+            )
+        if selected is None and lane_index == 0:
+            selected = next(
+                ((agent, agent_capability_set(agent)) for agent in all_agents if str(agent["name"]) not in used),
+                None,
+            )
+        if selected is None:
+            continue
+        owner, caps = selected
+        owner_name = str(owner["name"])
+        used.add(owner_name)
+        candidate_agents = [str(agent["name"]) for agent, _ in matching]
+        if owner_name not in candidate_agents:
+            candidate_agents.insert(0, owner_name)
+        matched = sorted(caps.intersection(accepted))
+        routes.append(
+            {
+                "lane_id": str(lane["id"]),
+                "capability": matched[0] if matched else "explicit_target",
+                "owner": owner_name,
+                "owner_capabilities": sorted(caps),
+                "candidate_agents": candidate_agents,
+                "required_capabilities": sorted(accepted),
+                "title": str(lane["title"]),
+                "parallel_lane": len(lanes) > 1,
+                "dependency_lanes": [] if lane_index == 0 else ["dissect"],
+            }
+        )
+    return routes
+
+
+def orchestration_root_for_thread(
+    state: dict[str, Any],
+    target: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not target.startswith("#") or ":" not in target:
+        return None, None
+    channel, root_short_id = target.split(":", 1)
+    root, root_error = message_by_id(state, root_short_id)
+    if root_error is not None or root is None or str(root.get("target") or "") != channel:
+        return None, None
+    return root, orchestration_run_for_message(state, str(root["id"]))
+
+
+def route_live_orchestration_steer(
+    state: dict[str, Any],
+    record: dict[str, Any],
+    root: dict[str, Any],
+    run: dict[str, Any],
+) -> list[dict[str, str]]:
+    run_id = str(run.get("run_id") or "")
+    routes = orchestration_event_details(state, "orchestration_routed", run_id)
+    owners = sorted({str(route.get("owner") or "") for route in routes if route.get("owner")})
+    now_ms = epoch_milliseconds()
+    append_daemon_event(
+        state,
+        "orchestration_steer_received",
+        {
+            "run_id": run_id,
+            "root_message_id": root["id"],
+            "steer_message_id": record["id"],
+            "target": record["target"],
+            "body_sha256": hashlib.sha256(str(record.get("body") or "").encode("utf-8")).hexdigest(),
+            "body_bytes": len(str(record.get("body") or "").encode("utf-8")),
+            "received_epoch_ms": now_ms,
+        },
+    )
+    routed: list[dict[str, str]] = []
+    for owner in owners:
+        append_daemon_event(
+            state,
+            "orchestration_notice",
+            {
+                "run_id": run_id,
+                "agent": owner,
+                "target": record["target"],
+                "first_message_id": record["id"],
+                "latest_message_id": record["id"],
+                "pending_count": 1,
+                "thread": True,
+                "mention": owner in mentioned_agent_names(state, str(record.get("body") or "")),
+                "body_present": False,
+                "delivery_kind": "metadata_only_notice",
+                "delivered_epoch_ms": now_ms,
+            },
+        )
+        status = enqueue_daemon_wake(
+            state,
+            owner,
+            f"orchestration_steer:{run_id}",
+            str(record["id"]),
+        )
+        routed.append({"agent": owner, "status": status, "reason": "orchestration_steer"})
+    return routed
+
+
+def route_live_orchestration_wakes(
+    state: dict[str, Any],
+    record: dict[str, Any],
+    worker_limit: int | None = None,
+) -> list[dict[str, str]]:
+    root, existing_thread_run = orchestration_root_for_thread(state, str(record.get("target") or ""))
+    if root is not None and existing_thread_run is not None:
+        return route_live_orchestration_steer(state, record, root, existing_thread_run)
+
+    channel = str(record.get("target") or "")
+    if not channel.startswith("#") or ":" in channel:
+        mentioned = mentioned_agent_names(state, str(record.get("body") or ""))
+        owners = mentioned[:1]
+        if not owners and state.get("agents"):
+            owners = [str(sorted(state["agents"], key=lambda row: str(row["name"]))[0]["name"])]
+        routed: list[dict[str, str]] = []
+        now_ms = epoch_milliseconds()
+        for owner in owners:
+            append_daemon_event(
+                state,
+                "orchestration_notice",
+                {
+                    "run_id": None,
+                    "agent": owner,
+                    "target": channel,
+                    "first_message_id": record["id"],
+                    "latest_message_id": record["id"],
+                    "pending_count": 1,
+                    "thread": ":" in channel,
+                    "mention": owner in mentioned,
+                    "body_present": False,
+                    "delivery_kind": "metadata_only_notice",
+                    "delivered_epoch_ms": now_ms,
+                },
+            )
+            status = enqueue_daemon_wake(state, owner, "notice_query", str(record["id"]))
+            routed.append({"agent": owner, "status": status, "reason": "notice_query"})
+        return routed
+
+    if orchestration_run_for_message(state, str(record["id"])) is not None:
+        return []
+    ingest_ms = epoch_milliseconds()
+    body = str(record.get("body") or "")
+    mentioned = mentioned_agent_names(state, body)
+    if not mentioned and "@" in body:
+        append_daemon_event(
+            state,
+            "wake_route_miss",
+            {
+                "reason": "mention",
+                "message_id": record["id"],
+                "target": channel,
+            },
+        )
+    lanes = live_orchestration_lane_specs(state, body)
+    precommit_messages = thread_messages_after_root(state, channel, str(record["id"]))
+    precommit_steers = [
+        item
+        for item in precommit_messages
+        if str(item.get("type") or "") == "human"
+        or str(item.get("author") or "").startswith("slack:")
+    ]
+    steer_text = "\n".join(str(item.get("body") or "") for item in precommit_steers).lower()
+    steer_rules: list[str] = []
+    if (
+        "verify first" in steer_text
+        or "verification first" in steer_text
+        or "review first" in steer_text
+    ):
+        lanes = sorted(lanes, key=lambda lane: 0 if str(lane["id"]) == "verify" else 1)
+        steer_rules.append("verify_first")
+    if worker_limit is not None:
+        lanes = lanes[:worker_limit]
+    routes = choose_live_lane_owners(state, lanes, mentioned)
+    if not routes:
+        append_daemon_event(
+            state,
+            "wake_route_miss",
+            {
+                "reason": "orchestration_no_owner",
+                "message_id": record["id"],
+                "target": channel,
+            },
+        )
+        return []
+
+    run_id = f"orch_{uuid.uuid4().hex[:8]}"
+    thread = reply_thread_target(channel, str(record["id"]))
+    parent_task = task_by_message_id(state, channel, str(record["id"]))
+    if parent_task is None:
+        parent_task = append_task_from_message(state, channel, record)
+    parent_task["assignee"] = routes[0]["owner"]
+    parent_task["status"] = "in_progress"
+    parent_task["updated_at"] = current_timestamp()
+
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    append_daemon_event(
+        state,
+        "orchestration_steer_applied",
+        {
+            "run_id": run_id,
+            "root_message_id": record["id"],
+            "steer_count": len(precommit_steers),
+            "source_message_ids": [item["id"] for item in precommit_steers],
+            "applied": bool(precommit_steers),
+            "plan_changed": bool(steer_rules),
+            "applied_rules": steer_rules,
+            "lane_order": [route["lane_id"] for route in routes],
+            "precommit": True,
+        },
+    )
+    append_daemon_event(
+        state,
+        "orchestration_body_durable",
+        {
+            "run_id": run_id,
+            "root_message_id": record["id"],
+            "target": channel,
+            "body_sha256": body_hash,
+            "body_bytes": len(body.encode("utf-8")),
+            "stored_before_notice": True,
+            "stored_epoch_ms": ingest_ms,
+        },
+    )
+    append_daemon_event(
+        state,
+        "orchestration_dissected",
+        {
+            "run_id": run_id,
+            "root_message_id": record["id"],
+            "root_target": channel,
+            "root_body_sha256": body_hash,
+            "ordinary_message": True,
+            "platform_contract": ORCHESTRATION_PLATFORM_CONTRACT,
+            "parent_task": parent_task["number"],
+            "subtask_count": len(routes),
+            "lane_ids": [route["lane_id"] for route in routes],
+            "worker_count": len(routes),
+            "n_worker_extensible": True,
+            "live_wiring": True,
+        },
+    )
+
+    all_agent_names = sorted(str(agent["name"]) for agent in state.get("agents", []))
+    notice_ms = epoch_milliseconds()
+    for agent_name in all_agent_names:
+        append_daemon_event(
+            state,
+            "orchestration_notice",
+            {
+                "run_id": run_id,
+                "agent": agent_name,
+                "target": channel,
+                "first_message_id": record["id"],
+                "latest_message_id": record["id"],
+                "pending_count": 1,
+                "thread": False,
+                "mention": agent_name in mentioned,
+                "body_present": False,
+                "delivery_kind": "metadata_only_notice",
+                "delivered_epoch_ms": notice_ms,
+            },
+        )
+
+    append_daemon_event(
+        state,
+        "orchestration_status_transition",
+        {
+            "run_id": run_id,
+            "lane_id": "parent",
+            "task_number": parent_task["number"],
+            "from": "todo",
+            "to": "in_progress",
+            "owner": parent_task["assignee"],
+            "assignee_authorized": True,
+        },
+    )
+    parent_receipt = append_message(
+        state,
+        thread,
+        (
+            f"accepted run={run_id} owner=@{parent_task['assignee']} "
+            f"task #{parent_task['number']} status=in_progress lanes={len(routes)}"
+        ),
+        author=str(parent_task["assignee"]),
+    )
+    receipt_ms = epoch_milliseconds()
+    append_daemon_event(
+        state,
+        "orchestration_thread_receipt",
+        {
+            "run_id": run_id,
+            "lane_id": "parent",
+            "owner": parent_task["assignee"],
+            "task_number": parent_task["number"],
+            "status": "in_progress",
+            "thread": thread,
+            "message_id": parent_receipt["id"],
+            "receipt_kind": "accepted",
+            "committed_epoch_ms": receipt_ms,
+        },
+    )
+
+    routed: list[dict[str, str]] = []
+    subtask_numbers: list[int] = []
+    receipt_ids = [str(parent_receipt["id"])]
+    max_loser_stop_ms = 0
+    for route in routes:
+        task = append_thread_task_for_author(
+            state,
+            channel,
+            thread,
+            f"[{run_id}/{route['lane_id']}] {route['title']}: {orchestration_summary(body)}",
+            "swarm-runtime",
+        )
+        task["assignee"] = route["owner"]
+        task["status"] = "in_progress"
+        task["updated_at"] = current_timestamp()
+        subtask_numbers.append(int(task["number"]))
+        route["task_number"] = int(task["number"])
+
+        append_daemon_event(
+            state,
+            "orchestration_routed",
+            {
+                "run_id": run_id,
+                "root_message_id": record["id"],
+                "lane_id": route["lane_id"],
+                "capability": route["capability"],
+                "owner": route["owner"],
+                "owner_capabilities": route["owner_capabilities"],
+                "candidate_agents": route["candidate_agents"],
+                "required_capabilities": route["required_capabilities"],
+                "dependency_lanes": route["dependency_lanes"],
+                "parallel_lane": route["parallel_lane"],
+                "task_number": task["number"],
+                "decision_reason": "metadata notice routed to a distinct matching registered capability",
+                "routed_epoch_ms": epoch_milliseconds(),
+            },
+        )
+        append_daemon_event(
+            state,
+            "orchestration_status_transition",
+            {
+                "run_id": run_id,
+                "lane_id": route["lane_id"],
+                "task_number": task["number"],
+                "from": "todo",
+                "to": "in_progress",
+                "owner": task["assignee"],
+                "assignee_authorized": True,
+            },
+        )
+        claim_ms = epoch_milliseconds()
+        append_daemon_event(
+            state,
+            "orchestration_claim",
+            {
+                "run_id": run_id,
+                "root_message_id": record["id"],
+                "lane_id": route["lane_id"],
+                "agent": route["owner"],
+                "task_number": task["number"],
+                "outcome": "success",
+                "body_reads": 0,
+                "executions": 0,
+                "claimed_epoch_ms": claim_ms,
+            },
+        )
+        losers = sorted(set(route["candidate_agents"]).difference({str(route["owner"])}))
+        for loser in losers:
+            loser_stop_ms = epoch_milliseconds()
+            max_loser_stop_ms = max(max_loser_stop_ms, loser_stop_ms - claim_ms)
+            append_daemon_event(
+                state,
+                "orchestration_claim",
+                {
+                    "run_id": run_id,
+                    "root_message_id": record["id"],
+                    "lane_id": route["lane_id"],
+                    "agent": loser,
+                    "task_number": task["number"],
+                    "outcome": "conflict_stop",
+                    "held_by": route["owner"],
+                    "body_reads": 0,
+                    "outward_replies": 0,
+                    "executions": 0,
+                    "stopped_epoch_ms": loser_stop_ms,
+                },
+            )
+        receipt_ids.append(str(task["message_id"]))
+        append_daemon_event(
+            state,
+            "orchestration_thread_receipt",
+            {
+                "run_id": run_id,
+                "lane_id": route["lane_id"],
+                "owner": route["owner"],
+                "task_number": task["number"],
+                "status": task["status"],
+                "thread": thread,
+                "message_id": task["message_id"],
+                "receipt_kind": "lane_accepted",
+                "committed_epoch_ms": epoch_milliseconds(),
+            },
+        )
+        append_daemon_event(
+            state,
+            "orchestration_external_wake",
+            {
+                "run_id": run_id,
+                "root_message_id": record["id"],
+                "lane_id": route["lane_id"],
+                "agent": route["owner"],
+                "source": "slack_event",
+                "resident_model_loop": False,
+                "wake_epoch_ms": epoch_milliseconds(),
+            },
+        )
+        status = enqueue_daemon_wake(
+            state,
+            str(route["owner"]),
+            f"orchestration_owner:{run_id}:{route['lane_id']}",
+            str(record["id"]),
+        )
+        routed.append(
+            {
+                "agent": str(route["owner"]),
+                "status": status,
+                "reason": "orchestration_owner",
+            }
+        )
+
+    append_daemon_event(
+        state,
+        "orchestration_run_ready",
+        {
+            "run_id": run_id,
+            "root_message_id": record["id"],
+            "parent_task": parent_task["number"],
+            "subtasks": subtask_numbers,
+            "thread": thread,
+            "receipt_ids": receipt_ids,
+            "platform_contract": ORCHESTRATION_PLATFORM_CONTRACT,
+            "live_wiring": True,
+        },
+    )
+    append_daemon_event(
+        state,
+        "orchestration_coordination_slo",
+        {
+            "run_id": run_id,
+            "root_message_id": record["id"],
+            "durable_ingest_ms": max(0, notice_ms - ingest_ms),
+            "notice_fanout_ms": max(0, notice_ms - ingest_ms),
+            "receipt_visible_ms": max(0, receipt_ms - ingest_ms),
+            "loser_stop_ms": max_loser_stop_ms,
+            "first_status_ms": max(0, receipt_ms - ingest_ms),
+            "receipt_visible_slo_ms": 2000,
+            "loser_stop_slo_ms": 500,
+            "first_status_slo_ms": 5000,
+        },
+    )
+    return routed
+
+
+def orchestration_assignment_for_agent(
+    state: dict[str, Any],
+    message_id: str,
+    agent_name: str,
+) -> dict[str, Any] | None:
+    run = orchestration_run_for_message(state, message_id)
+    if run is None:
+        return None
+    run_id = str(run.get("run_id") or "")
+    for route in orchestration_event_details(state, "orchestration_routed", run_id):
+        if str(route.get("owner") or "") == agent_name:
+            return route
+    return None
+
+
+def agent_capability_set(agent: dict[str, Any]) -> set[str]:
+    values = agent.get("capabilities", [])
+    if not isinstance(values, list):
+        return set()
+    return {str(value).strip().lower() for value in values if str(value).strip()}
+
+
+def orchestration_lane_specs(state: dict[str, Any]) -> list[dict[str, Any]]:
+    lanes = [dict(lane) for lane in ORCHESTRATION_LANES]
+    existing = {str(lane["id"]) for lane in lanes}
+    for agent in state.get("agents", []):
+        for capability in agent_capability_set(agent):
+            if not capability.startswith("lane:"):
+                continue
+            lane_id = capability.split(":", 1)[1].strip()
+            if not lane_id or lane_id in existing or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,31}", lane_id):
+                continue
+            lanes.append(
+                {
+                    "id": lane_id,
+                    "capabilities": (capability, lane_id),
+                    "title": f"execute custom capability lane {lane_id}",
+                }
+            )
+            existing.add(lane_id)
+    return lanes
+
+
+def orchestration_run_for_message(state: dict[str, Any], message_id: str) -> dict[str, Any] | None:
+    for event in state.get("daemon_events", []):
+        if event.get("event") != "orchestration_dissected":
+            continue
+        try:
+            detail = json.loads(str(event.get("detail") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if detail.get("root_message_id") == message_id:
+            return detail
+    return None
+
+
+def thread_messages_after_root(state: dict[str, Any], channel: str, root_message_id: str) -> list[dict[str, Any]]:
+    thread = reply_thread_target(channel, root_message_id)
+    root, root_error = message_by_id(state, root_message_id)
+    root_seq = int(root["seq"]) if root is not None and root_error is None else 0
+    return [
+        record
+        for record in records_for_surface(state, thread)
+        if int(record.get("seq") or 0) > root_seq
+    ]
+
+
+def command_agent_orchestrate(argv: list[str]) -> int:
+    allowed = {"--channel", "--message-id", "--max-workers"}
+    unknown = unknown_flags(argv, allowed)
+    if unknown:
+        return write_stderr(f"Error: unknown agent orchestrate flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    for flag in allowed:
+        if flag_missing_value(argv, flag):
+            return write_stderr(f"Error: {flag} requires a value\nCode: INVALID_ARG\n")
+    channel = arg_value(argv, "--channel")
+    message_id_arg = arg_value(argv, "--message-id")
+    if channel is None or not channel.startswith("#") or ":" in channel:
+        return write_stderr("Error: --channel must be a top-level channel\nCode: INVALID_ARG\n")
+    if message_id_arg is None:
+        return write_stderr("Error: --message-id is required\nCode: INVALID_ARG\n")
+    worker_limit: int | None = None
+    worker_limit_text = arg_value(argv, "--max-workers")
+    if worker_limit_text is not None:
+        try:
+            worker_limit = int(worker_limit_text)
+        except ValueError:
+            return write_stderr("Error: --max-workers must be an integer\nCode: INVALID_ARG\n")
+        if worker_limit <= 0:
+            return write_stderr("Error: --max-workers must be positive\nCode: INVALID_ARG\n")
+
+    def action(state: dict[str, Any]) -> int:
+        if not known_surface(state, channel):
+            return write_stderr(f"Error: Channel not found: {channel}\nCode: NOT_FOUND\n")
+        root, root_error = message_by_id(state, message_id_arg)
+        if root_error == "ambiguous":
+            return write_stderr(f"Error: ambiguous message id: {message_id_arg}\nCode: AMBIGUOUS_ID\n")
+        if root is None:
+            return write_stderr("Error: Message not found\nCode: NOT_FOUND\n")
+        if str(root["target"]) != channel:
+            return write_stderr("Error: message target does not match --channel\nCode: INVALID_TARGET\n")
+        root_kind = str(root.get("type") or "")
+        root_author = str(root.get("author") or "")
+        if root_kind != "human" and not root_author.startswith("slack:"):
+            return write_stderr("Error: orchestration must start from an ordinary human/chat message\nCode: INVALID_ARG\n")
+        existing_live = orchestration_run_for_message(state, str(root["id"]))
+        if existing_live is not None:
+            append_daemon_event(
+                state,
+                "orchestration_restart_idempotent",
+                {
+                    "run_id": existing_live.get("run_id"),
+                    "root_message_id": root["id"],
+                    "platform_contract": ORCHESTRATION_PLATFORM_CONTRACT,
+                    "duplicate_parent_tasks": 0,
+                    "duplicate_subtasks": 0,
+                    "duplicate_receipts": 0,
+                    "reexecuted_lanes": 0,
+                },
+            )
+            return write_stdout(
+                "Orchestration already exists; restart was idempotent.\n"
+                f"Run ID: {existing_live.get('run_id')}\n"
+                f"Root message: {root['id']}\n"
+            )
+        routed_live = route_live_orchestration_wakes(state, root, worker_limit)
+        created_live = orchestration_run_for_message(state, str(root["id"]))
+        if created_live is None:
+            return write_stderr(
+                "Error: no registered worker could claim the ordinary chat message\n"
+                "Code: ROUTE_FAILED\n"
+            )
+        if worker_limit is not None and len(routed_live) > worker_limit:
+            return write_stderr(
+                "Error: routed worker count exceeded --max-workers\n"
+                "Code: ROUTE_FAILED\n"
+            )
+        return write_stdout(
+            "Live orchestration created from ordinary message.\n"
+            f"Run ID: {created_live.get('run_id')}\n"
+            f"Root message: {root['id']}\n"
+            f"Routed owners: {len(routed_live)}\n"
+            f"Thread: {reply_thread_target(channel, str(root['id']))}\n"
         )
 
     return with_mutable_state(action)
@@ -7799,15 +9155,27 @@ def command_agent(argv: list[str]) -> int:
         return command_agent_supervisor_plan(rest)
     if subcommand == "collab-smoke":
         return command_agent_collab_smoke(rest)
+    if subcommand == "orchestrate":
+        return command_agent_orchestrate(rest)
     return write_stderr(f"Error: unknown agent subcommand: {subcommand}\nCode: INVALID_ARG\n")
 
 
 def command_server_info() -> int:
     def action(state: dict[str, Any]) -> int:
         channels = sorted(state.get("channels", []), key=lambda row: row["name"])
+        visible_channels = [
+            channel
+            for channel in channels
+            if not bool(channel.get("private")) or bool(channel.get("joined"))
+        ]
+        append_worker_navigation_query(
+            state,
+            "channel_list",
+            result_count=len(visible_channels),
+        )
         agents = [profile for profile in state.get("profiles", []) if profile["kind"] == "agent"]
         humans = [profile for profile in state.get("profiles", []) if profile["kind"] == "human"]
-        channel_rows = "\n".join(format_channel_row(channel) for channel in channels) or "No channels."
+        channel_rows = "\n".join(format_channel_row(channel) for channel in visible_channels) or "No channels."
         agent_rows = "\n".join(f"- @{profile['name']} ({profile['display_name']})" for profile in agents) or "No agents."
         human_rows = "\n".join(f"- @{profile['name']} ({profile['display_name']})" for profile in humans) or "No humans."
         return write_stdout(
@@ -7820,7 +9188,7 @@ def command_server_info() -> int:
             f"{human_rows}\n"
         )
 
-    return with_read_state(action)
+    return with_mutable_state(action)
 
 
 def command_server(argv: list[str]) -> int:
@@ -7840,7 +9208,15 @@ def command_channel_members(argv: list[str]) -> int:
         channel = channel_record(state, target)
         if channel is None and not target.startswith("dm:@"):
             return write_stderr("Error: Channel not found\nCode: NOT_FOUND\n")
+        if channel is not None and bool(channel.get("private")) and not bool(channel.get("joined")):
+            return write_stderr("Error: Channel is not visible to this worker\nCode: READ_FAILED\n")
         members = members_for_target(state, target)
+        append_worker_navigation_query(
+            state,
+            "channel_members",
+            target=target,
+            result_count=len(members),
+        )
         agents = [member for member in members if member["kind"] == "agent"]
         humans = [member for member in members if member["kind"] == "human"]
         agent_rows = "\n".join(f"  - {member_display(member)}" for member in agents) or "  - none"
@@ -7862,7 +9238,7 @@ def command_channel_members(argv: list[str]) -> int:
             f"{human_rows}\n"
         )
 
-    return with_read_state(action)
+    return with_mutable_state(action)
 
 
 def command_channel_join(argv: list[str]) -> int:

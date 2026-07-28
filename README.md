@@ -49,6 +49,8 @@ Current implemented surface:
 - `swarm agent turn-context --name ... [--target ...] [--event-id ...] [--session-id ...] [--require-seed] [--require-memory] [--write-manifest] [--json]` to build a versioned per-turn context manifest
 - `swarm agent worker --name ... [--once] [--require-seed]` for a persistent heartbeat loop backed by an agent workspace seed
 - `swarm agent collab-smoke --channel ... --task-author ... --worker ... --verifier ...` to exercise the A→B→C task/report/verify path in canonical state
+- Ordinary human Slack events entering `swarm daemon resident --workspace ...` now follow the live orchestration path automatically: durable ingest → metadata-only worker notices → capability route/claim → owner-only body query → native runtime turn → freshness-aware thread result/receipt → restart recovery. Simple greetings route to one owner; substantive goals can use the dissect/research/execute/verify/receipt lanes.
+- `swarm agent orchestrate --channel ... --message-id ... [--max-workers ...]` exposes the same state-backed path as a replay/manual inspection seam; it is not a separate scripted demo path.
 - `swarm slack configure --workspace ... --bot-token-env ... [--signing-secret-env ...] [--app-token-env ...]`
 - `swarm slack env --workspace ...`
 - `swarm slack export-history --workspace ... --channel-id ... [--channel-name ...] [--include-replies]` to export Slack channel history as ingest-compatible event JSON rows
@@ -61,23 +63,23 @@ Current implemented surface:
 - local SQLite-backed persistence
 - generated message IDs and wall-clock sent timestamps
 
-It does not implement a network server, remote integration authentication, or
-production workspace access. The daemon, integration, and action-card surfaces
-are local-only in this slice: the daemon scans the same SQLite store and fires
-due reminders, integration login creates a local placeholder record plus
-per-service environment paths without third-party identity exchange, and
-prepared actions are pending records/messages for a human commit path, not a
-remote execution backend.
+It does not implement a general network coordination server or remote
+integration authentication. Canonical coordination state remains single-host
+SQLite. With operator-provided environment credentials, the Slack daemon can
+consume a real Socket Mode stream and the sender can call `chat.postMessage`;
+Slack OAuth and workspace provisioning remain outside this repo. Other
+integration login records are local placeholders, and prepared actions remain
+pending records/messages for a human commit path.
 
 ## Slack Adapter Boundary
 
 Slack is treated as an adapter input and UI surface, not as the canonical
-coordination store. The current seam can export Slack channel history into
-local Slack-style message-event JSON, ingest those events, store workspace
-configuration by environment-variable name, render outbound request plans, and
-send through a small Slack Web API seam for `chat.postMessage`. It does not
-implement Slack Events API subscription, OAuth, Socket Mode, or workspace
-provisioning.
+coordination store. The adapter can export Slack channel history into local
+Slack-style message-event JSON, ingest those events, store workspace
+configuration by environment-variable name, consume Socket Mode events, render
+outbound request plans, and send through a small Slack Web API seam for
+`chat.postMessage`. It does not implement Slack OAuth, workspace provisioning,
+or an HTTP Events API endpoint.
 
 `swarm slack configure` persists only names such as `SLACK_BOT_TOKEN`; it never
 stores token or signing-secret values. `swarm slack env` shows the configured
@@ -143,6 +145,7 @@ From this checkout:
 python3 scripts/anti_stub_probe.py
 python3 scripts/behavior_eval_loop.py
 python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-consult-old-evidence.json
+python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json
 python3 scripts/consult_old_evidence_probe.py
 ```
 
@@ -194,3 +197,20 @@ automatic turn context. The runner must use the public `message search` and
 must cite the seeded message's stable channel/message reference. The companion
 probe randomizes the fact and verifies fail-closed paths for injected context,
 missing retrieval, missing provenance, and answer-without-query bypasses.
+
+The chat-task-orchestration scenario is a trace/eval preflight for the live
+runtime, not a replacement for a Slack test. It drives five distinct-capability
+owners through the same daemon turn boundary and checks the 14 release
+conditions in `docs/evals/scenario-chat-task-orchestration.json`, including
+notice-first body withholding, owner-only body reads, loser conflict-stop,
+freshness, lifecycle, exact-thread receipts, restart idempotency, and
+coordination SLOs. Every owner must also use the real same-state CLI to list
+visible channels, check source-channel membership, read a different visible
+channel on demand, and still commit only to the exact source thread. Native
+Codex and Claude workers launch with their
+approval/filesystem sandbox bypass modes explicitly enabled, while child
+environment credential scrubbing, credential-shaped output blocking, exact
+target commits, and freshness/idempotency receipts remain enforced. Each turn
+also performs a harmless workspace create/read/delete smoke before the native
+runtime starts. Direct user acceptance still means starting five real workers
+on the exact gated public SHA and sending an ordinary Slack message.

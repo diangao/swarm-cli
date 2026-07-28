@@ -1506,6 +1506,49 @@ def probe_navigation_surfaces(cli: Path, state_dir: Path) -> None:
     dynamic_members = run(cli, state_dir, "channel", "members", dynamic_channel).stdout
     require("@candidate" in dynamic_members, "dynamic channel did not include candidate member")
 
+    navigation_agent = "candidate"
+    navigation_env = {"SWARM_AGENT_NAME": navigation_agent}
+    listed = run(
+        cli,
+        state_dir,
+        "server",
+        "info",
+        env_overrides=navigation_env,
+    ).stdout
+    require(dynamic_channel in listed, "worker channel-list query omitted a visible channel")
+    run(
+        cli,
+        state_dir,
+        "channel",
+        "members",
+        dynamic_channel,
+        env_overrides=navigation_env,
+    )
+    cross_read = run(
+        cli,
+        state_dir,
+        "message",
+        "read",
+        "--channel",
+        dynamic_channel,
+        env_overrides=navigation_env,
+    ).stdout
+    require(dynamic_body in cross_read, "worker on-demand channel read did not return channel history")
+    navigation_events = [
+        detail
+        for detail in daemon_event_details(state_dir, "worker_navigation_query")
+        if detail.get("agent") == navigation_agent
+    ]
+    require(
+        {detail.get("operation") for detail in navigation_events}
+        == {"channel_list", "channel_members", "message_read"},
+        "worker navigation did not audit the three required query types",
+    )
+    require(
+        all(detail.get("success") is True and detail.get("body_in_trace") is False for detail in navigation_events),
+        "worker navigation audit exposed a body or omitted success",
+    )
+
 
 def probe_membership_attention(cli: Path, state_dir: Path) -> None:
     target = f"#join-{uuid.uuid4().hex[:8]}"
@@ -3152,17 +3195,28 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
     require(worker_a_wake is not None, "mention did not create a daemon wake row for worker-a")
     require(int(worker_a_wake["running"]) == 1, "first mention did not start worker-a turn")
     require(int(worker_a_wake["active_wake_count"]) == 1, "worker-a active wake count should start at one")
-    require(int(worker_a_wake["pending_count"]) == 2, "attention + second mention should batch into worker-a pending markers")
+    require(
+        int(worker_a_wake["pending_count"]) >= 1,
+        "newer owner wakes should batch into a worker-a pending marker",
+    )
     worker_b_wake = daemon_wake_row(state_dir, "worker-b")
-    require(worker_b_wake is not None and int(worker_b_wake["running"]) == 1, "attention routing did not wake worker-b")
-    require(worker_b_wake["active_reason"] == "attention", "worker-b wake should carry attention reason")
-    require(int(worker_b_wake["pending_count"]) == 2, "later frames should batch into worker-b pending markers")
+    require(worker_b_wake is None, "metadata-only non-owner should stop without a daemon model wake")
+    notices = daemon_event_details(state_dir, "orchestration_notice")
+    worker_b_notices = [detail for detail in notices if detail.get("agent") == "worker-b"]
+    require(len(worker_b_notices) == 3, "non-owner did not receive one metadata-only notice per message")
+    require(
+        all(detail.get("body_present") is False for detail in worker_b_notices),
+        "non-owner notice exposed a message body",
+    )
     misses = daemon_event_details(state_dir, "wake_route_miss")
     require(any(detail.get("reason") == "mention" for detail in misses), "unregistered @mention did not log route miss")
 
     listed = run(cli, state_dir, "daemon", "wakes", "--agent", "worker-a").stdout
     require("@worker-a running active_turns=1" in listed, "daemon wakes did not render running worker-a state")
-    require("pending=2 mention/" in listed, "daemon wakes did not render pending marker")
+    require(
+        "pending=" in listed and "orchestration_owner:" in listed,
+        "daemon wakes did not render the orchestration-owner pending marker",
+    )
     first_finish = run(cli, state_dir, "daemon", "finish-turn", "--agent", "worker-a").stdout
     require("Daemon turn finished for @worker-a: promoted." in first_finish, "finish-turn did not promote pending marker")
     promoted = daemon_wake_row(state_dir, "worker-a")
@@ -3173,12 +3227,6 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
     require("Daemon turn finished for @worker-a: idle." in second_finish, "second finish did not idle worker-a")
     idle = daemon_wake_row(state_dir, "worker-a")
     require(idle is not None and int(idle["running"]) == 0, "worker-a wake should be idle after second finish")
-
-    # Drain worker-b's attention wakes so the reminder section observes a fresh wake.
-    run(cli, state_dir, "daemon", "finish-turn", "--agent", "worker-b")
-    run(cli, state_dir, "daemon", "finish-turn", "--agent", "worker-b")
-    worker_b_idle = daemon_wake_row(state_dir, "worker-b")
-    require(worker_b_idle is not None and int(worker_b_idle["running"]) == 0, "worker-b attention wakes did not drain to idle")
 
     reminder_title = f"wake reminder {uuid.uuid4()}"
     scheduled = run(
@@ -3258,11 +3306,12 @@ def probe_daemon_turn_runner(cli: Path, state_dir: Path) -> None:
     agent = f"runner-{uuid.uuid4().hex[:8]}"
     runtime = state_dir / "turn-runtime.py"
     runtime.write_text(
+        "import json, os, time\n"
+        + explicit_owner_query_runtime_prelude()
+        +
         "\n".join(
             [
-                "import json, os, sys, time",
                 "args = sys.argv[1:]",
-                "payload = sys.stdin.read()",
                 "if payload == 'sleep':",
                 "    time.sleep(2)",
                 "if payload == 'leak':",
@@ -3594,7 +3643,13 @@ def probe_codex_turn_adapter(cli: Path, state_dir: Path) -> None:
                 f"thread_id = {thread_id!r}",
                 "if is_resume and thread_id not in args:",
                 "    raise SystemExit(22)",
-                "required = {'--json', '--ignore-user-config', '--skip-git-repo-check', '-'}",
+                "required = {",
+                "    '--json',",
+                "    '--ignore-user-config',",
+                "    '--dangerously-bypass-approvals-and-sandbox',",
+                "    '--skip-git-repo-check',",
+                "    '-',",
+                "}",
                 "if not required.issubset(set(args)):",
                 "    raise SystemExit(23)",
                 "print(json.dumps({'type': 'thread.started', 'thread_id': thread_id}))",
@@ -3681,9 +3736,127 @@ def probe_codex_turn_adapter(cli: Path, state_dir: Path) -> None:
         second_command[1:3] == ["exec", "resume"] and thread_id in second_command,
         "Codex resume command used wrong CLI shape",
     )
+    require(
+        "--dangerously-bypass-approvals-and-sandbox" in first_command
+        and "--dangerously-bypass-approvals-and-sandbox" in second_command,
+        "Codex turns did not disable approvals and filesystem sandboxing",
+    )
+    permission_events = [
+        detail
+        for detail in daemon_event_details(state_dir, "turn_permission_profile")
+        if detail.get("agent") == agent
+    ]
+    require(len(permission_events) == 2, "Codex turns omitted permission-profile evidence")
+    require(
+        all(
+            detail.get("approval_mode") == "never"
+            and detail.get("filesystem_sandbox") == "disabled"
+            and detail.get("permission_flag_present") is True
+            and detail.get("workspace_create_read_delete") is True
+            for detail in permission_events
+        ),
+        "Codex permission parity or workspace write smoke failed",
+    )
     entrypoint = state_dir / "agents" / agent / "AGENTS.md"
     require(entrypoint.exists(), "Codex workspace did not receive AGENTS.md identity entrypoint")
     require(f"@{agent}" in entrypoint.read_text(), "Codex AGENTS.md omitted agent identity")
+
+
+def probe_claude_turn_adapter(cli: Path, state_dir: Path) -> None:
+    agent = f"claude-{uuid.uuid4().hex[:8]}"
+    fake_claude = state_dir / "claude"
+    fake_claude.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import sys",
+                "args = sys.argv[1:]",
+                "payload = sys.stdin.read()",
+                "required = {'-p', '--dangerously-skip-permissions'}",
+                "if not required.issubset(set(args)):",
+                "    raise SystemExit(31)",
+                "if '--session-id' not in args and '--resume' not in args:",
+                "    raise SystemExit(32)",
+                "mode = 'resume' if '--resume' in args else 'first'",
+                "print('claude ' + mode + ': ' + payload)",
+            ]
+        )
+        + "\n"
+    )
+    fake_claude.chmod(0o755)
+    run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        agent,
+        "--display-name",
+        "Claude Adapter Probe",
+        "--runtime",
+        str(fake_claude),
+        "--workspace",
+        f"agents/{agent}",
+    )
+    for input_text in ("first", "second"):
+        completed = run(
+            cli,
+            state_dir,
+            "daemon",
+            "turn",
+            "run",
+            "--agent",
+            agent,
+            "--input",
+            input_text,
+            "--target",
+            "#claude-adapter",
+            "--timeout",
+            "3s",
+        ).stdout
+        require("completed" in completed and "message=" in completed, "Claude turn did not complete")
+
+    history = run(cli, state_dir, "message", "read", "--channel", "#claude-adapter").stdout
+    require("claude first: first" in history, "Claude first turn used the wrong CLI shape")
+    require("claude resume: second" in history, "Claude resumed turn used the wrong CLI shape")
+    conn = connect_state(state_dir)
+    try:
+        turns = conn.execute(
+            "SELECT session_id, command_json FROM daemon_turns WHERE agent = ? ORDER BY id",
+            (agent,),
+        ).fetchall()
+    finally:
+        conn.close()
+    require(len(turns) == 2, "Claude adapter did not persist exactly two turns")
+    require(turns[0]["session_id"] == turns[1]["session_id"], "Claude session id did not persist across resume")
+    first_command = json.loads(turns[0]["command_json"])
+    second_command = json.loads(turns[1]["command_json"])
+    require("--session-id" in first_command and "--resume" not in first_command, "Claude first command used wrong CLI shape")
+    require("--resume" in second_command, "Claude resume command used wrong CLI shape")
+    require(
+        "--dangerously-skip-permissions" in first_command
+        and "--dangerously-skip-permissions" in second_command,
+        "Claude turns did not disable permission prompts",
+    )
+    permission_events = [
+        detail
+        for detail in daemon_event_details(state_dir, "turn_permission_profile")
+        if detail.get("agent") == agent
+    ]
+    require(len(permission_events) == 2, "Claude turns omitted permission-profile evidence")
+    require(
+        all(
+            detail.get("approval_mode") == "never"
+            and detail.get("filesystem_sandbox") == "disabled"
+            and detail.get("permission_flag_present") is True
+            and detail.get("workspace_create_read_delete") is True
+            for detail in permission_events
+        ),
+        "Claude permission parity or workspace write smoke failed",
+    )
+    entrypoint = state_dir / "agents" / agent / "CLAUDE.md"
+    require(entrypoint.exists(), "Claude workspace did not receive CLAUDE.md identity entrypoint")
+    require(f"@{agent}" in entrypoint.read_text(), "Claude CLAUDE.md omitted agent identity")
 
 
 def agent_presence_row(state_dir: Path, agent_name: str) -> sqlite3.Row | None:
@@ -3697,49 +3870,55 @@ def agent_presence_row(state_dir: Path, agent_name: str) -> sqlite3.Row | None:
         conn.close()
 
 
+def explicit_owner_query_runtime_prelude() -> str:
+    return (
+        "import re, subprocess, sys\n"
+        "payload = sys.stdin.read()\n"
+        "notice_payload = payload\n"
+        "if '[owner QUERY required' in payload:\n"
+        "    read_match = re.search("
+        "r'`swarm message read --channel \"([^\"]+)\" --around \"([^\"]+)\"`', payload)\n"
+        "    assert read_match is not None, payload\n"
+        "    query = subprocess.run(\n"
+        "        ['swarm', 'message', 'read', '--channel', read_match.group(1), "
+        "'--around', read_match.group(2)],\n"
+        "        text=True, capture_output=True, check=False,\n"
+        "    )\n"
+        "    assert query.returncode == 0, query.stderr\n"
+        "    payload += '\\n[explicit owner query result]\\n' + query.stdout\n"
+    )
+
+
 def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
     vocal_agent = f"att-01-vocal-{uuid.uuid4().hex[:6]}"
     aware_agent = f"att-02-aware-{uuid.uuid4().hex[:6]}"
     silent_agent = f"att-03-silent-{uuid.uuid4().hex[:6]}"
-    prior_fact = f"prior shared channel fact {uuid.uuid4()}"
-    trigger_text = f"no mention here {uuid.uuid4()}"
+    trigger_text = f"@{vocal_agent} hello"
     other_target_secret = f"must not cross targets {uuid.uuid4()}"
+    other_target = f"#other-{uuid.uuid4().hex[:8]}"
     vocal_rt = state_dir / "att-vocal-rt.py"
     vocal_rt.write_text(
-        "import sys\n"
-        "payload = sys.stdin.read()\n"
-        "assert '[attention wake]' in payload\n"
-        "assert 'Shared channel timeline' in payload\n"
+        explicit_owner_query_runtime_prelude()
+        + "assert '[metadata-only NOTICE]' in payload\n"
+        "assert '\"body_present\":false' in payload\n"
+        "assert '[atomic claim receipt]' in payload\n"
+        "assert '[owner QUERY required]' in payload\n"
+        "assert '[explicit owner query result]' in payload\n"
         "assert 'Live agent presence snapshot' in payload\n"
         f"assert '@{aware_agent}: present (idle)' in payload\n"
-        f"assert {prior_fact!r} in payload\n"
+        f"assert {trigger_text!r} not in notice_payload\n"
         f"assert {trigger_text!r} in payload\n"
         f"assert {other_target_secret!r} not in payload\n"
-        "print('attention reply: noted')\n"
+        "assert 'Delivery trailer: reply to exact target #slack-' in payload\n"
+        "print('owner query reply: noted')\n"
     )
     aware_rt = state_dir / "att-aware-rt.py"
     aware_rt.write_text(
-        "import sys\n"
-        "payload = sys.stdin.read()\n"
-        "assert 'Shared channel timeline' in payload\n"
-        "assert 'Live agent presence snapshot' in payload\n"
-        f"assert '@{vocal_agent}: present (idle)' in payload\n"
-        f"assert {prior_fact!r} in payload\n"
-        f"assert {trigger_text!r} in payload\n"
-        f"assert {other_target_secret!r} not in payload\n"
-        f"assert '@{vocal_agent}: attention reply: noted' in payload\n"
-        "print('peer-aware reply: saw prior agent')\n"
+        "raise SystemExit('metadata-only non-owner runtime must not execute')\n"
     )
     silent_rt = state_dir / "att-silent-rt.py"
     silent_rt.write_text(
-        "import sys\n"
-        "payload = sys.stdin.read()\n"
-        "assert 'Live agent presence snapshot' in payload\n"
-        f"assert {prior_fact!r} in payload\n"
-        f"assert {trigger_text!r} in payload\n"
-        f"assert {other_target_secret!r} not in payload\n"
-        "assert 'peer-aware reply: saw prior agent' in payload\n"
-        "print('SILENT')\n"
+        "raise SystemExit('metadata-only non-owner runtime must not execute')\n"
     )
     for name, rt in (
         (vocal_agent, vocal_rt),
@@ -3758,8 +3937,7 @@ def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
     app_env = f"ATT_APP_{uuid.uuid4().hex[:6].upper()}"
     run(cli, state_dir, "slack", "configure", "--workspace", workspace, "--bot-token-env", bot_env, "--app-token-env", app_env, "--mode", "socket_mode")
     target = f"#slack-{channel_id.lower()}"
-    run(cli, state_dir, "message", "send", "--target", target, stdin=prior_fact)
-    run(cli, state_dir, "message", "send", "--target", f"#other-{uuid.uuid4().hex[:8]}", stdin=other_target_secret)
+    run(cli, state_dir, "message", "send", "--target", other_target, stdin=other_target_secret)
     mock = state_dir / "att-mock.jsonl"
     mock.write_text(json.dumps({
         "type": "events_api",
@@ -3774,37 +3952,62 @@ def probe_attention_wakes(cli: Path, state_dir: Path) -> None:
     ).stdout
     require("Resident daemon stopped after 4 iteration(s)" in resident, "attention resident run did not finish")
 
-    routes = daemon_event_details(state_dir, "wake_route")
-    attention_agents = {
-        r.get("agent")
-        for detail in routes
-        for r in detail.get("routes", [])
-        if r.get("reason") == "attention"
-    }
+    durable = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_body_durable")
+        if detail.get("target") == target
+    ]
+    require(len(durable) == 1, "ordinary Slack body was not persisted once before notice fanout")
+    run_id = str(durable[0]["run_id"])
+    root_message_id = str(durable[0]["root_message_id"])
+    notices = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_notice")
+        if detail.get("run_id") == run_id
+    ]
+    noticed_agents = {str(detail.get("agent")) for detail in notices}
     require(
-        attention_agents >= {vocal_agent, aware_agent, silent_agent},
-        "attention routing did not wake all non-mentioned agents",
+        noticed_agents >= {vocal_agent, aware_agent, silent_agent},
+        "metadata-only notices did not reach all registered probe agents",
     )
-    silents = daemon_event_details(state_dir, "turn_silent")
-    require(any(d.get("agent") == silent_agent for d in silents), "SILENT turn was not recorded in ledger")
-    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
-    require(prior_fact in history, "pre-trigger shared channel fact disappeared")
-    require("attention reply: noted" in history, "vocal attention agent reply was not appended")
-    require("peer-aware reply: saw prior agent" in history, "later attention agent did not receive shared channel context")
-    require(f"@{silent_agent}" not in history, "SILENT output leaked into the channel")
+    require(
+        all(detail.get("body_present") is False for detail in notices),
+        "metadata-only notice fanout exposed the durable body",
+    )
+    body_reads = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_body_read")
+        if detail.get("run_id") == run_id
+    ]
+    require(
+        len(body_reads) == 1
+        and body_reads[0].get("agent") == vocal_agent
+        and body_reads[0].get("after_claim") is True
+        and body_reads[0].get("explicit_query") is True
+        and body_reads[0].get("query_turn_id"),
+        "explicit body query was not restricted to the successful owner after claim",
+    )
+    thread_target = f"{target}:{root_message_id[:8]}"
+    history = run(cli, state_dir, "message", "read", "--channel", thread_target).stdout
+    require("owner query reply: noted" in history, "owner result was not appended to the exact source thread")
+    require(f"target={thread_target}" in history, "owner result omitted its exact delivery trailer")
+    require(f"root={root_message_id[:8]}" in history, "owner result omitted its root-message trailer")
     conn = connect_state(state_dir)
     try:
         turn_count = conn.execute(
-            "SELECT COUNT(*) AS count FROM daemon_turns WHERE agent IN (?, ?, ?)",
+            "SELECT agent, COUNT(*) AS count FROM daemon_turns WHERE agent IN (?, ?, ?) GROUP BY agent",
             (vocal_agent, aware_agent, silent_agent),
-        ).fetchone()
+        ).fetchall()
         wake_count = conn.execute(
             "SELECT COUNT(*) AS count FROM daemon_wakes "
             "WHERE agent_name IN (?, ?, ?) AND (running = 1 OR pending_count > 0)",
             (vocal_agent, aware_agent, silent_agent),
         ).fetchone()
-        require(turn_count is not None and turn_count["count"] == 3, "agent output caused an attention wake cascade")
-        require(wake_count is not None and wake_count["count"] == 0, "attention wakes did not drain to a bounded state")
+        turn_counts = {str(row["agent"]): int(row["count"]) for row in turn_count}
+        require(turn_counts.get(vocal_agent) == 1, "successful owner did not execute exactly one native turn")
+        require(turn_counts.get(aware_agent, 0) == 0, "non-owner notice recipient executed a model turn")
+        require(turn_counts.get(silent_agent, 0) == 0, "non-owner notice recipient executed a model turn")
+        require(wake_count is not None and wake_count["count"] == 0, "owner wake did not drain to a bounded state")
     finally:
         conn.close()
 
@@ -3820,10 +4023,10 @@ def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
     newer_fact = f"newer target fact {uuid.uuid4()}"
     fresh_output = f"fresh retry saw newer fact {uuid.uuid4()}"
     runtime.write_text(
-        "import pathlib, sys, time\n"
+        "import pathlib, time\n"
         f"pathlib.Path({str(marker)!r}).write_text('started')\n"
-        "payload = sys.stdin.read()\n"
-        f"if {newer_fact!r} in payload:\n"
+        + explicit_owner_query_runtime_prelude()
+        + f"if {newer_fact!r} in payload:\n"
         f"    print({fresh_output!r})\n"
         "else:\n"
         "    time.sleep(0.4)\n"
@@ -3904,15 +4107,22 @@ def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
         "--loops", "2", "--idle-interval", "0s", "--turn-timeout", "5s",
     ).stdout
     require("Resident daemon stopped after 2 iteration(s)" in resident, "freshness retry resident did not finish")
-    history = run(cli, state_dir, "message", "read", "--channel", target).stdout
-    require(fresh_output in history, "freshness retry did not receive the newer shared channel fact")
-    require(stale_output not in history, "held stale output leaked after freshness retry")
+    durable = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_body_durable")
+        if detail.get("target") == target
+    ]
+    require(len(durable) == 1, "freshness retry did not create one durable orchestration root")
+    retry_thread = f"{target}:{str(durable[0]['root_message_id'])[:8]}"
+    history = run(cli, state_dir, "message", "read", "--channel", retry_thread).stdout
+    require(fresh_output in history, "freshness retry did not receive the newer owner-query body")
+    require(stale_output not in history, "held stale output leaked into the orchestration thread")
     wake = daemon_wake_row(state_dir, agent)
     require(wake is not None and int(wake["running"]) == 0, "freshness retry wake did not drain")
 
-    # Also prove the harder queue race: a second human is already present
-    # before the older wake starts. The old turn must compare freshness to the
-    # newest fact in its visible wake context, not to the absolute target head.
+    # Also prove the harder queue race: a newer steer is already present in the
+    # same source thread before the owner wake starts. The first owner turn must
+    # include that steer in its bounded view rather than publish an older result.
     queued_state = state_dir / "queued"
     queued_state.mkdir()
     queued_agent = f"fresh-queued-{uuid.uuid4().hex[:8]}"
@@ -3921,15 +4131,14 @@ def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
     queued_target = f"#slack-{queued_channel_id.lower()}"
     queued_bot_env = f"FRESHQ_BOT_{uuid.uuid4().hex[:6].upper()}"
     queued_app_env = f"FRESHQ_APP_{uuid.uuid4().hex[:6].upper()}"
-    queued_old = f"queued older human {uuid.uuid4()}"
+    queued_old = f"@{queued_agent} hello"
     queued_new = f"queued newer human {uuid.uuid4()}"
     queued_stale = f"queued stale output {uuid.uuid4()}"
     queued_fresh = f"queued fresh output {uuid.uuid4()}"
     queued_runtime = state_dir / "fresh-queued-runtime.py"
     queued_runtime.write_text(
-        "import sys\n"
-        "payload = sys.stdin.read()\n"
-        f"if {queued_new!r} in payload:\n"
+        explicit_owner_query_runtime_prelude()
+        + f"if {queued_new!r} in payload:\n"
         f"    print({queued_fresh!r})\n"
         "else:\n"
         f"    print({queued_stale!r})\n"
@@ -3948,25 +4157,45 @@ def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
         "--mode", "socket_mode",
     )
     queued_mock = state_dir / "fresh-queued-mock.jsonl"
+    queued_root_ts = f"1762500100.{uuid.uuid4().int % 1_000_000:06d}"
+    queued_steer_ts = f"1762500101.{uuid.uuid4().int % 1_000_000:06d}"
     queued_mock.write_text(
         "\n".join(
-            json.dumps(
-                {
-                    "type": "events_api",
-                    "payload": {
-                        "team_id": queued_workspace,
-                        "event": {
-                            "type": "message",
-                            "channel": queued_channel_id,
-                            "user": "UFRESHQ",
-                            "text": body,
-                            "ts": f"{1762500100 + index}.{uuid.uuid4().int % 1_000_000:06d}",
+            [
+                json.dumps(
+                    {
+                        "type": "events_api",
+                        "payload": {
+                            "team_id": queued_workspace,
+                            "event": {
+                                "type": "message",
+                                "channel": queued_channel_id,
+                                "user": "UFRESHQ",
+                                "text": queued_old,
+                                "ts": queued_root_ts,
+                            },
                         },
-                    },
-                    "envelope_id": f"env-{uuid.uuid4().hex}",
-                }
-            )
-            for index, body in enumerate((queued_old, queued_new))
+                        "envelope_id": f"env-{uuid.uuid4().hex}",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "events_api",
+                        "payload": {
+                            "team_id": queued_workspace,
+                            "event": {
+                                "type": "message",
+                                "channel": queued_channel_id,
+                                "user": "UFRESHQ",
+                                "text": queued_new,
+                                "ts": queued_steer_ts,
+                                "thread_ts": queued_root_ts,
+                            },
+                        },
+                        "envelope_id": f"env-{uuid.uuid4().hex}",
+                    }
+                ),
+            ]
         )
         + "\n"
     )
@@ -3983,13 +4212,18 @@ def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
     ).stdout
     require("Resident daemon stopped after 2 iteration(s)" in queued_resident, "queued freshness resident did not finish")
     queued_history = run(cli, queued_state, "message", "read", "--channel", queued_target).stdout
-    require(queued_old in queued_history and queued_new in queued_history, "queued human facts disappeared")
-    require(queued_stale not in queued_history, "older queued wake published across a newer human")
-    require(queued_fresh in queued_history, "newer queued wake did not receive the fresh shared context")
-    queued_holds = daemon_event_details(queued_state, "turn_freshness_hold")
+    require(queued_old in queued_history, "queued orchestration root disappeared")
+    queued_durable = daemon_event_details(queued_state, "orchestration_body_durable")
+    require(len(queued_durable) == 1, "queued steer created a duplicate orchestration root")
+    queued_thread = f"{queued_target}:{str(queued_durable[0]['root_message_id'])[:8]}"
+    queued_thread_history = run(cli, queued_state, "message", "read", "--channel", queued_thread).stdout
+    require(queued_new in queued_thread_history, "queued human steer disappeared from the source thread")
+    require(queued_stale not in queued_thread_history, "older owner wake published across a newer steer")
+    require(queued_fresh in queued_thread_history, "owner wake did not include the already-present newer steer")
+    steer_events = daemon_event_details(queued_state, "orchestration_steer_received")
     require(
-        any(detail.get("agent") == queued_agent for detail in queued_holds),
-        "pre-existing newer human did not freshness-hold the older wake",
+        len(steer_events) == 1 and steer_events[0].get("target") == queued_thread,
+        "same-thread newer human was not recorded as an orchestration steer",
     )
 
 
@@ -3999,16 +4233,17 @@ def probe_thread_wake_inherits_root(cli: Path, state_dir: Path) -> None:
     channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
     bot_env = f"THREAD_BOT_{uuid.uuid4().hex[:6].upper()}"
     app_env = f"THREAD_APP_{uuid.uuid4().hex[:6].upper()}"
-    root_text = f"thread root fact {uuid.uuid4()}"
+    root_text = f"@{agent} hello"
     reply_text = f"thread reply trigger {uuid.uuid4()}"
     output_text = f"thread shared root visible {uuid.uuid4()}"
     runtime = state_dir / "thread-shared-runtime.py"
     runtime.write_text(
-        "import sys\n"
-        "payload = sys.stdin.read()\n"
+        explicit_owner_query_runtime_prelude()
+        + f"assert {root_text!r} not in notice_payload\n"
+        f"assert {reply_text!r} not in notice_payload\n"
         f"if {reply_text!r} in payload:\n"
         f"    assert {root_text!r} in payload\n"
-        "    assert 'Shared channel timeline' in payload\n"
+        "    assert '[explicit owner query result]' in payload\n"
         f"    print({output_text!r})\n"
         "else:\n"
         "    print('SILENT')\n"
@@ -4105,14 +4340,8 @@ def probe_daemon_resident(cli: Path, state_dir: Path) -> None:
     agent = f"resident-{uuid.uuid4().hex[:8]}"
     runtime = state_dir / "resident-runtime.py"
     runtime.write_text(
-        "\n".join(
-            [
-                "import sys",
-                "payload = sys.stdin.read()",
-                "print('resident turn ok: ' + payload[:40])",
-            ]
-        )
-        + "\n"
+        explicit_owner_query_runtime_prelude()
+        + "print('resident turn ok: ' + payload[:40])\n"
     )
     runtime.chmod(0o755)
     run(
@@ -4929,13 +5158,16 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="swarm-codex-adapter-") as tmp:
         probe_codex_turn_adapter(cli, Path(tmp))
 
+    with tempfile.TemporaryDirectory(prefix="swarm-claude-adapter-") as tmp:
+        probe_claude_turn_adapter(cli, Path(tmp))
+
     with tempfile.TemporaryDirectory(prefix="swarm-curator-") as tmp:
         probe_curator_workload(cli, Path(tmp))
 
     with tempfile.TemporaryDirectory(prefix="swarm-curator-grind-") as tmp:
         probe_curator_grind_db_workload(cli, Path(tmp))
 
-    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, Codex exec/resume JSON adapter, resident daemon presence/worker-retirement, shared-channel attention/presence context, bounded no-runaway/SILENT collaboration, stale-output freshness hold and retry, curator seed/schedule/queue-writeback workload, and Grind DB-backed curator scheduled workload")
+    print("anti-stub probe ok: empty fresh store, dynamic inbox, send/read, reply hints, pagination/read limits, known empty surfaces, search/resolve, reactions, routing, freshness cursor/draft membership, DM, timestamps, SQLite locking, tasks/task filters/message-id claims, reminders/daemon fire, navigation, profile avatars, membership, integrations, agent registry/seed/heartbeat, attachments, action prepare, Slack adapter ingest/resolve/outbound/send/customize, Slack daemon Socket Mode ingest/replay idempotence, daemon wake router single-flight/reminder routing, daemon dispatch lease claim/expiry/exactly-once recovery, daemon turn runner env/output/watchdog gates, Codex exec/resume JSON adapter, Claude print/resume adapter, runtime permission parity, resident daemon presence/worker-retirement, metadata-only notice and owner-query collaboration, stale-output freshness hold and retry, curator seed/schedule/queue-writeback workload, and Grind DB-backed curator scheduled workload")
     return 0
 
 
