@@ -110,6 +110,8 @@
     { "id": "orchestration_notice", "must_expose": "Per-worker metadata-only NOTICE rows with target/count/first/latest and body_present=false." },
     { "id": "orchestration_body_read", "must_expose": "Owner-only post-claim explicit CLI body-query rows with turn id and target; no raw body text." },
     { "id": "orchestration_coordination_slo", "must_expose": "Receipt-visible, loser-stop, and first-status millisecond timing against release SLOs." },
+    { "id": "orchestration_artifact", "must_expose": "The execute owner commits one validated workspace-relative artifact path and SHA-256." },
+    { "id": "orchestration_lane_role_fidelity", "must_expose": "Non-execute lanes bind to the execute-owner artifact path/hash; unavailable verify waits and no receipt lane rebuilds." },
     { "id": "turn_permission_profile", "must_expose": "Per-turn launcher permission mode plus harmless workspace create/read/delete readback." },
     { "id": "worker_navigation_query", "must_expose": "Per-owner audited channel-list, source-membership, and distinct-channel read queries without body text." },
     { "id": "orchestration_trace_all", "must_expose": "Full metadata-only trace sample for #59/#61 public-safety scanning." }
@@ -128,7 +130,8 @@
     { "id": "notice_first_body_withheld", "assert": "the body is durable before metadata-only NOTICE fan-out and no initial worker delivery contains it." },
     { "id": "owner_only_body_read", "assert": "only successful claim holders query the body; conflict losers have zero reads, replies, and executions." },
     { "id": "coordination_slos", "assert": "receipt-visible p95 is at most 2000ms, loser-stop p95 at most 500ms, and first-status p95 at most 5000ms." },
-    { "id": "channel_navigation_exact_target", "assert": "every owner lists visible channels, checks source membership, reads a different visible channel on demand, and commits only to the exact source thread." }
+    { "id": "channel_navigation_exact_target", "assert": "every owner lists visible channels, checks source membership, reads a different visible channel on demand, and commits only to the exact source thread." },
+    { "id": "lane_role_fidelity", "assert": "execute alone creates a validated artifact; all non-execute results reference its exact owner/path/hash, verify waits when unavailable, and receipt never rebuilds." }
   ],
   "fail_signals": [
     "test checklist pre-creates subtasks or route decisions",
@@ -138,6 +141,8 @@
     "status is local-only without a committed thread receipt",
     "any owner cannot list visible channels or read a different visible channel on demand",
     "a navigation query leaks a channel body into trace or the result replies to the wrong target",
+    "a non-execute lane rebuilds an artifact, omits the execute-owner path/hash, or commits before that artifact exists",
+    "a lane result is empty, authored as candidate, or lacks its exact delivery trailer",
     "replay creates duplicate parent/subtasks/receipts/execution",
     "steer is ignored or applied after route commit",
     "trace stores private message body, model chain-of-thought, credentials, owner PII, or private machine paths"

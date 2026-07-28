@@ -644,6 +644,14 @@ DEFAULT_EVIDENCE_QUERIES: dict[str, str] = {
         "SELECT ordinal, time, event, detail FROM daemon_events "
         "WHERE event = 'orchestration_task_status_freshness_hold' ORDER BY ordinal"
     ),
+    "orchestration_artifact": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_artifact' ORDER BY ordinal"
+    ),
+    "orchestration_lane_role_fidelity": (
+        "SELECT ordinal, time, event, detail FROM daemon_events "
+        "WHERE event = 'orchestration_lane_role_fidelity' ORDER BY ordinal"
+    ),
     "orchestration_tasks": (
         "SELECT number, channel, title, status, author, assignee, message_id "
         "FROM tasks WHERE title LIKE '[orch_%' ORDER BY number"
@@ -1014,6 +1022,8 @@ def materialize_agents(cli: Path, state_dir: Path, fixture: dict[str, object]) -
         runtime_path = state_dir / "swarm-eval-turn-runtime"
         runtime_path.write_text(
             "#!/usr/bin/env python3\n"
+            "import hashlib\n"
+            "import pathlib\n"
             "import re\n"
             "import subprocess\n"
             "import sys\n"
@@ -1040,7 +1050,22 @@ def materialize_agents(cli: Path, state_dir: Path, fixture: dict[str, object]) -
             "    query('message', 'read', '--channel', navigation_target)\n"
             "match = re.search(r'run=([^ ]+) lane=([^ ]+) task=([^ ]+)', prompt)\n"
             "if match:\n"
-            "    print(f'completed lane={match.group(2)} task={match.group(3)} run={match.group(1)} navigation=ok')\n"
+            "    run_id, lane_id, task_number = match.groups()\n"
+            "    if 'WAIT_FOR_EXECUTE_ARTIFACT' in prompt:\n"
+            "        print('WAIT_FOR_EXECUTE_ARTIFACT')\n"
+            "    elif lane_id == 'execute':\n"
+            "        artifact_path = pathlib.Path('artifacts') / f'{run_id}-implementation.txt'\n"
+            "        artifact_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        artifact_path.write_text(f'run={run_id} lane={lane_id} task={task_number}\\n')\n"
+            "        digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()\n"
+            "        print(f'completed lane={lane_id} task={task_number} run={run_id} navigation=ok '\n"
+            "              f'[artifact path={artifact_path} sha256={digest}]')\n"
+            "    else:\n"
+            "        artifact_ref = re.search(r'\\[artifact-ref owner=@[^ ]+ path=[^ ]+ sha256=[0-9a-f]{64}\\]', prompt)\n"
+            "        if artifact_ref is None:\n"
+            "            raise SystemExit(44)\n"
+            "        print(f'completed lane={lane_id} task={task_number} run={run_id} navigation=ok '\n"
+            "              + artifact_ref.group(0))\n"
             "else:\n"
             "    print('completed claimed chat lane')\n",
             encoding="utf-8",
@@ -1615,24 +1640,64 @@ def op_run_orchestration_workers(
     require(bool(owners), "run_orchestration_workers found no routed owners")
     outputs: list[str] = []
     timeout = str(args.get("timeout") or "10s")
-    for owner in owners:
-        proc = run_cli(
-            runtime.cli,
-            runtime.state_dir,
-            "daemon",
-            "turn",
-            "run",
-            "--agent",
-            owner,
-            "--timeout",
-            timeout,
-        )
-        outputs.append(proc.stdout.strip())
+    rounds = 0
+    while rounds < 8:
+        rounds += 1
+        conn = connect_state(runtime.state_dir)
+        try:
+            active_rows = conn.execute(
+                """
+                SELECT agent_name
+                FROM daemon_wakes
+                WHERE running = 1
+                  AND instr(COALESCE(active_reason, ''), ?) > 0
+                ORDER BY agent_name
+                """,
+                (run_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        active = {str(row["agent_name"]) for row in active_rows}
+        if not active:
+            break
+        for owner in owners:
+            if owner not in active:
+                continue
+            proc = run_cli(
+                runtime.cli,
+                runtime.state_dir,
+                "daemon",
+                "turn",
+                "run",
+                "--agent",
+                owner,
+                "--timeout",
+                timeout,
+            )
+            outputs.append(proc.stdout.strip())
+    conn = connect_state(runtime.state_dir)
+    try:
+        remaining = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM daemon_wakes
+            WHERE running = 1
+              AND instr(COALESCE(active_reason, ''), ?) > 0
+            """,
+            (run_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    require(
+        remaining is not None and int(remaining["count"]) == 0,
+        "run_orchestration_workers did not drain bounded owner reruns",
+    )
     ref = str(args.get("ref") or f"W{index}")
     runtime.refs[ref] = {
         "kind": "orchestration_workers",
         "run_id": run_id,
         "owners": owners,
+        "rounds": rounds,
         "stdout": "\n".join(outputs),
     }
     return action_result(
@@ -2721,6 +2786,10 @@ def evaluate_conditions(
     task_freshness_details = decoded_event_details(
         evidence_rows.get("orchestration_task_status_freshness", [])
     )
+    artifact_details = decoded_event_details(evidence_rows.get("orchestration_artifact", []))
+    lane_role_details = decoded_event_details(
+        evidence_rows.get("orchestration_lane_role_fidelity", [])
+    )
     navigation_details = decoded_event_details(
         evidence_rows.get("worker_navigation_query", [])
     )
@@ -3184,6 +3253,10 @@ def evaluate_conditions(
                 and row.get("delivery_root_message_id")
                 and truthy_int(row.get("complete_all_work_before_stopping")) == 1
                 and row.get("message_id")
+                and row.get("result_author") == row.get("owner")
+                and truthy_int(row.get("result_body_non_empty")) == 1
+                and truthy_int(row.get("delivery_trailer_present")) == 1
+                and row.get("owner") != "candidate"
             ]
             passed = len(result_receipts) == len(route_details) and len(valid) == len(route_details)
             results.append(
@@ -3191,6 +3264,69 @@ def evaluate_conditions(
                     condition_id,
                     passed,
                     f"result_receipts={len(result_receipts)} valid_trailers={len(valid)} routes={len(route_details)}",
+                )
+            )
+        elif condition_id == "lane_role_fidelity":
+            execute_routes = [
+                row for row in route_details if str(row.get("lane_id") or "") == "execute"
+            ]
+            execute_artifacts = [
+                row
+                for row in artifact_details
+                if str(row.get("lane_id") or "") == "execute"
+                and row.get("owner")
+                and row.get("path")
+                and re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256") or ""))
+            ]
+            artifact = execute_artifacts[-1] if execute_artifacts else {}
+            committed = [
+                row for row in lane_role_details if truthy_int(row.get("result_committed")) == 1
+            ]
+            non_execute = [
+                row for row in committed if str(row.get("lane_id") or "") != "execute"
+            ]
+            non_execute_valid = [
+                row
+                for row in non_execute
+                if row.get("artifact_owner") == artifact.get("owner")
+                and row.get("artifact_path") == artifact.get("path")
+                and row.get("artifact_sha256") == artifact.get("sha256")
+                and truthy_int(row.get("reference_present")) == 1
+                and truthy_int(row.get("rebuilt_artifact")) == 0
+            ]
+            verify_waits = [
+                row
+                for row in lane_role_details
+                if str(row.get("lane_id") or "") == "verify"
+                and truthy_int(row.get("artifact_available")) == 0
+                and row.get("wait_reason") == "execute_artifact_unavailable"
+                and truthy_int(row.get("rebuilt_artifact")) == 0
+                and truthy_int(row.get("result_committed")) == 0
+            ]
+            receipt_rows = [
+                row
+                for row in lane_role_details
+                if str(row.get("lane_id") or "") == "receipt"
+            ]
+            receipt_never_rebuilt = bool(receipt_rows) and all(
+                truthy_int(row.get("rebuilt_artifact")) == 0 for row in receipt_rows
+            )
+            passed = (
+                len(execute_routes) == 1
+                and len(execute_artifacts) == 1
+                and len(committed) == len(route_details)
+                and len(non_execute_valid) == len(non_execute)
+                and bool(verify_waits)
+                and receipt_never_rebuilt
+            )
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"execute_routes={len(execute_routes)} artifacts={len(execute_artifacts)} "
+                    f"committed={len(committed)}/{len(route_details)} "
+                    f"non_execute_refs={len(non_execute_valid)}/{len(non_execute)} "
+                    f"verify_waits={len(verify_waits)} receipt_never_rebuilt={receipt_never_rebuilt}",
                 )
             )
         elif condition_id == "wake_starts_turn":
@@ -3207,7 +3343,8 @@ def evaluate_conditions(
                 bool(route_owners)
                 and wake_agents == route_owners
                 and len(valid) == len(route_details)
-                and len(body_read_details) == len(route_details)
+                and {str(row.get("agent") or "") for row in body_read_details} == route_owners
+                and len(body_read_details) >= len(route_details)
             )
             results.append(
                 condition_result(
@@ -3276,9 +3413,9 @@ def evaluate_conditions(
             )
             loser_agents = {str(row.get("agent") or "") for row in losers}
             passed = (
-                len(read_agents) == len(route_details)
+                len(read_agents) >= len(route_details)
                 and set(read_agents) == route_owners
-                and len(explicit_owner_reads) == len(route_details)
+                and len(explicit_owner_reads) == len(read_agents)
                 and not set(read_agents).intersection(loser_agents.difference(route_owners))
                 and bool(losers)
                 and losers_clean
@@ -3406,7 +3543,7 @@ def evaluate_conditions(
             )
         elif condition_id == "platform_contract_bound":
             expected_version = "swarm-runtime-flow-v1"
-            expected_coverage = "chat-task-orchestration-coverage-v2"
+            expected_coverage = "chat-task-orchestration-coverage-v3"
             contract_rows = [
                 detail.get("platform_contract")
                 for detail in platform_contract_details

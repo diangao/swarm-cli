@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "coverage_manifest_version": "chat-task-orchestration-coverage-v2",
+  "coverage_manifest_version": "chat-task-orchestration-coverage-v3",
   "runtime_flow_contract": {
     "version": "swarm-runtime-flow-v1",
     "source_policy": "private acceptance inputs are not embedded or identified in the public tree",
@@ -390,6 +390,39 @@
         ]
       },
       "remaining_gap": "exact native model/profile and host permission readback are release-time live checks, not fixture claims"
+    },
+    {
+      "row": 13,
+      "state": "lane_role_artifact_fidelity",
+      "status": "implemented",
+      "code_paths": [
+        "swarm",
+        "scripts/anti_stub_probe.py",
+        "scripts/behavior_eval_loop.py",
+        "docs/evals/scenario-chat-task-orchestration.json"
+      ],
+      "code_symbols": [
+        "orchestration_lane_role_contract",
+        "validate_orchestration_artifact",
+        "finalize_daemon_turn"
+      ],
+      "input": "one execute-owner artifact and its workspace-relative path/SHA-256",
+      "output": "execute alone creates the validated artifact; all non-execute results bind to the same owner/path/hash; unavailable verification blocks without rebuilding",
+      "trace": [
+        "orchestration_artifact.owner",
+        "orchestration_artifact.path",
+        "orchestration_artifact.sha256",
+        "orchestration_lane_role_fidelity.reference_present",
+        "orchestration_lane_role_fidelity.rebuilt_artifact",
+        "orchestration_lane_role_fidelity.result_committed"
+      ],
+      "scenario": {
+        "id": "chat-task-orchestration-n-worker",
+        "command": "python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json",
+        "conditions": ["lane_role_fidelity"],
+        "result": "pass"
+      },
+      "remaining_gap": null
     }
   ],
   "release_slos_ms": {
@@ -411,7 +444,8 @@
     "notice_first_body_withheld": [2, 3],
     "owner_only_body_read": [3, 4, 5],
     "coordination_slos": [12],
-    "channel_navigation_exact_target": [4]
+    "channel_navigation_exact_target": [4],
+    "lane_role_fidelity": [13]
   },
   "acceptance_conditions": [
     "decomposed_by_runtime",
@@ -427,6 +461,7 @@
     "notice_first_body_withheld",
     "owner_only_body_read",
     "coordination_slos",
-    "channel_navigation_exact_target"
+    "channel_navigation_exact_target",
+    "lane_role_fidelity"
   ]
 }

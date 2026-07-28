@@ -3180,9 +3180,52 @@ def slack_record_needs_outbound(
 ) -> bool:
     if str(record["author"]).startswith("slack:") or str(record["author"]).startswith("slack-bot:"):
         return False
+    if not str(record.get("body") or "").strip():
+        return False
     if slack_mapping_by_message_id(state, workspace, str(record["id"])) is not None:
         return False
+    if slack_outbound_is_quarantined(state, workspace, str(record["id"])):
+        return False
     return record["type"] in {"agent", "system"}
+
+
+def slack_outbound_is_quarantined(
+    state: dict[str, Any],
+    workspace: str,
+    message_id: str,
+) -> bool:
+    for event in reversed(state.get("daemon_events", [])):
+        if event.get("event") != "slack_outbound_quarantined":
+            continue
+        try:
+            detail = json.loads(str(event.get("detail") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(detail, dict):
+            continue
+        if (
+            str(detail.get("workspace") or "") == workspace
+            and str(detail.get("message_id") or "") == message_id
+        ):
+            return True
+    return False
+
+
+def slack_terminal_validation_reason(error_text: str) -> str | None:
+    prefix = "Slack Web API rejected chat.postMessage: "
+    if not error_text.startswith(prefix):
+        return None
+    reason = error_text[len(prefix):].strip()
+    terminal_reasons = {
+        "no_text",
+        "invalid_arguments",
+        "msg_too_long",
+        "invalid_blocks",
+        "invalid_attachments",
+        "invalid_metadata",
+        "invalid_post_type",
+    }
+    return reason if reason in terminal_reasons else None
 
 
 def slack_outbound_plan_item(
@@ -3699,9 +3742,11 @@ def command_message_read(argv: list[str]) -> int:
                     return write_stderr("Error: noticed message not found in thread\nCode: NOT_FOUND\n")
                 run_id = str(orchestration_run.get("run_id") or "")
                 existing_reads = orchestration_event_details(state, "orchestration_body_read", run_id)
+                query_turn_id = str(os.environ.get("SWARM_TURN_ID") or "")
                 if not any(
                     str(detail.get("agent") or "") == navigation_agent
                     and str(detail.get("queried_message_id") or "") == str(queried_record["id"])
+                    and str(detail.get("query_turn_id") or "") == query_turn_id
                     for detail in existing_reads
                 ):
                     append_daemon_event(
@@ -3717,7 +3762,7 @@ def command_message_read(argv: list[str]) -> int:
                             "after_claim": True,
                             "explicit_query": True,
                             "query_target": channel,
-                            "query_turn_id": str(os.environ.get("SWARM_TURN_ID") or ""),
+                            "query_turn_id": query_turn_id,
                             "body_sha256": hashlib.sha256(
                                 str(queried_record.get("body") or "").encode("utf-8")
                             ).hexdigest(),
@@ -4075,9 +4120,16 @@ def command_message_send(argv: list[str]) -> int:
         return write_stderr("Error: --target is required\nCode: INVALID_ARG\n")
     target_allowed = target.startswith("#") or target.startswith("dm:@")
     attachment_ids = arg_values(argv, "--attachment-id")
-    author = (arg_value(argv, "--author") or "candidate").removeprefix("@")
+    author = (
+        arg_value(argv, "--author")
+        or os.environ.get("SWARM_AGENT_NAME")
+        or "candidate"
+    ).removeprefix("@")
     if not author:
         return write_stderr("Error: --author requires a value\nCode: INVALID_ARG\n")
+    message_body = None if "--send-draft" in argv else sys.stdin.read()
+    if message_body is not None and not message_body.strip():
+        return write_stderr("Error: message body must be non-empty\nCode: EMPTY_MESSAGE\n")
 
     def action(state: dict[str, Any]) -> int:
         author_profile = profile_by_name(state, author)
@@ -4095,16 +4147,18 @@ def command_message_send(argv: list[str]) -> int:
             draft = state.get("freshness", {}).get(target, {}).get("draft")
             if not draft:
                 return write_stderr("Error: No draft saved for target\nCode: NOT_FOUND\n")
-            body, draft_attachment_ids = decode_draft(draft)
+            draft_body, draft_attachment_ids = decode_draft(draft)
+            if not draft_body.strip():
+                return write_stderr("Error: draft message body must be non-empty\nCode: EMPTY_MESSAGE\n")
             attachments, attachment_error = resolve_message_attachments(state, target, draft_attachment_ids)
             if attachment_error is not None:
                 return write_stderr(f"Error: {attachment_error}\nCode: NOT_FOUND\n")
-            record = append_message(state, target, body, attachments, author=author)
+            record = append_message(state, target, draft_body, attachments, author=author)
             state["freshness"][target]["draft"] = None
             state["freshness"][target]["cursor"] = record["seq"]
             return write_stdout(success_text(target, record))
 
-        body = sys.stdin.read()
+        assert message_body is not None
         if not target_allowed:
             return write_stderr(f"Error: Target not found: {target}\nCode: NOT_FOUND\n")
         if not target_joined_for_write(state, target):
@@ -4113,8 +4167,8 @@ def command_message_send(argv: list[str]) -> int:
         if attachment_error is not None:
             return write_stderr(f"Error: {attachment_error}\nCode: NOT_FOUND\n")
         if freshness_blockers(state, target):
-            return render_freshness_hold(state, target, body, [record["id"] for record in attachments])
-        record = append_message(state, target, body, attachments, author=author)
+            return render_freshness_hold(state, target, message_body, [record["id"] for record in attachments])
+        record = append_message(state, target, message_body, attachments, author=author)
         if target in state.get("freshness", {}):
             state["freshness"][target]["cursor"] = record["seq"]
         return write_stdout(success_text(target, record))
@@ -5689,6 +5743,7 @@ def prepare_daemon_turn(
                     )
                     wake_context_head_seq = latest_target_message_seq(state, target)
                     presence_context = wake_live_presence_context(state)
+                    lane_contract = orchestration_lane_role_contract(state, assignment)
                     notice = {
                         "target": queried_record["target"],
                         "pending_count": 1,
@@ -5714,6 +5769,7 @@ def prepare_daemon_turn(
                         + "Complete the assigned lane through your native harness. Do not restate the "
                         + "request generically. Produce the concrete result or a useful progress/status receipt "
                         + "for your lane. Other workers have separate claims; do not speak for them.\n\n"
+                        + (lane_contract + "\n\n" if lane_contract else "")
                         + "Live agent presence snapshot (ledger at turn start):\n"
                         + (presence_context or "(no agent presence available)")
                         + "\n\n"
@@ -5748,6 +5804,7 @@ def prepare_daemon_turn(
                     input_message_id = str(root_record["id"])
                     target = str(active_record["target"])
                     wake_context_head_seq = latest_target_message_seq(state, target)
+                    lane_contract = orchestration_lane_role_contract(state, assignment)
                     input_text = (
                         "[metadata-only NOTICE]\n"
                         + json.dumps(
@@ -5771,6 +5828,7 @@ def prepare_daemon_turn(
                         + '"` before re-evaluating the lane. The read is owner-only and audited.\n\n'
                         + "Re-evaluate your claimed lane against the newer steer before any status/result "
                         + "commit. If the earlier result is stale, replace it; do not send the stale result.\n\n"
+                        + (lane_contract + "\n\n" if lane_contract else "")
                         + "Delivery trailer: reply to exact target "
                         + target
                         + " for root msg="
@@ -5998,6 +6056,7 @@ def finalize_daemon_turn(
                 )
         orchestration_assignment = None
         orchestration_root_id = str(turn.get("input_message_id") or "")
+        stdout_clean = (stdout_text or "").strip()
         if orchestration_root_id:
             orchestration_assignment = orchestration_assignment_for_agent(
                 state,
@@ -6031,19 +6090,55 @@ def finalize_daemon_turn(
                         "result_committed": False,
                     },
                 )
+        lane_wait_reason = None
+        lane_contract_error = None
+        validated_artifact = None
+        if (
+            orchestration_assignment is not None
+            and status == "done"
+            and owner_query_error is None
+        ):
+            run_id = str(orchestration_assignment.get("run_id") or "")
+            lane_id = str(orchestration_assignment.get("lane_id") or "")
+            execute_route_exists = orchestration_execute_route_exists(state, run_id)
+            if not stdout_clean or stdout_clean == "SILENT":
+                lane_contract_error = "orchestration owner produced no non-empty lane result"
+            elif execute_route_exists and lane_id == "execute":
+                validated_artifact, lane_contract_error = validate_orchestration_artifact(
+                    state,
+                    agent_name,
+                    stdout_clean,
+                )
+            elif execute_route_exists:
+                execute_artifact = orchestration_execute_artifact(state, run_id)
+                if execute_artifact is None:
+                    lane_wait_reason = "execute_artifact_unavailable"
+                else:
+                    required_reference = (
+                        f"[artifact-ref owner=@{execute_artifact['owner']} "
+                        f"path={execute_artifact['path']} sha256={execute_artifact['sha256']}]"
+                    )
+                    if required_reference not in stdout_clean:
+                        lane_contract_error = (
+                            "non-execute lane result omitted the exact execute-owner artifact reference"
+                        )
         wake_status = None
         wake = daemon_wake_by_agent(state, agent_name)
         if consumes_wake and wake is not None and wake.get("running"):
             wake_status, _ = finish_daemon_wake(state, agent_name)
-        effective_status = "failed" if dispatch_error is not None or owner_query_error else status
+        effective_status = (
+            "failed"
+            if dispatch_error is not None or owner_query_error or lane_contract_error
+            else status
+        )
         effective_error = (
             "dispatch finalize failed"
             if dispatch_error is not None
-            else owner_query_error or error_text
+            else owner_query_error or lane_contract_error or error_text
         )
         effective_exit_code = (
             1
-            if (dispatch_error is not None or owner_query_error)
+            if (dispatch_error is not None or owner_query_error or lane_contract_error)
             and (exit_code is None or exit_code == 0)
             else exit_code
         )
@@ -6057,7 +6152,6 @@ def finalize_daemon_turn(
         if completed_session_id and effective_status == "done":
             turn["session_id"] = completed_session_id
         message_id = None
-        stdout_clean = (stdout_text or "").strip()
         outbound_text = stdout_clean
         if orchestration_assignment is not None and target and stdout_clean and stdout_clean != "SILENT":
             delivery_trailer = (
@@ -6073,6 +6167,7 @@ def finalize_daemon_turn(
             and bool(target)
             and bool(stdout_clean)
             and stdout_clean != "SILENT"
+            and lane_wait_reason is None
             and current_target_seq > target_snapshot_seq
         )
         if stdout_clean == "SILENT":
@@ -6090,7 +6185,13 @@ def finalize_daemon_turn(
                     "output_chars": len(outbound_text),
                 },
             )
-        elif dispatch_error is None and effective_status == "done" and target and stdout_clean:
+        elif (
+            dispatch_error is None
+            and effective_status == "done"
+            and lane_wait_reason is None
+            and target
+            and stdout_clean
+        ):
             record = append_message(state, target, outbound_text, author=agent_name)
             message_id = record["id"]
         if orchestration_assignment is not None:
@@ -6114,7 +6215,123 @@ def finalize_daemon_turn(
                         "current_seq": current_target_seq,
                     },
                 )
+                retry_status = (
+                    wake_status
+                    if wake_status == "promoted"
+                    else enqueue_daemon_wake(
+                        state,
+                        agent_name,
+                        f"orchestration_owner:{run_id}:{lane_id}",
+                        orchestration_root_id,
+                    )
+                )
+                append_daemon_event(
+                    state,
+                    "orchestration_freshness_rerun_scheduled",
+                    {
+                        "run_id": run_id,
+                        "root_message_id": orchestration_root_id,
+                        "lane_id": lane_id,
+                        "agent": agent_name,
+                        "task_number": task_number,
+                        "held_turn_id": turn_id,
+                        "wake_status": retry_status,
+                        "explicit_owner_query_required": True,
+                        "result_committed": False,
+                    },
+                )
+            elif lane_wait_reason is not None:
+                retry_status = wake_status if wake_status == "promoted" else "blocked"
+                append_daemon_event(
+                    state,
+                    "orchestration_lane_role_fidelity",
+                    {
+                        "run_id": run_id,
+                        "root_message_id": orchestration_root_id,
+                        "lane_id": lane_id,
+                        "agent": agent_name,
+                        "task_number": task_number,
+                        "artifact_available": False,
+                        "wait_reason": lane_wait_reason,
+                        "rebuilt_artifact": False,
+                        "result_committed": False,
+                        "wake_status": retry_status,
+                    },
+                )
             elif effective_status == "done" and message_id is not None:
+                execute_artifact = (
+                    validated_artifact
+                    if lane_id == "execute"
+                    else orchestration_execute_artifact(state, run_id)
+                )
+                if lane_id == "execute" and validated_artifact is not None:
+                    append_daemon_event(
+                        state,
+                        "orchestration_artifact",
+                        {
+                            "run_id": run_id,
+                            "root_message_id": orchestration_root_id,
+                            "lane_id": lane_id,
+                            "owner": validated_artifact["owner"],
+                            "path": validated_artifact["path"],
+                            "sha256": validated_artifact["sha256"],
+                            "turn_id": turn_id,
+                            "message_id": message_id,
+                        },
+                    )
+                    waiting_lanes = {
+                        str(row.get("lane_id") or "")
+                        for row in orchestration_event_details(
+                            state,
+                            "orchestration_lane_role_fidelity",
+                            run_id,
+                        )
+                        if row.get("wait_reason") == "execute_artifact_unavailable"
+                        and row.get("result_committed") is False
+                    }
+                    committed_lanes = {
+                        str(row.get("lane_id") or "")
+                        for row in orchestration_event_details(
+                            state,
+                            "orchestration_lane_role_fidelity",
+                            run_id,
+                        )
+                        if row.get("result_committed") is True
+                    }
+                    for route in orchestration_event_details(
+                        state,
+                        "orchestration_routed",
+                        run_id,
+                    ):
+                        dependent_lane = str(route.get("lane_id") or "")
+                        dependent_owner = str(route.get("owner") or "")
+                        if (
+                            dependent_lane == "execute"
+                            or dependent_lane not in waiting_lanes
+                            or dependent_lane in committed_lanes
+                            or not dependent_owner
+                        ):
+                            continue
+                        dependent_wake_status = enqueue_daemon_wake(
+                            state,
+                            dependent_owner,
+                            f"orchestration_owner:{run_id}:{dependent_lane}",
+                            orchestration_root_id,
+                        )
+                        append_daemon_event(
+                            state,
+                            "orchestration_artifact_dependent_released",
+                            {
+                                "run_id": run_id,
+                                "root_message_id": orchestration_root_id,
+                                "lane_id": dependent_lane,
+                                "agent": dependent_owner,
+                                "artifact_owner": validated_artifact["owner"],
+                                "artifact_path": validated_artifact["path"],
+                                "artifact_sha256": validated_artifact["sha256"],
+                                "wake_status": dependent_wake_status,
+                            },
+                        )
                 prior_executions = [
                     row
                     for row in orchestration_event_details(
@@ -6136,6 +6353,16 @@ def finalize_daemon_turn(
                             "task_number": task_number,
                             "execution_count": 1,
                             "loser_execution_count": 0,
+                            "artifact_owner": execute_artifact.get("owner")
+                            if execute_artifact is not None
+                            else None,
+                            "artifact_path": execute_artifact.get("path")
+                            if execute_artifact is not None
+                            else None,
+                            "artifact_sha256": execute_artifact.get("sha256")
+                            if execute_artifact is not None
+                            else None,
+                            "rebuilt_artifact": lane_id == "execute",
                             "executed_epoch_ms": epoch_milliseconds(),
                         },
                     )
@@ -6182,7 +6409,56 @@ def finalize_daemon_turn(
                         "delivery_reply_target": target,
                         "delivery_root_message_id": orchestration_root_id,
                         "complete_all_work_before_stopping": True,
+                        "result_author": agent_name,
+                        "result_body_non_empty": bool(stdout_clean),
+                        "delivery_trailer_present": True,
+                        "artifact_owner": execute_artifact.get("owner")
+                        if execute_artifact is not None
+                        else None,
+                        "artifact_path": execute_artifact.get("path")
+                        if execute_artifact is not None
+                        else None,
+                        "artifact_sha256": execute_artifact.get("sha256")
+                        if execute_artifact is not None
+                        else None,
                         "committed_epoch_ms": epoch_milliseconds(),
+                    },
+                )
+                append_daemon_event(
+                    state,
+                    "orchestration_lane_role_fidelity",
+                    {
+                        "run_id": run_id,
+                        "root_message_id": orchestration_root_id,
+                        "lane_id": lane_id,
+                        "agent": agent_name,
+                        "task_number": task_number,
+                        "artifact_available": execute_artifact is not None,
+                        "artifact_owner": execute_artifact.get("owner")
+                        if execute_artifact is not None
+                        else None,
+                        "artifact_path": execute_artifact.get("path")
+                        if execute_artifact is not None
+                        else None,
+                        "artifact_sha256": execute_artifact.get("sha256")
+                        if execute_artifact is not None
+                        else None,
+                        "reference_present": (
+                            True
+                            if lane_id == "execute"
+                            else bool(
+                                execute_artifact is not None
+                                and (
+                                    f"[artifact-ref owner=@{execute_artifact['owner']} "
+                                    f"path={execute_artifact['path']} "
+                                    f"sha256={execute_artifact['sha256']}]"
+                                )
+                                in stdout_clean
+                            )
+                        ),
+                        "rebuilt_artifact": lane_id == "execute",
+                        "result_committed": True,
+                        "message_id": message_id,
                     },
                 )
             elif effective_status not in {"done"}:
@@ -6976,6 +7252,9 @@ def command_agent_register(argv: list[str]) -> int:
             avatar_url.strip() if avatar_url is not None else None,
             existing["created_at"] if existing is not None else now,
             now,
+            str(existing.get("presence") or "offline") if existing is not None else "offline",
+            existing.get("presence_updated_at") if existing is not None else None,
+            existing.get("last_turn_at") if existing is not None else None,
         )
         if existing is None:
             state.setdefault("agents", []).append(record)
@@ -7445,7 +7724,7 @@ ORCHESTRATION_LANES = [
 
 ORCHESTRATION_PLATFORM_CONTRACT = {
     "version": "swarm-runtime-flow-v1",
-    "coverage_manifest_version": "chat-task-orchestration-coverage-v2",
+    "coverage_manifest_version": "chat-task-orchestration-coverage-v3",
     "source_material_embedded": False,
 }
 
@@ -7487,6 +7766,119 @@ def orchestration_event_details(
             continue
         details.append(detail)
     return details
+
+
+def orchestration_execute_route_exists(state: dict[str, Any], run_id: str) -> bool:
+    return any(
+        str(detail.get("lane_id") or "") == "execute"
+        for detail in orchestration_event_details(state, "orchestration_routed", run_id)
+    )
+
+
+def orchestration_execute_artifact(
+    state: dict[str, Any],
+    run_id: str,
+) -> dict[str, Any] | None:
+    artifacts = orchestration_event_details(state, "orchestration_artifact", run_id)
+    for detail in reversed(artifacts):
+        if (
+            str(detail.get("lane_id") or "") == "execute"
+            and detail.get("owner")
+            and detail.get("path")
+            and re.fullmatch(r"[0-9a-f]{64}", str(detail.get("sha256") or ""))
+        ):
+            return detail
+    return None
+
+
+def parse_orchestration_artifact_marker(output: str) -> tuple[str, str] | None:
+    match = re.search(
+        r"\[artifact path=([^\]\s]+) sha256=([0-9a-fA-F]{64})\]",
+        output,
+    )
+    if match is None:
+        return None
+    return match.group(1), match.group(2).lower()
+
+
+def validate_orchestration_artifact(
+    state: dict[str, Any],
+    agent_name: str,
+    output: str,
+) -> tuple[dict[str, str] | None, str | None]:
+    marker = parse_orchestration_artifact_marker(output)
+    if marker is None:
+        return None, "execute owner result omitted [artifact path=... sha256=...]"
+    artifact_path, claimed_sha256 = marker
+    if not valid_workspace_path(artifact_path):
+        return None, "execute owner artifact path is not a safe workspace-relative path"
+    agent = agent_by_name(state, agent_name)
+    if agent is None:
+        return None, "execute owner is missing from the registry"
+    workspace = (state_dir() / str(agent.get("workspace_path") or "")).resolve()
+    candidate = (workspace / artifact_path).resolve()
+    try:
+        candidate.relative_to(workspace)
+    except ValueError:
+        return None, "execute owner artifact resolves outside its workspace"
+    if not candidate.is_file():
+        return None, "execute owner artifact file does not exist"
+    digest = hashlib.sha256()
+    try:
+        with candidate.open("rb") as artifact_file:
+            for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        return None, f"execute owner artifact could not be read: {type(exc).__name__}"
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != claimed_sha256:
+        return None, "execute owner artifact hash does not match its result marker"
+    return {
+        "owner": agent_name,
+        "path": artifact_path,
+        "sha256": actual_sha256,
+    }, None
+
+
+def orchestration_lane_role_contract(
+    state: dict[str, Any],
+    assignment: dict[str, Any],
+) -> str:
+    run_id = str(assignment.get("run_id") or "")
+    lane_id = str(assignment.get("lane_id") or "")
+    if not orchestration_execute_route_exists(state, run_id):
+        return ""
+    if lane_id == "execute":
+        return (
+            "Lane role contract (execute owner): you alone create or rebuild the implementation artifact. "
+            "Before answering, create one canonical artifact inside your own workspace, compute its SHA-256, "
+            "and include this exact machine-readable marker in the final result: "
+            "`[artifact path=<workspace-relative-path> sha256=<64-lowercase-hex>]`. "
+            "The runtime verifies the file and hash before any result or status receipt can commit."
+        )
+    artifact = orchestration_execute_artifact(state, run_id)
+    if artifact is None:
+        return (
+            f"Lane role contract ({lane_id}): the execute-owner artifact is not committed yet. "
+            "Do not create, copy, or rebuild an implementation artifact. Return exactly "
+            "WAIT_FOR_EXECUTE_ARTIFACT; the runtime will keep the task blocked and rerun it after the "
+            "execute owner commits."
+        )
+    reference = (
+        f"[artifact-ref owner=@{artifact['owner']} path={artifact['path']} "
+        f"sha256={artifact['sha256']}]"
+    )
+    lane_instruction = (
+        "Inspect or test that exact owner artifact; if it is unavailable, report a blocker and do not rebuild it."
+        if lane_id == "verify"
+        else "Summarize status from that exact owner artifact; never create, copy, or rebuild it."
+        if lane_id == "receipt"
+        else "Ground this lane in that exact owner artifact and do not create, copy, or rebuild it."
+    )
+    return (
+        f"Lane role contract ({lane_id}): {lane_instruction} Include this exact reference unchanged in "
+        f"your final result: `{reference}`."
+    )
 
 
 def orchestration_summary(body: str) -> str:
@@ -10205,6 +10597,29 @@ def command_slack_send(argv: list[str]) -> int:
         else:
             response, response_error = slack_web_post_message(context["token_value"], plan, timeout_seconds)
         if response_error is not None:
+            terminal_reason = slack_terminal_validation_reason(response_error)
+            if terminal_reason is not None:
+                def quarantine_action(state: dict[str, Any]) -> int:
+                    if not slack_outbound_is_quarantined(state, workspace, message_id):
+                        append_daemon_event(
+                            state,
+                            "slack_outbound_quarantined",
+                            {
+                                "workspace": workspace,
+                                "message_id": message_id,
+                                "target": plan.get("swarm_target"),
+                                "reason": terminal_reason,
+                                "terminal": True,
+                            },
+                        )
+                    return 0
+
+                with_mutable_state(quarantine_action)
+                return write_stderr(
+                    f"Error: {response_error}\n"
+                    "Code: SLACK_SEND_QUARANTINED\n"
+                    "Next action: correct the canonical message content before creating a new outbound row.\n"
+                )
             return write_stderr(f"Error: {response_error}\nCode: SLACK_SEND_FAILED\n")
         assert response is not None
 

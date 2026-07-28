@@ -227,6 +227,51 @@ def probe_inbox(cli: Path, state_dir: Path) -> None:
 
 
 def probe_send_read_and_routes(cli: Path, state_dir: Path) -> None:
+    conn = connect_state(state_dir)
+    try:
+        before_empty_messages = int(
+            conn.execute("SELECT COUNT(*) AS count FROM messages").fetchone()["count"]
+        )
+        before_empty_receipts = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM daemon_events "
+                "WHERE event = 'orchestration_thread_receipt'"
+            ).fetchone()["count"]
+        )
+    finally:
+        conn.close()
+    for empty_body in ("", " \n\t"):
+        rejected = run(
+            cli,
+            state_dir,
+            "message",
+            "send",
+            "--target",
+            f"#empty-reject-{uuid.uuid4().hex[:8]}",
+            stdin=empty_body,
+            expected=1,
+        ).stderr
+        require("Code: EMPTY_MESSAGE" in rejected, "empty stdin did not fail closed")
+    conn = connect_state(state_dir)
+    try:
+        require(
+            int(conn.execute("SELECT COUNT(*) AS count FROM messages").fetchone()["count"])
+            == before_empty_messages,
+            "empty stdin appended a message row",
+        )
+        require(
+            int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM daemon_events "
+                    "WHERE event = 'orchestration_thread_receipt'"
+                ).fetchone()["count"]
+            )
+            == before_empty_receipts,
+            "empty stdin appended an orchestration receipt",
+        )
+    finally:
+        conn.close()
+
     channel_target = f"#replyhint-{uuid.uuid4().hex[:8]}"
     channel_body = f"top-level reply hint body {uuid.uuid4()}"
     channel_sent = run(cli, state_dir, "message", "send", "--target", channel_target, stdin=channel_body).stdout
@@ -1983,6 +2028,98 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
     server_info = run(cli, state_dir, "server", "info").stdout
     require(f"@{name} ({display_name})" in server_info, "server info did not include registered agent profile")
 
+    preserved_presence = "in_turn"
+    preserved_presence_updated_at = "2026-07-29 05:00:01"
+    preserved_last_turn_at = "2026-07-29 05:00:02"
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                UPDATE agents
+                SET presence = ?, presence_updated_at = ?, last_turn_at = ?
+                WHERE name = ?
+                """,
+                (
+                    preserved_presence,
+                    preserved_presence_updated_at,
+                    preserved_last_turn_at,
+                    name,
+                ),
+            )
+    finally:
+        conn.close()
+    updated_display_name = f"{display_name} Updated"
+    run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        name,
+        "--display-name",
+        updated_display_name,
+        "--runtime",
+        "codex",
+        "--workspace",
+        f"agents/{name}",
+        "--avatar-url",
+        avatar_url,
+        "--capability",
+        "triage",
+        "--capability",
+        "write",
+    )
+    conn = connect_state(state_dir)
+    try:
+        preserved = conn.execute(
+            """
+            SELECT display_name, presence, presence_updated_at, last_turn_at
+            FROM agents
+            WHERE name = ?
+            """,
+            (name,),
+        ).fetchone()
+        require(preserved is not None, "agent disappeared during config-only registration update")
+        require(preserved["display_name"] == updated_display_name, "agent config field did not update")
+        require(preserved["presence"] == preserved_presence, "agent register reset runtime-owned presence")
+        require(
+            preserved["presence_updated_at"] == preserved_presence_updated_at,
+            "agent register reset runtime-owned presence timestamp",
+        )
+        require(
+            preserved["last_turn_at"] == preserved_last_turn_at,
+            "agent register reset runtime-owned last-turn timestamp",
+        )
+    finally:
+        conn.close()
+    authored_target = f"#agent-author-{uuid.uuid4().hex[:8]}"
+    authored_body = f"runtime-derived author {uuid.uuid4()}"
+    authored_id = parse_message_id(
+        run(
+            cli,
+            state_dir,
+            "message",
+            "send",
+            "--target",
+            authored_target,
+            stdin=authored_body,
+            env_overrides={"SWARM_AGENT_NAME": name},
+        ).stdout
+    )
+    conn = connect_state(state_dir)
+    try:
+        authored = conn.execute(
+            "SELECT author, body FROM messages WHERE id = ?",
+            (authored_id,),
+        ).fetchone()
+        require(
+            authored is not None and authored["author"] == name and authored["body"] == authored_body,
+            "message send fell through to candidate instead of the runtime agent identity",
+        )
+    finally:
+        conn.close()
+
     count_after_register = registered_agent_count()
     register_bogus = run(
         cli,
@@ -2203,7 +2340,7 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
             (name,),
         ).fetchone()
         require(agent_row is not None, "agent registry row missing from SQLite")
-        require(agent_row["display_name"] == display_name, "agent registry display name mismatch")
+        require(agent_row["display_name"] == updated_display_name, "agent registry display name mismatch")
         require(agent_row["runtime"] == "codex", "agent registry runtime mismatch")
         require(agent_row["workspace_path"] == f"agents/{name}", "agent registry workspace mismatch")
         require(json.loads(agent_row["capabilities_json"]) == ["triage", "write"], "agent capabilities JSON mismatch")
@@ -2811,6 +2948,102 @@ def probe_slack_adapter(cli: Path, state_dir: Path) -> None:
         failed_send_id,
     ).stdout
     require(len(outbound_plans(failed_after)) == 1, "failed slack send polluted mark-sent ledger")
+
+    legacy_empty_id = str(uuid.uuid4())
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            next_seq = int(
+                conn.execute("SELECT value FROM meta WHERE key = 'next_seq'").fetchone()["value"]
+            )
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'next_seq'", (str(next_seq + 1),))
+            conn.execute(
+                """
+                INSERT INTO messages(seq, target, id, time, type, author, body)
+                VALUES (?, ?, ?, ?, 'agent', 'candidate', '')
+                """,
+                (
+                    next_seq,
+                    target,
+                    legacy_empty_id,
+                    "2026-07-29 05:00:00",
+                ),
+            )
+    finally:
+        conn.close()
+    legacy_empty_plan = run(
+        cli,
+        state_dir,
+        "slack",
+        "outbound",
+        "--workspace",
+        workspace,
+        "--message-id",
+        legacy_empty_id,
+    ).stdout
+    require(
+        "## Slack Outbound Plan (0 requests)" in legacy_empty_plan,
+        "outbound planner did not exclude a legacy empty-body poison row",
+    )
+
+    no_text_body = f"terminal Slack validation quarantine {uuid.uuid4()}"
+    no_text_result = run(cli, state_dir, "message", "send", "--target", target, stdin=no_text_body).stdout
+    if "Freshness hold:" in no_text_result:
+        no_text_result = run(
+            cli,
+            state_dir,
+            "message",
+            "send",
+            "--send-draft",
+            "--target",
+            target,
+        ).stdout
+    no_text_id = parse_message_id(no_text_result)
+    mock_no_text_path = state_dir / "slack-send-no-text.json"
+    mock_no_text_path.write_text(json.dumps({"ok": False, "error": "no_text"}))
+    no_text_send = run(
+        cli,
+        state_dir,
+        "slack",
+        "send",
+        "--workspace",
+        workspace,
+        "--message-id",
+        no_text_id,
+        "--mock-response-file",
+        str(mock_no_text_path),
+        expected=1,
+        env_overrides={bot_token_env: fake_token},
+    ).stderr
+    require(
+        "Code: SLACK_SEND_QUARANTINED" in no_text_send and "no_text" in no_text_send,
+        "terminal Slack no_text error was not quarantined",
+    )
+    no_text_retry = run(
+        cli,
+        state_dir,
+        "slack",
+        "send",
+        "--workspace",
+        workspace,
+        "--message-id",
+        no_text_id,
+    ).stdout
+    require(
+        "## Slack Send (0 requests)" in no_text_retry,
+        "quarantined no_text row remained eligible for infinite replay",
+    )
+    quarantine_events = [
+        detail
+        for detail in daemon_event_details(state_dir, "slack_outbound_quarantined")
+        if detail.get("workspace") == workspace and detail.get("message_id") == no_text_id
+    ]
+    require(
+        len(quarantine_events) == 1
+        and quarantine_events[0].get("reason") == "no_text"
+        and quarantine_events[0].get("terminal") is True,
+        "terminal Slack quarantine event was missing or duplicated",
+    )
 
     unmapped_target = f"#slack-unmapped-{uuid.uuid4().hex[:8]}"
     unmapped_body = f"unmapped slack outbound {uuid.uuid4()}"
@@ -4117,6 +4350,32 @@ def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
     history = run(cli, state_dir, "message", "read", "--channel", retry_thread).stdout
     require(fresh_output in history, "freshness retry did not receive the newer owner-query body")
     require(stale_output not in history, "held stale output leaked into the orchestration thread")
+    run_id = str(durable[0]["run_id"])
+    result_receipts = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_thread_receipt")
+        if detail.get("run_id") == run_id and detail.get("receipt_kind") == "result"
+    ]
+    require(len(result_receipts) == 1, "freshness retry did not commit exactly one owner result receipt")
+    receipt = result_receipts[0]
+    require(
+        receipt.get("owner") == agent
+        and receipt.get("result_author") == agent
+        and receipt.get("result_body_non_empty") is True
+        and receipt.get("delivery_trailer_present") is True,
+        "freshness retry receipt lost exact owner, non-empty body, or delivery trailer",
+    )
+    transitions = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_status_transition")
+        if detail.get("run_id") == run_id
+        and detail.get("owner") == agent
+        and detail.get("to") == "in_review"
+    ]
+    require(
+        len(transitions) == 1 and transitions[0].get("server_message_id") == receipt.get("message_id"),
+        "freshness retry did not commit one matching owner status transition",
+    )
     wake = daemon_wake_row(state_dir, agent)
     require(wake is not None and int(wake["running"]) == 0, "freshness retry wake did not drain")
 
@@ -4224,6 +4483,220 @@ def probe_daemon_turn_freshness_hold(cli: Path, state_dir: Path) -> None:
     require(
         len(steer_events) == 1 and steer_events[0].get("target") == queued_thread,
         "same-thread newer human was not recorded as an orchestration steer",
+    )
+
+
+def probe_orchestration_owner_freshness_rerun(cli: Path, state_dir: Path) -> None:
+    agent = f"fresh-owner-{uuid.uuid4().hex[:8]}"
+    workspace = f"T{uuid.uuid4().hex[:8].upper()}"
+    channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
+    target = f"#slack-{channel_id.lower()}"
+    bot_env = f"FRESHOWNER_BOT_{uuid.uuid4().hex[:6].upper()}"
+    app_env = f"FRESHOWNER_APP_{uuid.uuid4().hex[:6].upper()}"
+    root_text = f"@{agent} hello"
+    newer_fact = f"owner freshness correction {uuid.uuid4()}"
+    stale_output = f"stale owner output {uuid.uuid4()}"
+    fresh_output = f"fresh owner output {uuid.uuid4()}"
+    started = state_dir / "fresh-owner-started"
+    runtime = state_dir / "fresh-owner-runtime.py"
+    runtime.write_text(
+        "import pathlib, time\n"
+        f"pathlib.Path({str(started)!r}).write_text('started')\n"
+        + explicit_owner_query_runtime_prelude()
+        + f"if {newer_fact!r} in payload:\n"
+        f"    print({fresh_output!r})\n"
+        "else:\n"
+        "    time.sleep(0.4)\n"
+        f"    print({stale_output!r})\n"
+    )
+    run(
+        cli,
+        state_dir,
+        "agent",
+        "register",
+        "--name",
+        agent,
+        "--display-name",
+        agent,
+        "--runtime",
+        f"{sys.executable} {runtime}",
+        "--workspace",
+        f"agents/{agent}",
+        "--capability",
+        "dissect",
+    )
+    run(
+        cli,
+        state_dir,
+        "slack",
+        "configure",
+        "--workspace",
+        workspace,
+        "--bot-token-env",
+        bot_env,
+        "--app-token-env",
+        app_env,
+        "--mode",
+        "socket_mode",
+    )
+    root_ts = f"1762500300.{uuid.uuid4().int % 1_000_000:06d}"
+    root_mock = state_dir / "fresh-owner-root.jsonl"
+    root_mock.write_text(
+        json.dumps(
+            {
+                "type": "events_api",
+                "payload": {
+                    "team_id": workspace,
+                    "event": {
+                        "type": "message",
+                        "channel": channel_id,
+                        "user": "UFRESHOWNER",
+                        "text": root_text,
+                        "ts": root_ts,
+                    },
+                },
+                "envelope_id": f"env-{uuid.uuid4().hex}",
+            }
+        )
+        + "\n"
+    )
+    run(
+        cli,
+        state_dir,
+        "daemon",
+        "slack",
+        "--workspace",
+        workspace,
+        "--mock-socket-file",
+        str(root_mock),
+        env_overrides={app_env: f"xapp-fresh-owner-{uuid.uuid4()}"},
+    )
+    durable = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_body_durable")
+        if detail.get("target") == target
+    ]
+    require(len(durable) == 1, "owner freshness setup did not create one orchestration root")
+    run_id = str(durable[0]["run_id"])
+    root_message_id = str(durable[0]["root_message_id"])
+    thread_target = f"{target}:{root_message_id[:8]}"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_turn = executor.submit(
+            run,
+            cli,
+            state_dir,
+            "daemon",
+            "turn",
+            "run",
+            "--agent",
+            agent,
+            "--timeout",
+            "5s",
+        )
+        deadline = time.time() + 3
+        while not started.exists() and time.time() < deadline:
+            time.sleep(0.01)
+        require(started.exists(), "orchestration owner freshness runtime did not start")
+        steer_mock = state_dir / "fresh-owner-steer.jsonl"
+        steer_mock.write_text(
+            json.dumps(
+                {
+                    "type": "events_api",
+                    "payload": {
+                        "team_id": workspace,
+                        "event": {
+                            "type": "message",
+                            "channel": channel_id,
+                            "user": "UFRESHOWNER",
+                            "text": newer_fact,
+                            "ts": f"1762500301.{uuid.uuid4().int % 1_000_000:06d}",
+                            "thread_ts": root_ts,
+                        },
+                    },
+                    "envelope_id": f"env-{uuid.uuid4().hex}",
+                }
+            )
+            + "\n"
+        )
+        run(
+            cli,
+            state_dir,
+            "daemon",
+            "slack",
+            "--workspace",
+            workspace,
+            "--mock-socket-file",
+            str(steer_mock),
+            env_overrides={app_env: f"xapp-fresh-owner-steer-{uuid.uuid4()}"},
+        )
+        first_turn.result()
+
+    held_history = run(cli, state_dir, "message", "read", "--channel", thread_target).stdout
+    require(stale_output not in held_history, "stale orchestration owner output committed before rerun")
+    scheduled = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_freshness_rerun_scheduled")
+        if detail.get("run_id") == run_id and detail.get("agent") == agent
+    ]
+    require(
+        len(scheduled) == 1
+        and scheduled[0].get("explicit_owner_query_required") is True
+        and scheduled[0].get("result_committed") is False,
+        "freshness-held orchestration owner did not schedule one explicit-query rerun",
+    )
+    wake = daemon_wake_row(state_dir, agent)
+    require(wake is not None and int(wake["running"]) == 1, "owner freshness rerun wake was lost")
+    resident = run(
+        cli,
+        state_dir,
+        "daemon",
+        "resident",
+        "--loops",
+        "2",
+        "--idle-interval",
+        "0s",
+        "--turn-timeout",
+        "5s",
+    ).stdout
+    require("Resident daemon stopped after 2 iteration(s)" in resident, "owner freshness rerun did not finish")
+    final_history = run(cli, state_dir, "message", "read", "--channel", thread_target).stdout
+    require(final_history.count(fresh_output) == 1, "fresh owner output was not committed exactly once")
+    require(stale_output not in final_history, "held stale owner output leaked after rerun")
+    result_receipts = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_thread_receipt")
+        if detail.get("run_id") == run_id and detail.get("receipt_kind") == "result"
+    ]
+    require(
+        len(result_receipts) == 1
+        and result_receipts[0].get("owner") == agent
+        and result_receipts[0].get("result_author") == agent
+        and result_receipts[0].get("result_body_non_empty") is True
+        and result_receipts[0].get("delivery_trailer_present") is True,
+        "freshness rerun did not produce one exact-owner non-empty result receipt",
+    )
+    transitions = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_status_transition")
+        if detail.get("run_id") == run_id
+        and detail.get("owner") == agent
+        and detail.get("to") == "in_review"
+    ]
+    require(
+        len(transitions) == 1
+        and transitions[0].get("server_message_id") == result_receipts[0].get("message_id"),
+        "freshness rerun did not bind its single result to one status transition",
+    )
+    body_reads = [
+        detail
+        for detail in daemon_event_details(state_dir, "orchestration_body_read")
+        if detail.get("run_id") == run_id and detail.get("agent") == agent
+    ]
+    require(
+        len(body_reads) == 2
+        and len({str(detail.get("query_turn_id") or "") for detail in body_reads}) == 2,
+        "freshness rerun did not explicitly re-read under a new owner turn",
     )
 
 
@@ -5151,6 +5624,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="swarm-turn-freshness-") as tmp:
         probe_daemon_turn_freshness_hold(cli, Path(tmp))
+
+    with tempfile.TemporaryDirectory(prefix="swarm-owner-freshness-") as tmp:
+        probe_orchestration_owner_freshness_rerun(cli, Path(tmp))
 
     with tempfile.TemporaryDirectory(prefix="swarm-thread-shared-") as tmp:
         probe_thread_wake_inherits_root(cli, Path(tmp))

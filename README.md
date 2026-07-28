@@ -49,7 +49,7 @@ Current implemented surface:
 - `swarm agent turn-context --name ... [--target ...] [--event-id ...] [--session-id ...] [--require-seed] [--require-memory] [--write-manifest] [--json]` to build a versioned per-turn context manifest
 - `swarm agent worker --name ... [--once] [--require-seed]` for a persistent heartbeat loop backed by an agent workspace seed
 - `swarm agent collab-smoke --channel ... --task-author ... --worker ... --verifier ...` to exercise the A→B→C task/report/verify path in canonical state
-- Ordinary human Slack events entering `swarm daemon resident --workspace ...` now follow the live orchestration path automatically: durable ingest → metadata-only worker notices → capability route/claim → owner-only body query → native runtime turn → freshness-aware thread result/receipt → restart recovery. Simple greetings route to one owner; substantive goals can use the dissect/research/execute/verify/receipt lanes.
+- Ordinary human Slack events entering `swarm daemon resident --workspace ...` now follow the live orchestration path automatically: durable ingest → metadata-only worker notices → capability route/claim → owner-only body query → native runtime turn → freshness-aware thread result/receipt → restart recovery. Simple greetings route to one owner; substantive goals can use the dissect/research/execute/verify/receipt lanes. The execute owner publishes one validated workspace-relative artifact path/SHA-256; non-execute lanes reference that exact artifact, and unavailable verification waits without rebuilding.
 - `swarm agent orchestrate --channel ... --message-id ... [--max-workers ...]` exposes the same state-backed path as a replay/manual inspection seam; it is not a separate scripted demo path.
 - `swarm slack configure --workspace ... --bot-token-env ... [--signing-secret-env ...] [--app-token-env ...]`
 - `swarm slack env --workspace ...`
@@ -200,11 +200,11 @@ missing retrieval, missing provenance, and answer-without-query bypasses.
 
 The chat-task-orchestration scenario is a trace/eval preflight for the live
 runtime, not a replacement for a Slack test. It drives five distinct-capability
-owners through the same daemon turn boundary and checks the 14 release
+owners through the same daemon turn boundary and checks the 15 release
 conditions in `docs/evals/scenario-chat-task-orchestration.json`, including
 notice-first body withholding, owner-only body reads, loser conflict-stop,
-freshness, lifecycle, exact-thread receipts, restart idempotency, and
-coordination SLOs. Every owner must also use the real same-state CLI to list
+freshness, lifecycle, exact-thread receipts, restart idempotency, lane-role
+artifact fidelity, and coordination SLOs. Every owner must also use the real same-state CLI to list
 visible channels, check source-channel membership, read a different visible
 channel on demand, and still commit only to the exact source thread. Native
 Codex and Claude workers launch with their
