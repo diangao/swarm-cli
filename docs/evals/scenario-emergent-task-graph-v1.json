@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "scenario_id": "emergent-task-graph-v1",
+  "title": "Dissect model outputs a variable tasks[] graph; capability-matching seats self-select via open atomic claims with fencing; replay-safe, timeout-guarded, exact-once receipts",
+  "owner_note": "Verifier-owned acceptance contract for dynamic task formation v1. Locked before implementation. Serialization design: single-writer SQLite transactional CAS + lease/fencing token + idempotency keys; multi-machine consensus is explicitly out of scope.",
+  "accept_intent": "A human posts one ordinary goal. The dissect lane's MODEL turn outputs a schema-validated, variable-count tasks[] (count and shape are the model's judgment, not a fixed taxonomy). The runtime persists them as replay-safe rows and publishes metadata-only claimable notices to every capability-matching seat. NO runtime owner pre-selection: seats self-select. Each seat cheaply decides claim-or-decline from notice metadata; claim races settle by atomic CAS with exactly one winner holding a fencing token; losers conflict-stop with zero body reads. A late or superseded owner cannot commit (token fenced). Unclaimed tasks escalate on timeout instead of rotting. Restart or duplicate wake never duplicates the graph, executions, or receipts. Passing means all of this is observable in the ledger at a five-seat live run.",
+  "fixture": {
+    "agent_count": 5,
+    "role_assignment": "capability labels as configured in registry; NO lane owner pre-selection by runtime",
+    "conversation_history": "scenario-controlled + live human-root rerun",
+    "graph_size_matrix": "acceptance runs at THREE goal complexities producing dynamic 2-task, 3-task, and 5-task graphs (model-judged, not forced); count variance across them is itself evidence for model_generated_task_graph",
+    "notes": "registry freeze-window applies to the entire live window; any registry write inside it auto-fails the run audit"
+  },
+  "pass_conditions": [
+    {
+      "id": "model_generated_task_graph",
+      "assert": "the persisted tasks[] for the goal was produced by the dissect MODEL turn (turn provenance links each task row to the model turn), passes schema validation, and its COUNT is not a constant of the runtime: across the acceptance runs, at least two different goals yield different task counts/shapes. The fixed five-lane generator is gone from the live path.",
+      "supersedes": "decomposed_by_runtime"
+    },
+    {
+      "id": "task_budget_and_dedup",
+      "assert": "tasks[] respects the max-task budget fail-closed (over-budget output is rejected/trimmed with an auditable record, not silently accepted) and duplicate task_keys within a graph are rejected. An EMPTY tasks[] or schema-unparseable model output is fail-closed: no partial graph persists, the failure is auditable, and the goal escalates to the human rather than silently dying.",
+      "supersedes": null
+    },
+    {
+      "id": "post_claim_freshness_reread",
+      "assert": "after winning a claim, the owner re-reads the goal root at its CURRENT version before doing work (trace shows claim -> versioned reread -> execution in that order); if the root changed since the tasks[] graph was cut, the owner's work binds to the newer version or the task is held, never silently built against the stale version.",
+      "supersedes": null
+    },
+    {
+      "id": "open_self_selected_claims",
+      "assert": "no runtime owner pre-selection exists in the trace; every claimed task shows a seat-initiated claim attempt; each winner's capabilities match the task's requirement; at least one task shows a genuine multi-seat claim race settled by CAS with exactly one winner.",
+      "supersedes": "routed_by_capability"
+    },
+    {
+      "id": "fencing_token_commit",
+      "assert": "every commit/receipt carries the claim's fencing token; an injected late-owner commit (stale token after timeout-reassignment) is REJECTED and recorded; only the current token holder's result commits.",
+      "supersedes": null
+    },
+    {
+      "id": "claim_timeout_escalation",
+      "assert": "an intentionally unclaimed/abandoned task reaches its claim/lease timeout and is re-noticed or escalated (visible escalation record); no task rots silently in claimed-but-dead state; the reassigned task completes under a new token.",
+      "supersedes": null
+    },
+    {
+      "id": "graph_replay_idempotency",
+      "assert": "a duplicate wake/replay of the same root and a mid-run restart create ZERO duplicate task rows (UNIQUE root_id+graph_version+task_key holds), zero duplicate executions, zero duplicate receipts; completed tasks stay completed. Plan-commit semantics: a retry with the same plan hash is an idempotent success; a different hash for the same root/version is GRAPH_VERSION_CONFLICT and changes nothing; the planner model turn is NEVER re-invoked after a committed plan exists. Each committed plan records its planner turn id, and acceptance verifies that turn's existence and timing (anti-stub).",
+      "supersedes": "restart_no_reexecution"
+    },
+    {
+      "id": "herd_economics",
+      "assert": "declining seats decide from notice metadata alone via code-level preflight: every seat that did not win a claim has ZERO body reads, ZERO full model turns, zero outward replies, and zero executions for that task (0/0/0/0); the per-task evaluation overhead (notices delivered vs claims attempted vs bodies read) is recorded and bodies-read equals winners exactly.",
+      "supersedes": "owner_only_body_read"
+    },
+    {
+      "id": "phase_gating",
+      "assert": "tasks in a later phase are not claimable until every prior-phase task is terminal-success (trace shows later-phase notices/claims only after the barrier); a failed prior phase leaves later phases blocked and the run enters held with an exact thread receipt; no silent replanning occurs in v1.",
+      "supersedes": null
+    },
+    {
+      "id": "steer_shape_boundary",
+      "assert": "a task-local steer is honored within the current attempt (freshness reread + rerun); a steer that would change graph shape does NOT silently mutate the graph: it produces an auditable hold/replan-request record and the graph stays at its committed version.",
+      "supersedes": null
+    },
+    {
+      "id": "exact_once_receipts",
+      "assert": "each completed task has exactly one committed, non-empty, owner-authored receipt with the delivery trailer, bound to task+attempt idempotency key; empty or unmapped receipt rows cannot enter the outbound set (fail-closed), and no receipt is retried into duplication.",
+      "supersedes": "thread_owner_status_receipt + delivery_reply_trailer"
+    }
+  ],
+  "regression_floor": "ALL 15 conditions of scenario-chat-task-orchestration.json remain binding on the same SHA (notice_first_body_withheld, wake_starts_turn, steer_honored_precommit including live steer in the rerun, lifecycle_and_illegal_transition incl. live illegal-transition, task_status_freshness_hold incl. rerun-to-completion, coordination_slos, channel_navigation_exact_target 5/5, lane_role_fidelity, single_owner_no_duplicate, plus the prior fix regressions: field-owned register, empty-content fail-closed, poison-row/no_text replay). Notice negative-list extended for v1 : the open-task NOTICE carries no root body AND no title/objective/acceptance prose derived from the body.",
+  "fail_signals": [
+    "task count/shape is a runtime constant across differing goals (taxonomy in disguise)",
+    "any runtime-side owner pre-selection in the live path",
+    "a stale-token commit lands as success",
+    "an unclaimed task never escalates",
+    "replay/restart creates any duplicate row/execution/receipt",
+    "a declining seat reads a task body",
+    "an empty receipt enters outbound or a receipt duplicates",
+    "any registry write inside the live window"
+  ],
+  "metrics": [
+    "task_count_variance_across_goals",
+    "claim_collision_rate",
+    "decline_cost (notices vs body reads)",
+    "timeout_escalation_latency",
+    "stale_commit_rejections",
+    "coordination SLO p50/p95 as before"
+  ],
+  "live_rerun_requirements": "the acceptance live run must additionally exercise: a real precommit human steer, one illegal-transition rejection, one injected late-owner fence, one timeout escalation, and 5/5 valid exact-thread replies."
+}

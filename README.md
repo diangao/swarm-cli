@@ -51,6 +51,11 @@ Current implemented surface:
 - `swarm agent collab-smoke --channel ... --task-author ... --worker ... --verifier ...` to exercise the A→B→C task/report/verify path in canonical state
 - Ordinary human Slack events entering `swarm daemon resident --workspace ...` now follow the live orchestration path automatically: durable ingest → metadata-only worker notices → capability route/claim → owner-only body query → native runtime turn → freshness-aware thread result/receipt → restart recovery. Simple greetings route to one owner; substantive goals can use the dissect/research/execute/verify/receipt lanes. The execute owner publishes one validated workspace-relative artifact path/SHA-256; non-execute lanes reference that exact artifact, and unavailable verification waits without rebuilding.
 - `swarm agent orchestrate --channel ... --message-id ... [--max-workers ...]` exposes the same state-backed path as a replay/manual inspection seam; it is not a separate scripted demo path.
+- `SWARM_DYNAMIC_TASKS_V1=1` enables the gated emergent-task path for ordinary human Slack roots. A claimed native planner turn commits a validated variable `tasks[]` graph; capability-matching seats receive metadata-only notices and self-select through atomic claims. The default remains the frozen fixed-lane path while this feature is independently gated.
+- `swarm agent dynamic-start --channel ... --message-id ...` creates or idempotently reopens a dynamic planning run for a human root.
+- `swarm agent task-claim --run-id ... --graph-version ... --task-key ... --expected-attempt ... --agent ...` exposes the cheap seat-local claim preflight and fencing attempt.
+- `swarm agent plan-commit --run-id ... --attempt ...` accepts typed plan JSON on stdin only from the current live planner turn after its explicit owner read.
+- `swarm agent dynamic-list [--run-id ...] [--json]` inspects dynamic runs, tasks, attempts, leases, and receipts.
 - `swarm slack configure --workspace ... --bot-token-env ... [--signing-secret-env ...] [--app-token-env ...]`
 - `swarm slack env --workspace ...`
 - `swarm slack export-history --workspace ... --channel-id ... [--channel-name ...] [--include-replies]` to export Slack channel history as ingest-compatible event JSON rows
@@ -147,6 +152,7 @@ python3 scripts/behavior_eval_loop.py
 python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-consult-old-evidence.json
 python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json
 python3 scripts/consult_old_evidence_probe.py
+python3 scripts/dynamic_task_probe.py
 ```
 
 The local implementation stores state in `state.sqlite3`. By default it uses
@@ -214,3 +220,13 @@ target commits, and freshness/idempotency receipts remain enforced. Each turn
 also performs a harmless workspace create/read/delete smoke before the native
 runtime starts. Direct user acceptance still means starting five real workers
 on the exact gated public SHA and sending an ordinary Slack message.
+
+`scripts/dynamic_task_probe.py` is the focused offline gate for the feature-
+flagged dynamic path. It launches real helper runtimes and barrier-synchronized
+seat claim clients against one isolated SQLite store, then checks winner/loser
+CAS evidence, 0/0/0/0 loser economics, typed-plan provenance and idempotency,
+phase opening, timeout takeover and stale-attempt fencing, shape-changing steer
+hold behavior, no-eligible escalation, exact-once receipts, and restart replay.
+The verifier-owned frozen acceptance contract is
+`docs/evals/scenario-emergent-task-graph-v1.json`; its live five-seat and
+multi-goal matrix remains a separate release gate.
