@@ -88,9 +88,44 @@ class ScenarioSpec:
     requested_metrics: list[str]
 
 
+@dataclass
+class ManifestRuntime:
+    cli: Path
+    state_dir: Path
+    refs: dict[str, dict[str, object]]
+    agent_map: dict[str, str]
+    compose: dict[tuple[str, str], str]
+
+
+ManifestOpHandler = Callable[[ManifestRuntime, dict[str, object], int], dict[str, object]]
+MANIFEST_OP_HANDLERS: dict[str, ManifestOpHandler] = {}
+
+
+def manifest_op(name: str) -> Callable[[ManifestOpHandler], ManifestOpHandler]:
+    def decorator(func: ManifestOpHandler) -> ManifestOpHandler:
+        MANIFEST_OP_HANDLERS[name] = func
+        return func
+
+    return decorator
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise EvalFailure(message)
+
+
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def truthy_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 1 if value else 0
+    if isinstance(value, str):
+        return 1 if value.strip().lower() in {"1", "true", "yes", "y", "on"} else 0
+    return 0
 
 
 def run_cli(
@@ -406,6 +441,55 @@ def as_list(value: object, scenario_id: str, field: str) -> list[Any]:
     return value
 
 
+DEFAULT_EVIDENCE_QUERIES: dict[str, str] = {
+    "notice_shape": (
+        "SELECT turn_id, agent, target, pending_count AS count, sender, mention_flag, thread_flag, "
+        "first_message_id, latest_message_id, body, body_present FROM eval_attention_notices ORDER BY id"
+    ),
+    "injected_context": (
+        "SELECT turn_id, agent, layer_kind, target, body_present, body_text, payload_json "
+        "FROM eval_turn_context_layers ORDER BY turn_id, layer_index"
+    ),
+    "agent_queries": (
+        "SELECT turn_id, agent, command_kind, target, query_text, retrieved_body, result_ref "
+        "FROM eval_agent_command_log ORDER BY id"
+    ),
+    "agent_deferral": (
+        "SELECT turn_id, agent, target, reason FROM eval_agent_deferrals ORDER BY id"
+    ),
+    "agent_output": (
+        "SELECT turn_id, agent, target, body, reflected_body, message_id FROM eval_agent_outputs ORDER BY id"
+    ),
+    "seeded_fact": (
+        "SELECT fact_key, fact_value, provenance, injected_in_context FROM eval_seeded_facts ORDER BY id"
+    ),
+    "seeded_facts": (
+        "SELECT fact_key, fact_value, provenance, injected_in_context FROM eval_seeded_facts ORDER BY id"
+    ),
+    "durable_fact": (
+        "SELECT fact_key, fact_value, provenance, injected_in_context FROM eval_seeded_facts ORDER BY id"
+    ),
+    "agent_citations": (
+        "SELECT turn_id, agent, fact_key, provenance FROM eval_agent_output_citations ORDER BY id"
+    ),
+}
+
+
+def default_evidence_queries_from_contract(item: dict[str, object], scenario_id: str) -> list[dict[str, str]]:
+    requested = as_list(item.get("required_ledger_evidence"), scenario_id, "required_ledger_evidence")
+    queries: list[dict[str, str]] = []
+    for evidence_item in requested:
+        if not isinstance(evidence_item, dict):
+            raise EvalFailure(f"scenario {scenario_id} required_ledger_evidence entries must be objects")
+        evidence_id = evidence_item.get("id")
+        if not isinstance(evidence_id, str) or not evidence_id:
+            raise EvalFailure(f"scenario {scenario_id} required_ledger_evidence entry missing id")
+        sql = DEFAULT_EVIDENCE_QUERIES.get(evidence_id)
+        if sql is not None:
+            queries.append({"id": evidence_id, "sql": sql, "against": STATE_FILE})
+    return queries
+
+
 def read_manifest(path: Path) -> list[ScenarioSpec]:
     try:
         raw = path.read_text(encoding="utf-8")
@@ -424,15 +508,17 @@ def read_manifest(path: Path) -> list[ScenarioSpec]:
             raise EvalFailure("manifest.default_factors must be an object")
         default_factors.update(manifest_factors)
     scenarios = payload.get("scenarios")
+    if scenarios is None and isinstance(payload.get("scenario_id"), str):
+        scenarios = [payload]
     if not isinstance(scenarios, list):
-        raise EvalFailure("manifest.scenarios must be a list")
+        raise EvalFailure("manifest.scenarios must be a list, or manifest must be a single scenario object")
     specs: list[ScenarioSpec] = []
     seen: set[str] = set()
     for index, item in enumerate(scenarios, start=1):
         if not isinstance(item, dict):
             raise EvalFailure(f"scenario {index} must be an object")
         scenario_id = item.get("scenario_id") or item.get("id")
-        probe_raw = item.get("probe") or item.get("implementation_case")
+        probe_raw = item.get("probe_id") or item.get("probe") or item.get("implementation_case")
         probe_id = probe_raw.strip() if isinstance(probe_raw, str) and probe_raw.strip() else None
         title = item.get("title") or scenario_id
         fixture = item.get("fixture", DEFAULT_FIXTURE)
@@ -454,6 +540,8 @@ def read_manifest(path: Path) -> list[ScenarioSpec]:
         setup = as_list(item.get("setup"), scenario_id, "setup")
         actions = as_list(item.get("actions"), scenario_id, "actions")
         evidence_queries = as_list(item.get("evidence_queries"), scenario_id, "evidence_queries")
+        if not evidence_queries:
+            evidence_queries = default_evidence_queries_from_contract(item, scenario_id)
         pass_conditions = as_list(item.get("pass_conditions"), scenario_id, "pass_conditions")
         fail_signals = as_list(item.get("fail_signals"), scenario_id, "fail_signals")
         requested_metrics = as_list(item.get("metrics"), scenario_id, "metrics")
@@ -573,6 +661,110 @@ def ensure_eval_schema(state_dir: Path) -> None:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_seeded_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ref TEXT,
+                    fact_key TEXT NOT NULL,
+                    fact_value TEXT NOT NULL,
+                    provenance TEXT NOT NULL,
+                    injected_in_context INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_attention_notices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    pending_count INTEGER NOT NULL,
+                    sender TEXT NOT NULL,
+                    mention_flag INTEGER NOT NULL,
+                    thread_flag INTEGER NOT NULL,
+                    first_message_id TEXT,
+                    latest_message_id TEXT,
+                    body TEXT,
+                    body_present INTEGER NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_turn_context_layers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    layer_index INTEGER NOT NULL,
+                    layer_kind TEXT NOT NULL,
+                    target TEXT,
+                    body_present INTEGER NOT NULL DEFAULT 0,
+                    body_text TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_agent_command_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    command_kind TEXT NOT NULL,
+                    target TEXT,
+                    query_text TEXT,
+                    retrieved_body INTEGER NOT NULL DEFAULT 0,
+                    result_ref TEXT,
+                    stdout TEXT,
+                    stderr TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_agent_deferrals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    target TEXT,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_agent_outputs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    target TEXT,
+                    message_id TEXT,
+                    body TEXT NOT NULL,
+                    reflected_body INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_agent_output_citations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    fact_key TEXT NOT NULL,
+                    provenance TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
     finally:
         conn.close()
 
@@ -640,6 +832,142 @@ def update_task_ref(state_dir: Path, channel: str, task_number: int, ref: str) -
         conn.close()
 
 
+def record_turn_context_layer(
+    state_dir: Path,
+    *,
+    turn_id: str,
+    agent: str,
+    layer_index: int,
+    layer_kind: str,
+    target: str | None,
+    payload: dict[str, object],
+    body_text: str | None = None,
+) -> None:
+    ensure_eval_schema(state_dir)
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_turn_context_layers(
+                    turn_id, agent, layer_index, layer_kind, target, body_present,
+                    body_text, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    turn_id,
+                    agent,
+                    layer_index,
+                    layer_kind,
+                    target,
+                    1 if body_text is not None else 0,
+                    body_text,
+                    json.dumps(payload, sort_keys=True),
+                    now_text(),
+                ),
+            )
+    finally:
+        conn.close()
+
+
+def record_agent_command(
+    state_dir: Path,
+    *,
+    turn_id: str,
+    agent: str,
+    command_kind: str,
+    target: str | None,
+    query_text: str | None = None,
+    retrieved_body: bool = False,
+    result_ref: str | None = None,
+    stdout: str = "",
+    stderr: str = "",
+) -> None:
+    ensure_eval_schema(state_dir)
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_agent_command_log(
+                    turn_id, agent, command_kind, target, query_text, retrieved_body,
+                    result_ref, stdout, stderr, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (turn_id, agent, command_kind, target, query_text, 1 if retrieved_body else 0, result_ref, stdout, stderr, now_text()),
+            )
+    finally:
+        conn.close()
+
+
+def record_agent_deferral(state_dir: Path, *, turn_id: str, agent: str, target: str | None, reason: str) -> None:
+    ensure_eval_schema(state_dir)
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_agent_deferrals(turn_id, agent, target, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (turn_id, agent, target, reason, now_text()),
+            )
+    finally:
+        conn.close()
+
+
+def record_agent_output(
+    state_dir: Path,
+    *,
+    turn_id: str,
+    agent: str,
+    target: str | None,
+    body: str,
+    reflected_body: bool = False,
+    message_id: str | None = None,
+) -> None:
+    ensure_eval_schema(state_dir)
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_agent_outputs(
+                    turn_id, agent, target, message_id, body, reflected_body, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (turn_id, agent, target, message_id, body, 1 if reflected_body else 0, now_text()),
+            )
+    finally:
+        conn.close()
+
+
+def record_agent_citation(
+    state_dir: Path,
+    *,
+    turn_id: str,
+    agent: str,
+    fact_key: str,
+    provenance: str,
+) -> None:
+    ensure_eval_schema(state_dir)
+    conn = connect_state(state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_agent_output_citations(turn_id, agent, fact_key, provenance, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (turn_id, agent, fact_key, provenance, now_text()),
+            )
+    finally:
+        conn.close()
+
+
 def short_ref_record(refs: dict[str, dict[str, object]], key: str) -> dict[str, object]:
     if key not in refs:
         raise EvalFailure(f"unknown scenario ref: {key}")
@@ -667,6 +995,38 @@ def action_result(
     }
 
 
+@manifest_op("seed_fact")
+def op_seed_fact(runtime: ManifestRuntime, args: dict[str, object], index: int) -> dict[str, object]:
+    ref = str(args.get("ref") or f"F{index}")
+    fact_key = str(args.get("key") or args.get("fact_key") or ref)
+    fact_value = str(args.get("value") or args.get("fact_value") or "")
+    provenance = str(args.get("provenance") or args.get("source") or f"scenario:{ref}")
+    injected_in_context = truthy_int(args.get("inject") or args.get("injected_in_context"))
+    require(fact_value != "", f"seed_fact {ref} requires a non-empty value")
+    ensure_eval_schema(runtime.state_dir)
+    conn = connect_state(runtime.state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_seeded_facts(ref, fact_key, fact_value, provenance, injected_in_context, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (ref, fact_key, fact_value, provenance, injected_in_context, now_text()),
+            )
+    finally:
+        conn.close()
+    runtime.refs[ref] = {
+        "kind": "seeded_fact",
+        "ref": ref,
+        "fact_key": fact_key,
+        "fact_value": fact_value,
+        "provenance": provenance,
+        "injected_in_context": injected_in_context,
+    }
+    return action_result(index, "seed_fact", "success", args=args, ref=ref)
+
+
 def run_manifest_action(
     cli: Path,
     state_dir: Path,
@@ -683,6 +1043,7 @@ def run_manifest_action(
     if not isinstance(args_raw, dict):
         raise EvalFailure(f"action {index} args must be an object")
     args: dict[str, object] = dict(args_raw)
+    runtime = ManifestRuntime(cli, state_dir, refs, agent_map, compose)
 
     if op == "create_task":
         target = str(args.get("target") or args.get("channel") or "#test")
@@ -824,6 +1185,10 @@ def run_manifest_action(
             stdout=proc.stdout,
             stderr=proc.stderr,
         )
+
+    handler = MANIFEST_OP_HANDLERS.get(op)
+    if handler is not None:
+        return handler(runtime, args, index)
 
     raise EvalFailure(f"unsupported manifest op: {op}")
 
