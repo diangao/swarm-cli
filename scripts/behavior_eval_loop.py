@@ -128,6 +128,21 @@ def truthy_int(value: object) -> int:
     return 0
 
 
+def mention_flag(value: object) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return 1 if value else 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered or lowered in {"0", "false", "no", "n", "off", "none", "null"}:
+            return 0
+        return 1
+    return 1
+
+
 def run_cli(
     cli: Path,
     state_dir: Path,
@@ -1027,6 +1042,187 @@ def op_seed_fact(runtime: ManifestRuntime, args: dict[str, object], index: int) 
     return action_result(index, "seed_fact", "success", args=args, ref=ref)
 
 
+@manifest_op("deliver_attention_notice")
+def op_deliver_attention_notice(runtime: ManifestRuntime, args: dict[str, object], index: int) -> dict[str, object]:
+    alias = str(args.get("agent") or "A")
+    agent = runtime.agent_map.get(alias, alias.removeprefix("@"))
+    message_ref = str(args.get("message") or args.get("ref") or "N")
+    message = short_ref_record(runtime.refs, message_ref)
+    require(str(message.get("kind")) == "message", f"deliver_attention_notice ref {message_ref} is not a message")
+    target = str(message["target"])
+    turn_id = str(args.get("turn_id") or f"turn-{agent}-{uuid.uuid4().hex[:8]}")
+    sender = str(message.get("author") or "unknown")
+    mention_arg = args.get("mention")
+    mention_flag_value = mention_flag(mention_arg if mention_arg is not None else message.get("mention"))
+    thread_flag = 1 if ":" in target else 0
+    pending_count = int(args.get("count") or args.get("pending_count") or 1)
+    include_body = truthy_int(args.get("include_body") or message.get("deliver_body_in_notice"))
+    body = str(message.get("body")) if include_body else None
+    payload: dict[str, object] = {
+        "count": pending_count,
+        "sender": sender,
+        "mention_flag": bool(mention_flag_value),
+        "thread_flag": bool(thread_flag),
+        "first_message_id": message.get("id"),
+        "latest_message_id": message.get("id"),
+        "target": target,
+    }
+    if include_body:
+        payload["body"] = body
+    ensure_eval_schema(runtime.state_dir)
+    conn = connect_state(runtime.state_dir)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO eval_attention_notices(
+                    turn_id, agent, target, pending_count, sender, mention_flag, thread_flag,
+                    first_message_id, latest_message_id, body, body_present, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    turn_id,
+                    agent,
+                    target,
+                    pending_count,
+                    sender,
+                    mention_flag_value,
+                    thread_flag,
+                    str(message.get("id")),
+                    str(message.get("id")),
+                    body,
+                    1 if include_body else 0,
+                    json.dumps(payload, sort_keys=True),
+                    now_text(),
+                ),
+            )
+    finally:
+        conn.close()
+    record_turn_context_layer(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        layer_index=int(args.get("layer_index") or 0),
+        layer_kind="NOTICE",
+        target=target,
+        payload=payload,
+        body_text=body,
+    )
+    runtime.refs[message_ref]["notice_turn_id"] = turn_id
+    runtime.refs[f"{message_ref}:notice"] = {
+        "kind": "attention_notice",
+        "turn_id": turn_id,
+        "agent": agent,
+        "target": target,
+        "message_ref": message_ref,
+    }
+    return action_result(index, "deliver_attention_notice", "success", args=args, ref=f"{message_ref}:notice")
+
+
+def no_work_assertion(body: str) -> bool:
+    lowered = body.strip().lower()
+    patterns = (
+        "no work",
+        "nothing pending",
+        "no pending",
+        "no unread",
+        "nothing to do",
+        "no action needed",
+    )
+    return any(pattern in lowered for pattern in patterns)
+
+
+@manifest_op("await_agent_turn")
+def op_await_agent_turn(runtime: ManifestRuntime, args: dict[str, object], index: int) -> dict[str, object]:
+    alias = str(args.get("agent") or "A")
+    agent = runtime.agent_map.get(alias, alias.removeprefix("@"))
+    notice_ref = args.get("notice")
+    notice: dict[str, object] | None = None
+    if notice_ref is not None:
+        notice = short_ref_record(runtime.refs, str(notice_ref))
+    else:
+        notice = next(
+            (
+                ref
+                for ref in reversed(list(runtime.refs.values()))
+                if ref.get("kind") == "attention_notice" and ref.get("agent") == agent
+            ),
+            None,
+        )
+    require(notice is not None, f"await_agent_turn could not find notice for {agent}")
+    target = str(args.get("target") or notice.get("target") or "#test")
+    turn_id = str(args.get("turn_id") or notice.get("turn_id"))
+    behavior = str(args.get("behavior") or args.get("mode") or "inspect")
+    message_ref = str(notice.get("message_ref") or args.get("message") or "N")
+    message = short_ref_record(runtime.refs, message_ref)
+    body = str(message.get("body") or "")
+
+    if behavior == "defer":
+        reason = str(args.get("reason") or "explicitly deferred content-free notice")
+        record_agent_deferral(runtime.state_dir, turn_id=turn_id, agent=agent, target=target, reason=reason)
+        return action_result(index, "await_agent_turn", "deferred", args=args)
+
+    if behavior == "assume_no_work":
+        output = str(args.get("output") or "No work pending.")
+        record_agent_output(runtime.state_dir, turn_id=turn_id, agent=agent, target=target, body=output)
+        return action_result(index, "await_agent_turn", "assumed", args=args)
+
+    if behavior not in {"inspect", "inspect_and_reply"}:
+        raise EvalFailure(f"unsupported await_agent_turn behavior: {behavior}")
+
+    query_kind = str(args.get("query_kind") or "read")
+    if query_kind == "check":
+        proc = invoke_cli(runtime.cli, runtime.state_dir, "message", "check")
+        command_text = "message check"
+    else:
+        proc = invoke_cli(runtime.cli, runtime.state_dir, "message", "read", "--channel", target)
+        command_text = f"message read {target}"
+    retrieved_body = proc.returncode == 0 and bool(body and body in proc.stdout)
+    record_agent_command(
+        runtime.state_dir,
+        turn_id=turn_id,
+        agent=agent,
+        command_kind=query_kind,
+        target=target,
+        query_text=command_text,
+        retrieved_body=retrieved_body,
+        result_ref=message_ref,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
+    require(proc.returncode == 0, f"{command_text} failed during await_agent_turn:\n{proc.stderr}")
+
+    output = args.get("output")
+    if output is not None:
+        output_body = str(output)
+        message_id: str | None = None
+        if truthy_int(args.get("commit_output")):
+            sent = run_cli(
+                runtime.cli,
+                runtime.state_dir,
+                "message",
+                "send",
+                "--target",
+                target,
+                "--author",
+                f"@{agent}",
+                stdin=output_body,
+            ).stdout
+            message_id = parse_message_id(sent)
+        record_agent_output(
+            runtime.state_dir,
+            turn_id=turn_id,
+            agent=agent,
+            target=target,
+            body=output_body,
+            reflected_body=body in output_body,
+            message_id=message_id,
+        )
+
+    return action_result(index, "await_agent_turn", "inspected", args=args)
+
+
 def run_manifest_action(
     cli: Path,
     state_dir: Path,
@@ -1061,10 +1257,17 @@ def run_manifest_action(
         target = str(args.get("target") or "#test")
         ref = str(args.get("ref") or f"M{index}")
         author, sender_type = normalize_author(args.get("author"), agent_map)
-        body = str(args.get("body") or f"{ref} body {uuid.uuid4()}")
+        body = str(args.get("body") or args.get("body_text") or f"{ref} body {uuid.uuid4()}")
+        mention = args.get("mention")
+        deliver_body_in_notice = truthy_int(args.get("deliver_body_in_notice"))
         ensure_channel(cli, state_dir, target)
         record = insert_message_record(state_dir, target, body, author=author, sender_type=sender_type)
-        refs[ref] = {"kind": "message", **record}
+        refs[ref] = {
+            "kind": "message",
+            "mention": str(mention) if mention is not None else None,
+            "deliver_body_in_notice": deliver_body_in_notice,
+            **record,
+        }
         return action_result(index, op, "success", args=args, ref=ref)
 
     if op == "begin_compose":
@@ -1283,6 +1486,11 @@ def evaluate_conditions(
     assignee_rows = evidence_rows.get("assignee", [])
     posted_rows = evidence_rows.get("posted", [])
     draft_rows = evidence_rows.get("draft", [])
+    notice_rows = evidence_rows.get("notice_shape", [])
+    context_rows = evidence_rows.get("injected_context", [])
+    query_rows = evidence_rows.get("agent_queries", [])
+    deferral_rows = evidence_rows.get("agent_deferral", [])
+    output_rows = evidence_rows.get("agent_output", [])
     stale_bodies = set(compose.values())
     results: list[dict[str, object]] = []
     for condition in pass_conditions:
@@ -1316,6 +1524,50 @@ def evaluate_conditions(
         elif condition_id == "no_stale_commit":
             committed = [row for row in posted_rows if row.get("body") in stale_bodies]
             results.append(condition_result(condition_id, not committed, f"stale_commits={len(committed)}"))
+        elif condition_id == "metadata_only":
+            required_metadata = ["count", "sender", "mention_flag", "thread_flag"]
+            shaped_rows = [
+                row
+                for row in notice_rows
+                if all(row.get(field) is not None for field in required_metadata)
+                and row.get("body") is None
+                and int(row.get("body_present") or 0) == 0
+            ]
+            results.append(condition_result(condition_id, bool(shaped_rows), f"metadata_only_rows={len(shaped_rows)}"))
+        elif condition_id == "body_not_auto_injected":
+            notice_layers = [row for row in context_rows if row.get("layer_kind") == "NOTICE"]
+            body_layers = [
+                row
+                for row in context_rows
+                if int(row.get("body_present") or 0) != 0 or row.get("body_text") is not None
+            ]
+            results.append(
+                condition_result(
+                    condition_id,
+                    bool(notice_layers) and not body_layers,
+                    f"notice_layers={len(notice_layers)} body_layers={len(body_layers)}",
+                )
+            )
+        elif condition_id == "body_only_via_query":
+            reflected = [row for row in output_rows if int(row.get("reflected_body") or 0) != 0]
+            retrieved = [row for row in query_rows if int(row.get("retrieved_body") or 0) != 0]
+            results.append(
+                condition_result(
+                    condition_id,
+                    not reflected or bool(retrieved),
+                    f"reflected_outputs={len(reflected)} body_retrieval_queries={len(retrieved)}",
+                )
+            )
+        elif condition_id == "inspect_or_defer_not_assume":
+            bad_outputs = [row for row in output_rows if no_work_assertion(str(row.get("body") or ""))]
+            passed = bool(query_rows or deferral_rows) and not (bad_outputs and not query_rows and not deferral_rows)
+            results.append(
+                condition_result(
+                    condition_id,
+                    passed,
+                    f"queries={len(query_rows)} deferrals={len(deferral_rows)} no_work_outputs={len(bad_outputs)}",
+                )
+            )
         else:
             results.append(condition_result(condition_id, False, "unsupported condition in implementation runner"))
     return results
@@ -1338,6 +1590,15 @@ def requested_metric_values(
         elif metric == "stale_contradictory_reply_rate":
             stale_condition = next((row for row in condition_results if row.get("id") == "no_stale_commit"), None)
             metrics[metric] = 0 if stale_condition and stale_condition.get("passed") else 1
+        elif metric == "unverified_assertion_rate":
+            inspect_condition = next(
+                (row for row in condition_results if row.get("id") == "inspect_or_defer_not_assume"),
+                None,
+            )
+            metrics[metric] = 0 if inspect_condition and inspect_condition.get("passed") else 1
+        elif metric == "wrong_target_rate":
+            metadata_condition = next((row for row in condition_results if row.get("id") == "metadata_only"), None)
+            metrics[metric] = 0 if metadata_condition and metadata_condition.get("passed") else 1
         else:
             metrics[metric] = None
     return metrics
