@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -12,7 +13,6 @@ import uuid
 import hashlib
 import json
 import mimetypes
-import re
 import shutil
 import shlex
 import time
@@ -27,10 +27,20 @@ from typing import Any, Callable
 
 
 SCHEMA_VERSION = 22
+CONTEXT_MANIFEST_VERSION = 1
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 DRAFT_PREFIX = "__SWARM_DRAFT_V1__"
+CREDENTIAL_SHAPE_RE = re.compile(
+    r"(?i)("
+    r"sk_(?:agent|machine)?_[A-Za-z0-9_-]{8,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{8,}|"
+    r"xapp-[A-Za-z0-9-]{8,}|"
+    r"bearer\s+[A-Za-z0-9._-]{12,}|"
+    r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+    r")"
+)
 
 
 def message(
@@ -3025,9 +3035,8 @@ def route_message_wakes(state: dict[str, Any], record: dict[str, Any]) -> list[d
                 "target": record["target"],
             },
         )
-    # channel-wide attention: every human channel message wakes every other
-    # registered agent; the reply/silence judgment lives in the agent turn
-    # (local reply policy), not in the router.
+    # Full-attention routing wakes every other registered agent for human
+    # channel messages; the reply/silence judgment lives in the agent turn.
     author = str(record.get("author") or "")
     if str(record.get("type") or "") == "human" or author.startswith("slack:"):
         for agent in state.get("agents", []):
@@ -3921,8 +3930,6 @@ def render_freshness_hold(
     return write_stdout(
         f"Freshness hold: showing latest {len(visible)} of {len(blocking)} newer message.\n"
         "Your message has been saved as a draft. Review the bounded context shown here, then choose one path.\n"
-        "Trace: recordId=decision_record:"
-        "0000000000000000000000000000000000000000000000000000000000000000.\n\n"
         f"## Message History for {target} ({len(visible)} messages)\n\n"
         f"{history_rows}\n\n"
         f"{attachment_note}"
@@ -3942,8 +3949,6 @@ def render_task_freshness_hold(state: dict[str, Any], channel: str) -> int:
     return write_stdout(
         f"Freshness hold: showing latest {len(visible)} of {len(blocking)} newer message.\n"
         "Your task claim was not applied. Review the bounded context shown here, then choose one path.\n"
-        "Trace: recordId=decision_record:"
-        "0000000000000000000000000000000000000000000000000000000000000000.\n\n"
         f"## Message History for {channel} ({len(visible)} messages)\n\n"
         f"{history_rows}\n\n"
         "After reviewing the newer context, rerun the task claim command if it is still correct.\n"
@@ -5368,9 +5373,9 @@ def wake_shared_channel_context(
         if len(after_trigger) >= 8:
             break
 
-    # channel-based collaboration shares channel facts, not model sessions. Keep
-    # the recent pre-trigger conversation plus peer outputs already committed
-    # in this wake. Exact-target scoping preserves channel/thread isolation.
+    # Collaboration shares channel facts, not model sessions. Keep the recent
+    # pre-trigger conversation plus peer outputs already committed in this wake.
+    # Exact-target scoping preserves channel/thread isolation.
     selected = before_and_trigger[-12:] + after_trigger
     rendered: list[str] = []
     for record in selected:
@@ -6504,6 +6509,240 @@ def command_agent_worker(argv: list[str]) -> int:
             return write_stdout(f"Worker stopped for @{name}. Session: {session_id}. Iterations: {iterations}.\n")
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def credential_shape_count(path: Path) -> int:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return 0
+    return len(CREDENTIAL_SHAPE_RE.findall(text))
+
+
+def context_file_record(workspace: Path, relative_path: str) -> dict[str, Any]:
+    path = workspace / relative_path
+    if not path.is_file():
+        return {
+            "path": relative_path,
+            "exists": False,
+            "size_bytes": 0,
+            "sha256": None,
+            "credential_shape_count": 0,
+        }
+    stat = path.stat()
+    return {
+        "path": relative_path,
+        "exists": True,
+        "size_bytes": stat.st_size,
+        "sha256": file_sha256(path),
+        "credential_shape_count": credential_shape_count(path),
+    }
+
+
+def latest_seq_for_target(state: dict[str, Any], target: str | None) -> int:
+    if target is None:
+        records = state.get("messages", [])
+    else:
+        records = [record for record in state.get("messages", []) if record["target"] == target]
+    if not records:
+        return 0
+    return max(int(record["seq"]) for record in records)
+
+
+def build_turn_context_manifest(
+    state: dict[str, Any],
+    agent: dict[str, Any],
+    *,
+    target: str | None,
+    event_id: str,
+    session_id: str | None,
+    trigger: str,
+    require_seed: bool,
+    require_memory: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    workspace = state_dir() / str(agent["workspace_path"])
+    seed_file = context_file_record(workspace, "seed.json")
+    memory_file = context_file_record(workspace, "MEMORY.md")
+    missing: list[str] = []
+    if require_seed and not seed_file["exists"]:
+        missing.append("seed.json")
+    if require_memory and not memory_file["exists"]:
+        missing.append("MEMORY.md")
+
+    manifest = {
+        "schema_version": CONTEXT_MANIFEST_VERSION,
+        "generated_at": current_timestamp(),
+        "agent": {
+            "name": agent["name"],
+            "display_name": agent["display_name"],
+            "runtime": agent["runtime"],
+            "workspace_path": agent["workspace_path"],
+            "capabilities": agent.get("capabilities", []),
+        },
+        "source_layers": {
+            "platform_policy": {
+                "id": "swarm-cli-local",
+                "commit_boundary": "agent-visible collaboration actions must be committed through swarm CLI commands",
+                "stdout_policy": "model/runtime stdout is not a message transport",
+            },
+            "runtime_policy": {
+                "runtime": agent["runtime"],
+                "session_resume_key": session_id or f"{agent['name']}:default",
+                "workspace_cwd": agent["workspace_path"],
+            },
+            "swarm_contract": {
+                "state_schema_version": SCHEMA_VERSION,
+                "context_manifest_version": CONTEXT_MANIFEST_VERSION,
+                "canonical_message_header": "[target=<target> msg=<short-id> time=<timestamp> type=<kind>] @<author>: <body>",
+                "freshness_hold": "newer target context saves outbound text as a durable draft",
+            },
+            "environment_facts": {
+                "python_version": sys.version.split()[0],
+                "state_backend": "sqlite",
+                "state_scope": "local-first single-machine store",
+                "workspace_exists": workspace.is_dir(),
+                "absolute_paths_omitted": True,
+            },
+            "capabilities": {
+                "cli_families": [
+                    "message",
+                    "task",
+                    "reminder",
+                    "server",
+                    "channel",
+                    "thread",
+                    "profile",
+                    "integration",
+                    "attachment",
+                    "action",
+                    "agent",
+                    "slack",
+                ],
+                "agent_capabilities": agent.get("capabilities", []),
+            },
+            "event": {
+                "id": event_id,
+                "trigger": trigger,
+                "target": target,
+                "target_latest_seq": latest_seq_for_target(state, target),
+                "global_latest_seq": latest_seq_for_target(state, None),
+            },
+            "persistent_memory": {
+                "workspace_path": agent["workspace_path"],
+                "required": {
+                    "seed": require_seed,
+                    "memory": require_memory,
+                },
+                "files": [seed_file, memory_file],
+            },
+            "security": {
+                "secret_values_included": False,
+                "file_contents_included": False,
+                "credential_shape_scan": "counts only; matched values are never emitted",
+            },
+        },
+    }
+    return manifest, missing
+
+
+def turn_context_manifest_path(agent: dict[str, Any], event_id: str) -> Path:
+    safe_event = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in event_id)[:80]
+    if not safe_event:
+        safe_event = uuid.uuid4().hex[:8]
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    workspace = state_dir() / str(agent["workspace_path"])
+    runtime_dir = workspace / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir / f"turn-context-{timestamp}-{safe_event}.json"
+
+
+def command_agent_turn_context(argv: list[str]) -> int:
+    allowed = {
+        "--name",
+        "--target",
+        "--event-id",
+        "--session-id",
+        "--trigger",
+        "--require-seed",
+        "--require-memory",
+        "--write-manifest",
+        "--json",
+    }
+    unknown = unknown_flags(argv, allowed)
+    if unknown:
+        return write_stderr(f"Error: unknown agent turn-context flag: {unknown[0]}\nCode: INVALID_ARG\n")
+    for flag in ("--name", "--target", "--event-id", "--session-id", "--trigger"):
+        if flag_missing_value(argv, flag):
+            return write_stderr("Error: Agent turn-context flags require values\nCode: INVALID_ARG\n")
+    name, name_error = parse_agent_name_arg(argv)
+    if name_error is not None:
+        return write_stderr(f"Error: {name_error}\nCode: INVALID_ARG\n")
+    assert name is not None
+    target = arg_value(argv, "--target")
+    if target is not None and not (target.startswith("#") or target.startswith("dm:@")):
+        return write_stderr("Error: --target must be a channel, thread, or DM\nCode: INVALID_TARGET\n")
+    event_id = arg_value(argv, "--event-id") or f"manual-{uuid.uuid4().hex[:8]}"
+    trigger = arg_value(argv, "--trigger") or "manual"
+    session_id = arg_value(argv, "--session-id")
+    require_seed = "--require-seed" in argv
+    require_memory = "--require-memory" in argv
+    write_manifest = "--write-manifest" in argv
+    json_output = "--json" in argv
+
+    def action(state: dict[str, Any]) -> int:
+        agent = agent_by_name(state, name)
+        if agent is None:
+            return write_stderr("Error: Agent not found\nCode: NOT_FOUND\n")
+        manifest, missing = build_turn_context_manifest(
+            state,
+            agent,
+            target=target,
+            event_id=event_id,
+            session_id=session_id,
+            trigger=trigger,
+            require_seed=require_seed,
+            require_memory=require_memory,
+        )
+        if missing:
+            missing_text = ", ".join(missing)
+            return write_stderr(
+                f"Error: required startup context missing for @{name}: {missing_text}\n"
+                "Code: STARTUP_CONTEXT_MISSING\n"
+                f"Next action: create the missing workspace files under {agent['workspace_path']} or run swarm agent seed --name {name}.\n"
+            )
+        if write_manifest:
+            output_path = turn_context_manifest_path(agent, event_id)
+            manifest["manifest_path"] = str(output_path.relative_to(state_dir()))
+            output_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        rendered = json.dumps(manifest, indent=2, sort_keys=True)
+        if json_output:
+            return write_stdout(rendered + "\n")
+        memory_files = manifest["source_layers"]["persistent_memory"]["files"]
+        present = [record["path"] for record in memory_files if record["exists"]]
+        path_line = f"Manifest path: {manifest['manifest_path']}\n" if "manifest_path" in manifest else ""
+        return write_stdout(
+            "## Turn Context Manifest\n\n"
+            f"Agent: @{agent['name']}\n"
+            f"Event: {event_id}\n"
+            f"Target: {target or '-'}\n"
+            f"Schema: {CONTEXT_MANIFEST_VERSION}\n"
+            f"Memory files present: {', '.join(present) if present else '-'}\n"
+            f"{path_line}\n"
+            f"{rendered}\n"
+        )
+
+    return with_read_state(action)
+
+
 def command_agent_collab_smoke(argv: list[str]) -> int:
     unknown = unknown_flags(argv, {"--channel", "--task-author", "--worker", "--verifier", "--title"})
     if unknown:
@@ -7537,6 +7776,8 @@ def command_agent(argv: list[str]) -> int:
         return command_agent_heartbeat(rest)
     if subcommand == "worker":
         return command_agent_worker(rest)
+    if subcommand == "turn-context":
+        return command_agent_turn_context(rest)
     if subcommand == "seed":
         return command_agent_seed(rest)
     if subcommand == "supervisor-plan":

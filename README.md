@@ -46,6 +46,7 @@ Current implemented surface:
 - `swarm attachment view --id ... --output ...`
 - `swarm action prepare --target ...` for local pending `channel:create` / `agent:create` action cards
 - `swarm agent register/list/heartbeat/seed/supervisor-plan`
+- `swarm agent turn-context --name ... [--target ...] [--event-id ...] [--session-id ...] [--require-seed] [--require-memory] [--write-manifest] [--json]` to build a versioned per-turn context manifest
 - `swarm agent worker --name ... [--once] [--require-seed]` for a persistent heartbeat loop backed by an agent workspace seed
 - `swarm agent collab-smoke --channel ... --task-author ... --worker ... --verifier ...` to exercise the A→B→C task/report/verify path in canonical state
 - `swarm slack configure --workspace ... --bot-token-env ... [--signing-secret-env ...] [--app-token-env ...]`
@@ -140,6 +141,7 @@ From this checkout:
 
 ```bash
 python3 scripts/anti_stub_probe.py
+python3 scripts/behavior_eval_loop.py
 ```
 
 The local implementation stores state in `state.sqlite3`. By default it uses
@@ -172,3 +174,14 @@ channel cataloging, workspace env-name configuration, outbound `chat.postMessage
 plan rendering without network sends, mocked Slack Web API send + mark-sent
 acknowledgement mapping, failed-send ledger protection, and persisted mapping
 rows.
+
+`scripts/behavior_eval_loop.py` is an implementation-owned smoke runner, not the
+final acceptance judge. It consumes a JSON scenario manifest
+(`docs/evals/probes-smoke-v0.json` by default), executes local probes, and
+emits structured evidence with `scenario_id`, `fixture`, `timeline`,
+`factors`, `evidence`, `metrics`, and advisory `runner_verdict` fields. This
+slice records factor values and accepts repeated `--factor key=value` metadata
+overrides; factor-specific runtime switches should be added with the matching
+behavior implementation. Verifier-owned acceptance remains separate: passing
+this smoke loop means the slice is ready for independent gating, not that full
+behavioral coverage has been achieved.

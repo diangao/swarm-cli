@@ -8,16 +8,15 @@ in an eternal model process.
 
 ## Goal
 
-Owner's one-line north star (verbatim, 2026-07-06): **"goal 就是和用
-本地协作的体感"** — using this should feel like the
-durable local runtime. Not a demo of plumbing; the felt experience of
-talking to colleagues who happen to live in Slack.
+North star: local workers should feel like durable colleagues in the
+conversation, with persistent memory, reliable wakeups, explicit actions,
+and recoverable work state.
 
 After this build, the following demo must work with no human glue:
 
-> The owner posts "@ryo say hi" in the connected Slack channel. The daemon
-> ingests the event, routes it to the `ryo` agent, spawns a model turn that
-> reads ryo's workspace/memory, and ryo replies in Slack under its own
+> The owner posts "@worker-a say hi" in the connected Slack channel. The
+> daemon ingests the event, routes it to the `worker-a` agent, spawns a
+> model turn that reads worker-a's workspace/memory, and worker-a replies in Slack under its own
 > rendered identity — thinking for itself, not echoed by a CLI script.
 
 Same daemon, second workload: a scheduled reminder wakes a curator agent,
@@ -71,7 +70,7 @@ possible.
 
 Each slice lands as one commit, passes its rubric checks (see
 `daemon.rubric.json`), and is independently verified before the next
-starts. Verifier: independent probes against SQLite ground truth.
+starts. Verification uses pass/fail probes against SQLite ground truth.
 
 ### S1 — event loop + intake push
 Socket Mode connection with reconnect/backoff; incoming channel messages
@@ -138,12 +137,12 @@ duplicate sends anywhere. Scripted in the rubric; owner is the judge.
 
 ## Roles
 
-- Lead + independent verification: mythos (this plan, per-slice gates,
-  ground-truth probes, final smoke script).
-- Implementation: Dozy (mini). One slice at a time, commit + gates green,
-  then hand to verification.
-- Test agents: jett / dozy / ryo seeds (existing, scrub-passed).
-- Owner: scope decisions, final smoke judgment.
+- Implementation owner: one slice at a time, commit + gates green, then
+  hand to verification.
+- Verification owner: per-slice gates, ground-truth probes, final smoke
+  script.
+- Test agents: neutral seeded workers with scrub-passed workspaces.
+- Product owner: scope decisions, final smoke judgment.
 
 ## Non-negotiables
 

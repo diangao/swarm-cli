@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "owner": "implementation-owned example manifest; independent acceptance remains separate",
+  "default_factors": {
+    "persona_seed": true,
+    "persistent_memory": true,
+    "session_resume": true,
+    "structured_channels_threads": true,
+    "exact_target_id": true,
+    "inbox_routing": true,
+    "claim_lock": true,
+    "task_state_machine": true,
+    "mid_turn_steering": false,
+    "freshness_hold": true,
+    "reminders": true,
+    "shared_timeline": "query_on_demand",
+    "presence_activity": true,
+    "cli_only_action": true,
+    "tool_catalog": "full_local",
+    "scopes_human_commit": true
+  },
+  "scenarios": [
+    {
+      "scenario_id": "claim-race",
+      "title": "Two agents race the same task claim",
+      "fixture": {
+        "agent_count": 2,
+        "role_assignment": {
+          "A": "worker",
+          "B": "worker"
+        },
+        "randomize_agent_name_order": true
+      },
+      "setup": [
+        {
+          "op": "create_task",
+          "args": {
+            "target": "#test",
+            "status": "todo",
+            "assignee": null,
+            "ref": "T"
+          }
+        }
+      ],
+      "actions": [
+        {
+          "op": "agent_claim",
+          "args": {
+            "agent": "A",
+            "task": "T"
+          },
+          "concurrency_group": "race1"
+        },
+        {
+          "op": "agent_claim",
+          "args": {
+            "agent": "B",
+            "task": "T"
+          },
+          "concurrency_group": "race1"
+        }
+      ],
+      "evidence_queries": [
+        {
+          "id": "assignee",
+          "sql": "SELECT assignee, status FROM tasks WHERE ref='T'",
+          "against": "state.sqlite3"
+        },
+        {
+          "id": "claim_results",
+          "sql": "SELECT agent, outcome FROM claim_attempts WHERE task='T' ORDER BY ts",
+          "against": "state.sqlite3"
+        }
+      ],
+      "pass_conditions": [
+        {
+          "id": "one_winner",
+          "assert": "exactly one claim_results.outcome == success"
+        },
+        {
+          "id": "single_assignee",
+          "assert": "assignee is a single agent == the winner"
+        },
+        {
+          "id": "loser_no_work",
+          "assert": "loser produced no in_progress transition and no artifact for T"
+        }
+      ],
+      "fail_signals": [
+        "both success",
+        "assignee flip-flop",
+        "loser produced work",
+        "deadlock or hang"
+      ],
+      "metrics": [
+        "claim_collision_rate",
+        "duplicate_work_rate"
+      ]
+    },
+    {
+      "scenario_id": "freshness-hold",
+      "title": "Newer message arrives before an old reply commits",
+      "fixture": {
+        "agent_count": 1,
+        "role_assignment": {
+          "A": "responder"
+        },
+        "randomize_agent_name_order": true
+      },
+      "setup": [
+        {
+          "op": "post_message",
+          "args": {
+            "target": "#test",
+            "author": "human",
+            "ref": "M",
+            "body": "older human context"
+          }
+        }
+      ],
+      "actions": [
+        {
+          "op": "begin_compose",
+          "args": {
+            "agent": "A",
+            "reply_to": "M",
+            "target": "#test",
+            "body": "stale reply body"
+          }
+        },
+        {
+          "op": "post_message",
+          "args": {
+            "target": "#test",
+            "author": "human",
+            "ref": "N",
+            "body": "newer human context"
+          }
+        },
+        {
+          "op": "agent_send",
+          "args": {
+            "agent": "A",
+            "target": "#test"
+          }
+        }
+      ],
+      "evidence_queries": [
+        {
+          "id": "draft",
+          "sql": "SELECT draft, cursor FROM freshness WHERE target='#test'",
+          "against": "state.sqlite3"
+        },
+        {
+          "id": "posted",
+          "sql": "SELECT id, body, seq FROM messages WHERE target='#test' ORDER BY seq",
+          "against": "state.sqlite3"
+        }
+      ],
+      "pass_conditions": [
+        {
+          "id": "held",
+          "assert": "agent_send result == freshness hold; draft persisted for #test"
+        },
+        {
+          "id": "bounded_context",
+          "assert": "hold surfaced newer message N plus explicit next action"
+        },
+        {
+          "id": "no_stale_commit",
+          "assert": "no messages row for A's stale body exists before explicit draft send"
+        }
+      ],
+      "fail_signals": [
+        "stale reply commits over N",
+        "draft lost",
+        "hold with no next action",
+        "unbounded context dump"
+      ],
+      "metrics": [
+        "stale_contradictory_reply_rate"
+      ]
+    }
+  ]
+}

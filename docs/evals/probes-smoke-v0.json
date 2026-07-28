@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "owner": "implementation-owned smoke manifest; verifier-owned acceptance rubric remains separate",
+  "default_factors": {
+    "persona_seed": true,
+    "persistent_memory": true,
+    "session_resume": true,
+    "structured_channels_threads": true,
+    "exact_target_id": true,
+    "inbox_routing": true,
+    "claim_lock": true,
+    "task_state_machine": true,
+    "mid_turn_steering": false,
+    "freshness_hold": true,
+    "reminders": true,
+    "shared_timeline": "query_on_demand",
+    "presence_activity": true,
+    "cli_only_action": true,
+    "tool_catalog": "full_local",
+    "scopes_human_commit": true
+  },
+  "scenarios": [
+    {
+      "scenario_id": "S1-empty-workspace-cold-start",
+      "title": "Empty workspace cold start does not invent prior context",
+      "probe": "cold-start-empty",
+      "fixture": {
+        "user_request": "start in an empty local workspace and inspect the inbox/history",
+        "conversation_history": "empty",
+        "agent_count": 1,
+        "agent_name_order": "not applicable"
+      }
+    },
+    {
+      "scenario_id": "P0-cli-only-commit-boundary",
+      "title": "Runtime stdout is not a message transport",
+      "probe": "cli-only-commit",
+      "fixture": {
+        "user_request": "produce stdout and then commit exactly one message through the CLI",
+        "conversation_history": "empty channel created by scenario",
+        "agent_count": 1,
+        "agent_name_order": "not applicable"
+      }
+    },
+    {
+      "scenario_id": "P0-context-compiler-manifest",
+      "title": "Startup context fails closed and emits a versioned manifest",
+      "probe": "startup-context",
+      "fixture": {
+        "user_request": "prepare a turn for a registered agent with seed and memory requirements",
+        "starting_files": "seed workspace generated during scenario",
+        "persona_memory_snapshot": "seed.json and MEMORY.md sha256 emitted in manifest",
+        "agent_count": 1,
+        "agent_name_order": "randomized generated agent suffix"
+      }
+    },
+    {
+      "scenario_id": "S7-freshness-held-draft",
+      "title": "Newer target context holds stale reply as a durable draft",
+      "probe": "freshness-draft",
+      "fixture": {
+        "user_request": "attempt to send an old reply after a newer message lands",
+        "conversation_history": "one baseline message plus one newer inserted owner message",
+        "agent_count": 1,
+        "agent_name_order": "not applicable"
+      }
+    },
+    {
+      "scenario_id": "S6-two-agent-claim-race-smoke",
+      "title": "Two agents cannot both win the same task claim",
+      "probe": "task-claim-conflict",
+      "fixture": {
+        "user_request": "two agents race one todo task claim",
+        "agent_count": 2,
+        "role_assignment": {
+          "alpha-*": "first claimant",
+          "beta-*": "second claimant"
+        },
+        "agent_name_order": "randomized generated agent suffix"
+      }
+    },
+    {
+      "scenario_id": "S8-reminder-after-process-exit-smoke",
+      "title": "Reminder persists and fires after the scheduling command exits",
+      "probe": "reminder-after-exit",
+      "fixture": {
+        "user_request": "schedule a short reminder, exit, then run daemon once to fire it",
+        "conversation_history": "empty channel created by scenario",
+        "agent_count": 1,
+        "agent_name_order": "not applicable"
+      }
+    }
+  ]
+}

@@ -2028,8 +2028,8 @@ def probe_agent_registry(cli: Path, state_dir: Path) -> None:
         "xox" + "p-",
         "sk" + "_agent_",
         "sk" + "_machine_",
-        "transport" + "_secret_",
         "runtime" + "_secret_",
+        "transport" + "_secret_",
         "credential.json contents",
     ]
     for marker in secret_markers:
@@ -3088,8 +3088,8 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
     channel_id = f"C{uuid.uuid4().hex[:8].upper()}"
     bot_token_env = f"SWARM_SLACK_ROUTER_BOT_{uuid.uuid4().hex[:8].upper()}"
     app_token_env = f"SWARM_SLACK_ROUTER_APP_{uuid.uuid4().hex[:8].upper()}"
-    register_probe_agent(cli, state_dir, "ryo")
-    register_probe_agent(cli, state_dir, "dozy")
+    register_probe_agent(cli, state_dir, "worker-a")
+    register_probe_agent(cli, state_dir, "worker-b")
     run(
         cli,
         state_dir,
@@ -3128,9 +3128,9 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
     mock_socket.write_text(
         "\n".join(
             [
-                json.dumps(slack_frame(f"hello @ryo route this {uuid.uuid4()}", root_ts)),
+                json.dumps(slack_frame(f"hello @worker-a route this {uuid.uuid4()}", root_ts)),
                 json.dumps(slack_frame(f"hello @unknown-agent miss this {uuid.uuid4()}", miss_ts)),
-                json.dumps(slack_frame(f"second @ryo event while running {uuid.uuid4()}", second_ts)),
+                json.dumps(slack_frame(f"second @worker-a event while running {uuid.uuid4()}", second_ts)),
             ]
         )
         + "\n"
@@ -3148,37 +3148,37 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
     ).stdout
     require("Slack daemon processed 3 event frame(s)." in routed, "daemon router did not process three mock frames")
 
-    ryo_wake = daemon_wake_row(state_dir, "ryo")
-    require(ryo_wake is not None, "mention did not create a daemon wake row for ryo")
-    require(int(ryo_wake["running"]) == 1, "first mention did not start ryo turn")
-    require(int(ryo_wake["active_wake_count"]) == 1, "ryo active wake count should start at one")
-    require(int(ryo_wake["pending_count"]) == 2, "attention + second mention should batch into ryo pending markers")
-    dozy_wake = daemon_wake_row(state_dir, "dozy")
-    require(dozy_wake is not None and int(dozy_wake["running"]) == 1, "attention routing did not wake dozy")
-    require(dozy_wake["active_reason"] == "attention", "dozy wake should carry attention reason")
-    require(int(dozy_wake["pending_count"]) == 2, "later frames should batch into dozy pending markers")
+    worker_a_wake = daemon_wake_row(state_dir, "worker-a")
+    require(worker_a_wake is not None, "mention did not create a daemon wake row for worker-a")
+    require(int(worker_a_wake["running"]) == 1, "first mention did not start worker-a turn")
+    require(int(worker_a_wake["active_wake_count"]) == 1, "worker-a active wake count should start at one")
+    require(int(worker_a_wake["pending_count"]) == 2, "attention + second mention should batch into worker-a pending markers")
+    worker_b_wake = daemon_wake_row(state_dir, "worker-b")
+    require(worker_b_wake is not None and int(worker_b_wake["running"]) == 1, "attention routing did not wake worker-b")
+    require(worker_b_wake["active_reason"] == "attention", "worker-b wake should carry attention reason")
+    require(int(worker_b_wake["pending_count"]) == 2, "later frames should batch into worker-b pending markers")
     misses = daemon_event_details(state_dir, "wake_route_miss")
     require(any(detail.get("reason") == "mention" for detail in misses), "unregistered @mention did not log route miss")
 
-    listed = run(cli, state_dir, "daemon", "wakes", "--agent", "ryo").stdout
-    require("@ryo running active_turns=1" in listed, "daemon wakes did not render running ryo state")
+    listed = run(cli, state_dir, "daemon", "wakes", "--agent", "worker-a").stdout
+    require("@worker-a running active_turns=1" in listed, "daemon wakes did not render running worker-a state")
     require("pending=2 mention/" in listed, "daemon wakes did not render pending marker")
-    first_finish = run(cli, state_dir, "daemon", "finish-turn", "--agent", "ryo").stdout
-    require("Daemon turn finished for @ryo: promoted." in first_finish, "finish-turn did not promote pending marker")
-    promoted = daemon_wake_row(state_dir, "ryo")
-    require(promoted is not None and int(promoted["running"]) == 1, "promoted ryo wake should still be running")
+    first_finish = run(cli, state_dir, "daemon", "finish-turn", "--agent", "worker-a").stdout
+    require("Daemon turn finished for @worker-a: promoted." in first_finish, "finish-turn did not promote pending marker")
+    promoted = daemon_wake_row(state_dir, "worker-a")
+    require(promoted is not None and int(promoted["running"]) == 1, "promoted worker-a wake should still be running")
     require(int(promoted["active_wake_count"]) == 2, "pending wake was not promoted to second active turn")
     require(int(promoted["pending_count"]) == 0, "pending marker was not cleared on promotion")
-    second_finish = run(cli, state_dir, "daemon", "finish-turn", "--agent", "ryo").stdout
-    require("Daemon turn finished for @ryo: idle." in second_finish, "second finish did not idle ryo")
-    idle = daemon_wake_row(state_dir, "ryo")
-    require(idle is not None and int(idle["running"]) == 0, "ryo wake should be idle after second finish")
+    second_finish = run(cli, state_dir, "daemon", "finish-turn", "--agent", "worker-a").stdout
+    require("Daemon turn finished for @worker-a: idle." in second_finish, "second finish did not idle worker-a")
+    idle = daemon_wake_row(state_dir, "worker-a")
+    require(idle is not None and int(idle["running"]) == 0, "worker-a wake should be idle after second finish")
 
-    # Drain dozy's attention wakes so the reminder section observes a fresh wake.
-    run(cli, state_dir, "daemon", "finish-turn", "--agent", "dozy")
-    run(cli, state_dir, "daemon", "finish-turn", "--agent", "dozy")
-    dozy_idle = daemon_wake_row(state_dir, "dozy")
-    require(dozy_idle is not None and int(dozy_idle["running"]) == 0, "dozy attention wakes did not drain to idle")
+    # Drain worker-b's attention wakes so the reminder section observes a fresh wake.
+    run(cli, state_dir, "daemon", "finish-turn", "--agent", "worker-b")
+    run(cli, state_dir, "daemon", "finish-turn", "--agent", "worker-b")
+    worker_b_idle = daemon_wake_row(state_dir, "worker-b")
+    require(worker_b_idle is not None and int(worker_b_idle["running"]) == 0, "worker-b attention wakes did not drain to idle")
 
     reminder_title = f"wake reminder {uuid.uuid4()}"
     scheduled = run(
@@ -3187,7 +3187,7 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
         "reminder",
         "schedule",
         "--target",
-        "dm:@dozy",
+        "dm:@worker-b",
         "--title",
         reminder_title,
         "--in",
@@ -3195,10 +3195,10 @@ def probe_daemon_wake_router(cli: Path, state_dir: Path) -> None:
     ).stdout
     reminder_id = parse_reminder_id(scheduled)
     run(cli, state_dir, "daemon", "run", "--once")
-    dozy_after = daemon_wake_row(state_dir, "dozy")
-    require(dozy_after is not None, "due reminder did not wake author agent")
-    require(int(dozy_after["running"]) == 1, "reminder wake did not start dozy turn")
-    require(dozy_after["active_reason"] == "reminder", "reminder wake did not use reminder reason")
+    worker_b_after = daemon_wake_row(state_dir, "worker-b")
+    require(worker_b_after is not None, "due reminder did not wake author agent")
+    require(int(worker_b_after["running"]) == 1, "reminder wake did not start worker-b turn")
+    require(worker_b_after["active_reason"] == "reminder", "reminder wake did not use reminder reason")
     reminder_routes = daemon_event_details(state_dir, "wake_route")
     require(
         any(detail.get("source") == "reminder" and detail.get("reminder_id") == reminder_id for detail in reminder_routes),
