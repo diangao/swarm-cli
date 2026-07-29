@@ -61,6 +61,12 @@ root_id = re.search(r"root_message_id[\\\"`: ]+([0-9a-f-]{36})", prompt).group(1
 attempt = int(re.search(r"claim_attempt[\\\"=: ]+(\\d+)", prompt).group(1))
 target = re.search(r"thread[\\\"=: ]+(#[^\\\"\\n ]+)", prompt).group(1)
 task_key = re.search(r"task_key[\\\"=: ]+([a-z0-9_-]+)", prompt).group(1)
+if task_key == "plan":
+    required_contract = (
+        "`acceptance` must be a JSON array of one to eight non-empty criterion strings"
+    )
+    if required_contract not in prompt or "never put objects" not in prompt:
+        raise SystemExit("planner prompt omitted the strict acceptance string-array contract")
 subprocess.run(
     ["swarm", "message", "read", "--channel", target, "--around", root_id[:8]],
     check=True,
@@ -201,6 +207,10 @@ elif mode == "malformed":
 elif mode == "over-budget":
     raw = json.dumps({**base, "tasks": [task], "padding": "x" * 40000})
     expected_code = "PLAN_BUDGET_EXCEEDED"
+elif mode == "acceptance-object":
+    task["acceptance"] = [{"criterion": "This object must be rejected."}]
+    raw = json.dumps({**base, "tasks": [task]}, separators=(",", ":"))
+    expected_code = "PLAN_ACCEPTANCE_INVALID"
 else:
     raise SystemExit(f"unknown invalid-plan mode: {mode}")
 completed = subprocess.run(
@@ -592,6 +602,7 @@ def probe_rejected_plan_variants(parent_dir: Path) -> dict[str, object]:
         "duplicate": "PLAN_TASK_KEY_DUPLICATE",
         "malformed": "PLAN_JSON_INVALID",
         "over-budget": "PLAN_BUDGET_EXCEEDED",
+        "acceptance-object": "PLAN_ACCEPTANCE_INVALID",
     }
     for mode, expected_code in expected_codes.items():
         state_dir = parent_dir / f"invalid-{mode}"
@@ -665,6 +676,7 @@ def probe_rejected_plan_variants(parent_dir: Path) -> dict[str, object]:
         "duplicate_task_key_fail_closed": "PASS",
         "malformed_current_plan_fail_closed": "PASS",
         "over_budget_plan_fail_closed": "PASS",
+        "acceptance_object_plan_fail_closed": "PASS",
     }
 
 
