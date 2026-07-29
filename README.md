@@ -51,7 +51,7 @@ Current implemented surface:
 - `swarm agent collab-smoke --channel ... --task-author ... --worker ... --verifier ...` to exercise the A→B→C task/report/verify path in canonical state
 - Ordinary human Slack events entering `swarm daemon resident --workspace ...` now follow the live orchestration path automatically: durable ingest → metadata-only worker notices → capability route/claim → owner-only body query → native runtime turn → freshness-aware thread result/receipt → restart recovery. Simple greetings route to one owner; substantive goals can use the dissect/research/execute/verify/receipt lanes. The execute owner publishes one validated workspace-relative artifact path/SHA-256; non-execute lanes reference that exact artifact, and unavailable verification waits without rebuilding.
 - `swarm agent orchestrate --channel ... --message-id ... [--max-workers ...]` exposes the same state-backed path as a replay/manual inspection seam; it is not a separate scripted demo path.
-- `SWARM_DYNAMIC_TASKS_V1=1` enables the gated resumable, emergent-task path for ordinary human Slack roots. A claimed native bootstrap turn contributes the first validated variable `tasks[]`; any later claimed owner may append genuinely new work during its own fenced turn. Every accepted task is a visible message-backed task, create and claim remain separate, and open or capability-matched seats self-select through atomic claims. A task that needs more than one model turn persists a bounded checkpoint/next action, resumes the same task-owned harness session, and re-wakes the same owner+attempt until a typed `complete`, `held`, or `failed` verdict. The default remains the frozen fixed-lane path while this feature is independently gated.
+- `SWARM_DYNAMIC_TASKS_V1=1` enables the gated resumable, emergent-task path for ordinary human Slack roots. A claimed native bootstrap turn contributes the first validated variable `tasks[]`; any later claimed owner may append genuinely new work during its own fenced turn. Every accepted task is a visible message-backed task, create and claim remain separate, and open or capability-matched seats self-select through atomic claims. A task that needs more than one model turn persists a bounded checkpoint/next action, resumes the same task-owned harness session, and re-wakes the same owner+attempt until a typed `complete`, `held`, or `failed` verdict. While a native turn is live, the daemon renews its 60-second task lease every 15 seconds under the exact run+graph+task+owner+attempt+turn fence; a dead owner still becomes claimable after the unchanged lease timeout. The default remains the frozen fixed-lane path while this feature is independently gated.
 - `swarm agent dynamic-start --channel ... --message-id ...` creates or idempotently reopens a dynamic planning run for a human root.
 - `swarm agent task-claim --run-id ... --graph-version ... --task-key ... --expected-attempt ... --agent ...` exposes the cheap seat-local claim preflight and fencing attempt.
 - `swarm agent plan-commit --run-id ... --attempt ...` accepts typed plan JSON on stdin only from the current live planner turn after its explicit owner read.
@@ -155,6 +155,7 @@ python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-consult-old
 python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json
 python3 scripts/consult_old_evidence_probe.py
 python3 scripts/dynamic_task_probe.py
+python3 scripts/dynamic_turn_lease_probe.py
 python3 scripts/resumable_emergent_probe.py
 ```
 
@@ -245,6 +246,10 @@ same-turn appends and a global over-budget append without mutating existing
 tasks, while checking metadata-only notice fan-out and 0/0/0/0 losing-claim
 economics. A separate chain emits eight consecutive continue verdicts and must
 end in an explicit budget hold with exactly one terminal escalation receipt.
+`scripts/dynamic_turn_lease_probe.py` accelerates the lease clock for routine
+regression and proves a running native turn renews under one owner, attempt,
+and turn without takeover; `--real-ttl` holds the same turn beyond the
+production 60-second lease before completing under attempt one.
 The neutral locked contracts are
 `docs/evals/scenario-long-horizon-continuation-v1.json` and
 `docs/evals/scenario-open-task-creation-v1.json`.

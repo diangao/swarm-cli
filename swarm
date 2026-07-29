@@ -6098,6 +6098,7 @@ def prepare_daemon_turn(
         consumes_wake = bool(wake is not None and wake.get("running"))
         wake_context_head_seq: int | None = None
         dynamic_task_selected = False
+        dynamic_binding: dict[str, Any] | None = None
         dynamic_session_id: str | None = None
         input_message_id = payload_fields.get("input_message_id")
         input_text = explicit_input if explicit_input is not None else payload_fields.get("input_text", "")
@@ -6129,6 +6130,12 @@ def prepare_daemon_turn(
                             "code": "CLAIM_REQUIRED",
                         }
                     dynamic_task_selected = True
+                    dynamic_binding = {
+                        "run_id": run_id,
+                        "graph_version": graph_version,
+                        "task_key": task_key,
+                        "attempt": attempt,
+                    }
                     dynamic_session_id = (
                         str(task.get("session_id") or "").strip() or None
                     )
@@ -6585,6 +6592,19 @@ def prepare_daemon_turn(
             "turn_started",
             {"id": turn_id, "agent": agent_name, "dispatch_id": dispatch_id, "session_id": session_id},
         )
+        if dynamic_binding is not None:
+            append_daemon_event(
+                state,
+                "orchestration_dynamic_turn_bound",
+                {
+                    **dynamic_binding,
+                    "agent": agent_name,
+                    "turn_id": turn_id,
+                    "root_message_id": input_message_id,
+                    "binding_persisted": True,
+                    "body_present": False,
+                },
+            )
         return {
             "turn_id": turn_id,
             "agent": agent_name,
@@ -6599,9 +6619,34 @@ def prepare_daemon_turn(
             "input_message_id": input_message_id,
             "input_text": input_text,
             "session_id": session_id,
+            "dynamic_binding": dynamic_binding,
         }
 
     return with_mutable_state_value(action)
+
+
+def dynamic_turn_binding(
+    state: dict[str, Any],
+    turn_id: int,
+    agent_name: str | None = None,
+) -> dict[str, Any] | None:
+    return next(
+        (
+            detail
+            for detail in reversed(
+                orchestration_event_details(
+                    state,
+                    "orchestration_dynamic_turn_bound",
+                )
+            )
+            if int(detail.get("turn_id") or 0) == turn_id
+            and (
+                agent_name is None
+                or str(detail.get("agent") or "") == agent_name
+            )
+        ),
+        None,
+    )
 
 
 def dynamic_task_for_turn(
@@ -7233,21 +7278,45 @@ def finalize_daemon_turn(
                     error_text,
                 )
         dynamic_root_id = str(turn.get("input_message_id") or "")
-        dynamic_run = (
-            dynamic_run_for_root(state, dynamic_root_id)
-            if dynamic_root_id
-            else None
-        )
-        dynamic_task = (
-            dynamic_task_for_turn(
+        binding = dynamic_turn_binding(state, turn_id, agent_name)
+        dynamic_run = None
+        dynamic_task = None
+        if binding is not None:
+            bound_run = dynamic_run_by_id(
                 state,
-                dynamic_run,
-                agent_name,
-                turn_id,
+                str(binding.get("run_id") or ""),
             )
-            if dynamic_run is not None
-            else None
-        )
+            bound_task = dynamic_task_by_key(
+                state,
+                str(binding.get("run_id") or ""),
+                int(binding.get("graph_version") or 0),
+                str(binding.get("task_key") or ""),
+            )
+            if (
+                bound_run is not None
+                and bound_task is not None
+                and dynamic_root_id
+                == str(bound_run.get("root_message_id") or "")
+            ):
+                dynamic_run = bound_run
+                dynamic_task = dict(bound_task)
+                dynamic_task["attempt"] = int(
+                    binding.get("attempt") or 0
+                )
+        elif dynamic_root_id:
+            # Backward-compatible recovery for turns created before persistent
+            # dynamic turn bindings existed.
+            dynamic_run = dynamic_run_for_root(state, dynamic_root_id)
+            dynamic_task = (
+                dynamic_task_for_turn(
+                    state,
+                    dynamic_run,
+                    agent_name,
+                    turn_id,
+                )
+                if dynamic_run is not None
+                else None
+            )
         if (
             dispatch_error is None
             and dispatch_id is None
@@ -7929,6 +7998,55 @@ def execute_daemon_turn(
     stderr_text = ""
     error_text = None
     completed_session_id = None
+    heartbeat_stop = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
+    dynamic_binding = prepared.get("dynamic_binding")
+    if isinstance(dynamic_binding, dict):
+        heartbeat_interval = min(
+            float(DYNAMIC_TURN_HEARTBEAT_INTERVAL_SECONDS),
+            max(0.1, float(DYNAMIC_CLAIM_LEASE_SECONDS) / 3.0),
+        )
+
+        def heartbeat_loop() -> None:
+            while not heartbeat_stop.wait(heartbeat_interval):
+                try:
+                    renewal = renew_dynamic_turn_lease(
+                        int(prepared["turn_id"]),
+                        str(prepared["agent"]),
+                        str(dynamic_binding["run_id"]),
+                        int(dynamic_binding["graph_version"]),
+                        str(dynamic_binding["task_key"]),
+                        int(dynamic_binding["attempt"]),
+                    )
+                except Exception as exc:
+                    try:
+                        daemon_record_event(
+                            "orchestration_dynamic_turn_lease_renewal_error",
+                            {
+                                "run_id": dynamic_binding["run_id"],
+                                "graph_version": dynamic_binding[
+                                    "graph_version"
+                                ],
+                                "task_key": dynamic_binding["task_key"],
+                                "agent": prepared["agent"],
+                                "attempt": dynamic_binding["attempt"],
+                                "turn_id": prepared["turn_id"],
+                                "error_type": type(exc).__name__,
+                                "lease_mutated": False,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    continue
+                if not renewal.get("renewed"):
+                    break
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_loop,
+            name=f"dynamic-turn-heartbeat-{prepared['turn_id']}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
     try:
         completed = subprocess.run(
             prepared["command"],
@@ -7967,6 +8085,10 @@ def execute_daemon_turn(
         error_text = f"runtime spawn failed: {type(exc).__name__}"
         stdout_text = None
         stderr_text = None
+    finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=2)
 
     if status == "blocked":
         daemon_record_event(
@@ -9213,6 +9335,7 @@ DYNAMIC_TASK_CREATE_MAX_BYTES = 32 * 1024
 DYNAMIC_TASK_MAX_COUNT = 8
 DYNAMIC_GRAPH_MAX_COUNT = 32
 DYNAMIC_CLAIM_LEASE_SECONDS = 60
+DYNAMIC_TURN_HEARTBEAT_INTERVAL_SECONDS = 15
 DYNAMIC_MAX_TURNS_DEFAULT = 8
 DYNAMIC_SHAPE_STEER_MARKERS = (
     "add a task",
@@ -9685,6 +9808,139 @@ def dynamic_claim_lease_expires_at(now: str, seconds: int) -> str:
         datetime.strptime(now, "%Y-%m-%d %H:%M:%S")
         + timedelta(seconds=seconds)
     ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def renew_dynamic_turn_lease(
+    turn_id: int,
+    agent_name: str,
+    run_id: str,
+    graph_version: int,
+    task_key: str,
+    attempt: int,
+) -> dict[str, Any]:
+    def action(state: dict[str, Any]) -> dict[str, Any]:
+        turn = next(
+            (
+                row
+                for row in state.get("daemon_turns", [])
+                if int(row.get("id") or 0) == turn_id
+            ),
+            None,
+        )
+        run = dynamic_run_by_id(state, run_id)
+        task = dynamic_task_by_key(
+            state,
+            run_id,
+            graph_version,
+            task_key,
+        )
+        reason = None
+        if turn is None:
+            reason = "turn_missing"
+        elif str(turn.get("status") or "") != "running":
+            reason = "turn_not_running"
+        elif str(turn.get("agent") or "") != agent_name:
+            reason = "turn_agent_mismatch"
+        elif run is None:
+            reason = "run_missing"
+        elif task is None:
+            reason = "task_missing"
+        elif str(turn.get("input_message_id") or "") != str(
+            run.get("root_message_id") or ""
+        ):
+            reason = "turn_root_mismatch"
+        elif str(task.get("owner") or "") != agent_name:
+            reason = "owner_mismatch"
+        elif int(task.get("attempt") or 0) != attempt:
+            reason = "attempt_mismatch"
+        elif str(task.get("state") or "") not in {"claimed", "running"}:
+            reason = "task_not_running"
+        else:
+            binding = dynamic_turn_binding(state, turn_id, agent_name)
+            matching_bindings = [
+                detail
+                for detail in orchestration_event_details(
+                    state,
+                    "orchestration_dynamic_turn_bound",
+                    run_id,
+                )
+                if int(detail.get("graph_version") or 0) == graph_version
+                and str(detail.get("task_key") or "") == task_key
+                and int(detail.get("attempt") or 0) == attempt
+            ]
+            if (
+                binding is None
+                or str(binding.get("run_id") or "") != run_id
+                or int(binding.get("graph_version") or 0)
+                != graph_version
+                or str(binding.get("task_key") or "") != task_key
+                or int(binding.get("attempt") or 0) != attempt
+                or not matching_bindings
+                or int(matching_bindings[-1].get("turn_id") or 0)
+                != turn_id
+            ):
+                reason = "turn_task_fence_mismatch"
+        if reason is not None:
+            append_daemon_event(
+                state,
+                "orchestration_dynamic_turn_lease_renewal_stopped",
+                {
+                    "run_id": run_id,
+                    "graph_version": graph_version,
+                    "task_key": task_key,
+                    "agent": agent_name,
+                    "attempt": attempt,
+                    "turn_id": turn_id,
+                    "reason": reason,
+                    "lease_mutated": False,
+                },
+            )
+            return {"renewed": False, "reason": reason}
+
+        assert run is not None
+        assert task is not None
+        now = current_timestamp()
+        previous_lease = str(task.get("lease_expires_at") or "")
+        renewed_lease = dynamic_claim_lease_expires_at(
+            now,
+            DYNAMIC_CLAIM_LEASE_SECONDS,
+        )
+        task["state"] = "running"
+        task["last_heartbeat_at"] = now
+        task["lease_expires_at"] = renewed_lease
+        task["updated_at"] = now
+        if task_key == DYNAMIC_PLAN_TASK_KEY:
+            run["plan_lease_expires_at"] = renewed_lease
+        run["updated_at"] = now
+        append_daemon_event(
+            state,
+            "orchestration_dynamic_turn_lease_renewed",
+            {
+                "run_id": run_id,
+                "graph_version": graph_version,
+                "task_key": task_key,
+                "task_number": task["task_number"],
+                "agent": agent_name,
+                "attempt": attempt,
+                "turn_id": turn_id,
+                "previous_lease_expires_at": previous_lease,
+                "lease_expires_at": renewed_lease,
+                "heartbeat_at": now,
+                "heartbeat_interval_seconds": (
+                    DYNAMIC_TURN_HEARTBEAT_INTERVAL_SECONDS
+                ),
+                "lease_ttl_seconds": DYNAMIC_CLAIM_LEASE_SECONDS,
+                "same_owner_attempt": True,
+                "turn_live": True,
+                "body_present": False,
+            },
+        )
+        return {
+            "renewed": True,
+            "lease_expires_at": renewed_lease,
+        }
+
+    return with_mutable_state_value(action)
 
 
 def claim_dynamic_task_in_state(

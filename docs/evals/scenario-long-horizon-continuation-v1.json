@@ -9,6 +9,7 @@
     { "id": "checkpoint_durability_and_scope", "assert": "each continue verdict persists a checkpoint and next_action that survive restart; checkpoint content is refs/hashes/progress-state only - no chain-of-thought, no message bodies, no prompts (privacy bar applies to every checkpoint in the chain)." },
     { "id": "resume_same_session_provenance", "assert": "turn N+1 provably resumes the same harness session as turn N (session id continuity in the trace for both Codex exec/resume and Claude resume adapters); a restarted-fresh session where resume was possible fails; the resumed turn's work demonstrably builds on the checkpoint rather than re-planning from scratch." },
     { "id": "single_ownership_across_turns", "assert": "the whole turn chain runs under one task_id+attempt fence; re-wakes are runtime-scheduled and fenced; no second owner or duplicate execution appears mid-chain while the lease is live and heartbeating." },
+    { "id": "lease_renewal_during_turn", "assert": "a native turn running within its deadline continuously renews its task lease under the same owner+attempt+turn fence at intervals shorter than the lease TTL; lease-expiry takeover fires only after heartbeats stop, never against a running turn; a live owner re-claiming itself or any attempt churn while its turn remains alive fails." },
     { "id": "budget_exhaustion_explicit_hold", "assert": "exhausting the per-task turn budget (default 8) produces an explicit HELD state with a human-visible escalation receipt; the task never silently dies, never loops past budget, and never converts exhaustion into a claimed completion." },
     { "id": "crash_restart_chain_integrity", "assert": "a crash or daemon restart mid-chain resumes from the last durable checkpoint: no completed turn re-executes, no checkpoint is lost, no duplicate receipts; a duplicate wake for a chain in progress is idempotent (single live turn per task at any moment)." },
     { "id": "takeover_late_result_fencing", "assert": "after lease-expiry takeover mid-chain, the new owner resumes from the last durable checkpoint under an incremented attempt; any late result/receipt/checkpoint from the old attempt is rejected by the fence and recorded." },
@@ -21,11 +22,12 @@
     "checkpoint lost on restart, or checkpoint containing CoT/bodies/prompts",
     "fresh session started where resume was possible",
     "second live turn for one task, or duplicate execution mid-chain",
+    "a live native turn outlasts its task lease, re-claims itself, or changes attempt before ending",
     "budget exhaustion silently dying or claiming completion",
     "late old-attempt write landing after takeover",
     "stale output committed after a steer",
     "task ended per-turn (chain not continued) despite a continue verdict"
   ],
-  "metrics": ["turns_per_completed_task", "checkpoint_resume_latency", "chain_completion_rate", "budget_hold_rate", "stale_write_rejections"],
+  "metrics": ["turns_per_completed_task", "checkpoint_resume_latency", "lease_renewal_gap", "chain_completion_rate", "budget_hold_rate", "stale_write_rejections"],
   "regression_floor": "All 15 orchestration conditions and all 11 dynamic-task-graph conditions remain binding on the same SHA; the live rerun matrix (2/3/5 graphs, human root, real steer, live fence, escalation, freeze-window audit) still gates final ready."
 }
