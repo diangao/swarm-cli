@@ -156,6 +156,7 @@ python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-o
 python3 scripts/consult_old_evidence_probe.py
 python3 scripts/dynamic_task_probe.py
 python3 scripts/dynamic_turn_lease_probe.py
+python3 scripts/startup_reconciliation_probe.py
 python3 scripts/resumable_emergent_probe.py
 ```
 
@@ -250,6 +251,16 @@ end in an explicit budget hold with exactly one terminal escalation receipt.
 regression and proves a running native turn renews under one owner, attempt,
 and turn without takeover; `--real-ttl` holds the same turn beyond the
 production 60-second lease before completing under attempt one.
+`scripts/startup_reconciliation_probe.py` launches a real resident and owner
+runtime in one process group, kills that group after the owner-only read while
+the task turn is still running, then starts a fresh resident. Before scheduling,
+startup performs one atomic reconciliation transaction: stale running turns
+receive metadata-only terminal audit records, orphaned dynamic owner wakes are
+retired (including stale promoted candidate wakes), bound tasks reopen without
+rewriting prior attempt evidence, and fresh notices are emitted. The probe
+requires the replacement to win under the next attempt and complete without an
+orphan-wake error loop or quarantine, while the entire pre-restart event ledger
+remains an exact prefix.
 The neutral locked contracts are
 `docs/evals/scenario-long-horizon-continuation-v1.json` and
 `docs/evals/scenario-open-task-creation-v1.json`.

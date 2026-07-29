@@ -8608,6 +8608,341 @@ def process_dynamic_timeouts_once() -> int:
     return with_mutable_state(action)
 
 
+def reconcile_resident_startup_state() -> dict[str, int]:
+    """Fail closed transient work left behind by a prior resident process."""
+
+    def action(state: dict[str, Any]) -> dict[str, int]:
+        now = current_timestamp()
+        stale_turns = [
+            row
+            for row in state.get("daemon_turns", [])
+            if str(row.get("status") or "") == "running"
+        ]
+        stale_agents = {
+            str(row.get("agent") or "")
+            for row in stale_turns
+            if str(row.get("agent") or "")
+        }
+        reopened: dict[
+            tuple[str, int, str],
+            tuple[dict[str, Any], dict[str, Any]],
+        ] = {}
+        retired_wakes = 0
+        requeued_dispatches = 0
+
+        def remember_open_task(
+            run: dict[str, Any] | None,
+            task: dict[str, Any] | None,
+        ) -> None:
+            if (
+                run is None
+                or task is None
+                or str(run.get("state") or "")
+                in {"held", "done", "failed", "canceled"}
+            ):
+                return
+            task_state = str(task.get("state") or "")
+            if task_state in {"claimed", "running"}:
+                previous_owner = task.get("owner")
+                previous_attempt = int(task.get("attempt") or 0)
+                task["state"] = "open"
+                task["owner"] = None
+                task["last_heartbeat_at"] = None
+                task["lease_expires_at"] = dynamic_claim_lease_expires_at(
+                    now,
+                    DYNAMIC_CLAIM_LEASE_SECONDS,
+                )
+                task["updated_at"] = now
+                generic = next(
+                    (
+                        row
+                        for row in state.get("tasks", [])
+                        if int(row.get("number") or 0)
+                        == int(task["task_number"])
+                    ),
+                    None,
+                )
+                if generic is not None:
+                    generic["assignee"] = None
+                    generic["status"] = "todo"
+                    generic["updated_at"] = now
+                if str(task.get("task_key") or "") == DYNAMIC_PLAN_TASK_KEY:
+                    run["plan_owner"] = None
+                    run["plan_lease_expires_at"] = None
+                append_daemon_event(
+                    state,
+                    "orchestration_dynamic_startup_reopened",
+                    {
+                        "run_id": run["run_id"],
+                        "graph_version": task["graph_version"],
+                        "task_key": task["task_key"],
+                        "task_number": task["task_number"],
+                        "previous_owner": previous_owner,
+                        "previous_attempt": previous_attempt,
+                        "next_expected_attempt": previous_attempt,
+                        "reason": "resident_restart",
+                        "body_present": False,
+                    },
+                )
+            if str(task.get("state") or "") != "open":
+                return
+            task["lease_expires_at"] = dynamic_claim_lease_expires_at(
+                now,
+                DYNAMIC_CLAIM_LEASE_SECONDS,
+            )
+            task["updated_at"] = now
+            key = (
+                str(run["run_id"]),
+                int(task["graph_version"]),
+                str(task["task_key"]),
+            )
+            reopened[key] = (run, task)
+
+        for turn in stale_turns:
+            turn_id = int(turn["id"])
+            agent_name = str(turn["agent"])
+            root_id = str(turn.get("input_message_id") or "")
+            binding = dynamic_turn_binding(state, turn_id, agent_name)
+            run = None
+            task = None
+            bound_attempt = None
+            if binding is not None:
+                run = dynamic_run_by_id(
+                    state,
+                    str(binding.get("run_id") or ""),
+                )
+                task = dynamic_task_by_key(
+                    state,
+                    str(binding.get("run_id") or ""),
+                    int(binding.get("graph_version") or 0),
+                    str(binding.get("task_key") or ""),
+                )
+                bound_attempt = int(binding.get("attempt") or 0)
+            elif root_id:
+                run = dynamic_run_for_root(state, root_id)
+                task = (
+                    dynamic_task_for_turn(
+                        state,
+                        run,
+                        agent_name,
+                        turn_id,
+                    )
+                    if run is not None
+                    else None
+                )
+                bound_attempt = (
+                    int(task.get("attempt") or 0)
+                    if task is not None
+                    else None
+                )
+
+            turn["status"] = "failed"
+            turn["updated_at"] = now
+            turn["finished_at"] = now
+            turn["exit_code"] = 1
+            turn["error"] = "resident restarted before turn completion"
+            append_daemon_event(
+                state,
+                "resident_startup_turn_reconciled",
+                {
+                    "turn_id": turn_id,
+                    "agent": agent_name,
+                    "dispatch_id": turn.get("dispatch_id"),
+                    "run_id": (
+                        str(run.get("run_id") or "")
+                        if run is not None
+                        else None
+                    ),
+                    "graph_version": (
+                        int(task.get("graph_version") or 0)
+                        if task is not None
+                        else None
+                    ),
+                    "task_key": (
+                        str(task.get("task_key") or "")
+                        if task is not None
+                        else None
+                    ),
+                    "attempt": bound_attempt,
+                    "prior_status": "running",
+                    "terminal_status": "failed",
+                    "reason": "resident_restart",
+                    "body_present": False,
+                },
+            )
+            append_daemon_event(
+                state,
+                "turn_finished",
+                {
+                    "id": turn_id,
+                    "agent": agent_name,
+                    "status": "failed",
+                    "dynamic_run_id": (
+                        str(run.get("run_id") or "")
+                        if run is not None
+                        else None
+                    ),
+                    "dynamic_task_key": (
+                        str(task.get("task_key") or "")
+                        if task is not None
+                        else None
+                    ),
+                    "dynamic_attempt": bound_attempt,
+                    "message_id": None,
+                    "freshness_held": False,
+                    "continuation_requeued": False,
+                    "typed_verdict": None,
+                    "reconciled_at_startup": True,
+                    "reason": "resident_restart",
+                    "body_present": False,
+                },
+            )
+            remember_open_task(run, task)
+
+            dispatch_id = turn.get("dispatch_id")
+            if dispatch_id is not None:
+                dispatch = find_dispatch(state, int(dispatch_id))
+                if (
+                    dispatch is not None
+                    and str(dispatch.get("status") or "") == "leased"
+                    and dispatch.get("lease_owner")
+                ):
+                    dispatch_error = finish_dispatch_after_turn(
+                        state,
+                        dispatch,
+                        str(dispatch["lease_owner"]),
+                        False,
+                        "resident restarted before turn completion",
+                    )
+                    if dispatch_error is None:
+                        requeued_dispatches += 1
+
+        for wake in state.get("daemon_wakes", []):
+            if int(wake.get("running") or 0) != 1:
+                continue
+            agent_name = str(wake.get("agent_name") or "")
+            active_reason = str(wake.get("active_reason") or "")
+            owner_binding = parse_dynamic_owner_reason(active_reason)
+            should_retire = agent_name in stale_agents or owner_binding is not None
+            if not should_retire:
+                continue
+            if owner_binding is not None:
+                run_id, graph_version, task_key, _attempt = owner_binding
+                run = dynamic_run_by_id(state, run_id)
+                task = dynamic_task_by_key(
+                    state,
+                    run_id,
+                    graph_version,
+                    task_key,
+                )
+                remember_open_task(run, task)
+            prior_reason = active_reason
+            wake_status, _wake_error = finish_daemon_wake(
+                state,
+                agent_name,
+            )
+            retired_wakes += 1
+            append_daemon_event(
+                state,
+                "resident_startup_wake_reconciled",
+                {
+                    "agent": agent_name,
+                    "prior_reason": prior_reason,
+                    "wake_status": wake_status,
+                    "reason": "resident_restart",
+                    "body_present": False,
+                },
+            )
+            while int(wake.get("running") or 0) == 1:
+                prior_reason = str(wake.get("active_reason") or "")
+                promoted_owner = parse_dynamic_owner_reason(prior_reason)
+                promoted_notice = parse_dynamic_notice_reason(prior_reason)
+                if promoted_owner is None and promoted_notice is None:
+                    break
+                promoted_binding = promoted_owner or promoted_notice
+                assert promoted_binding is not None
+                run_id, graph_version, task_key, _attempt = promoted_binding
+                run = dynamic_run_by_id(state, run_id)
+                task = dynamic_task_by_key(
+                    state,
+                    run_id,
+                    graph_version,
+                    task_key,
+                )
+                remember_open_task(run, task)
+                wake_status, _wake_error = finish_daemon_wake(
+                    state,
+                    agent_name,
+                )
+                retired_wakes += 1
+                append_daemon_event(
+                    state,
+                    "resident_startup_wake_reconciled",
+                    {
+                        "agent": agent_name,
+                        "prior_reason": prior_reason,
+                        "wake_status": wake_status,
+                        "reason": "resident_restart",
+                        "body_present": False,
+                    },
+                )
+
+        for run, task in reopened.values():
+            emit_dynamic_task_notices(state, run, task)
+
+        remaining_running_turns = sum(
+            1
+            for row in state.get("daemon_turns", [])
+            if str(row.get("status") or "") == "running"
+        )
+        orphan_owner_wakes = 0
+        for wake in state.get("daemon_wakes", []):
+            if int(wake.get("running") or 0) != 1:
+                continue
+            parsed = parse_dynamic_owner_reason(
+                str(wake.get("active_reason") or "")
+            )
+            if parsed is None:
+                continue
+            run_id, graph_version, task_key, attempt = parsed
+            task = dynamic_task_by_key(
+                state,
+                run_id,
+                graph_version,
+                task_key,
+            )
+            if (
+                task is None
+                or str(task.get("state") or "")
+                not in {"claimed", "running"}
+                or str(task.get("owner") or "")
+                != str(wake.get("agent_name") or "")
+                or int(task.get("attempt") or 0) != attempt
+            ):
+                orphan_owner_wakes += 1
+
+        summary = {
+            "stale_turns_terminated": len(stale_turns),
+            "owner_wakes_retired": retired_wakes,
+            "tasks_reopened": len(reopened),
+            "dispatches_requeued": requeued_dispatches,
+            "remaining_running_turns": remaining_running_turns,
+            "orphan_owner_wakes": orphan_owner_wakes,
+        }
+        append_daemon_event(
+            state,
+            "resident_startup_reconciled",
+            {
+                **summary,
+                "scheduling_started": False,
+                "body_present": False,
+            },
+        )
+        return summary
+
+    return with_mutable_state_value(action)
+
+
 def pending_outbound_targets(workspace: str) -> list[str]:
     def action(state: dict[str, Any]) -> list[str]:
         if slack_workspace_by_id(state, workspace) is None:
@@ -8657,6 +8992,23 @@ def command_daemon_resident(argv: list[str]) -> int:
     socket_window = arg_value(argv, "--socket-window") or "20s"
     max_events = arg_value(argv, "--max-events") or "10"
 
+    startup_summary = reconcile_resident_startup_state()
+    if (
+        int(startup_summary["remaining_running_turns"]) != 0
+        or int(startup_summary["orphan_owner_wakes"]) != 0
+    ):
+        daemon_record_event(
+            "resident_startup_reconciliation_failed",
+            {
+                **startup_summary,
+                "scheduling_started": False,
+                "body_present": False,
+            },
+        )
+        return write_stderr(
+            "Error: resident startup reconciliation left transient owners\n"
+            "Code: STARTUP_RECONCILIATION_FAILED\n"
+        )
     set_all_agents_presence("idle")
     daemon_record_event("resident_started", {"loops": loops, "workspace": workspace or ""})
     iterations = 0
