@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "scenario_id": "open-task-creation-v1",
+  "title": "Any claimed owner can append new tasks mid-execution: creation separated from claiming, append-only graph, no auto-ownership, full notice fan-out",
+  "owner_note": "Verifier-owned acceptance addendum extending the dynamic task graph contract. Locked before implementation completes, per lockstep. The initial planner becomes the first contributor of tasks; every claimed owner is an equal contributor thereafter.",
+  "pass_conditions": [
+    {
+      "id": "any_owner_task_create",
+      "assert": "a claimed owner, mid-execution, appends one or more new tasks via the same typed create path the planner uses; the appended tasks carry creator provenance (creating seat + turn id); at least one acceptance run shows a task created by a NON-planner seat; a build where only the planner can create fails."
+    },
+    {
+      "id": "create_claim_separation",
+      "assert": "an appended task enters open state unowned; the creator does NOT automatically own its child; if the creator wants it, it claims through the same atomic race as everyone else, and at least one run shows a child task won by a different seat than its creator."
+    },
+    {
+      "id": "append_only_graph_integrity",
+      "assert": "the graph grows append-only: existing tasks are never retroactively mutated by a creator; appended tasks respect the same budget and duplicate-key guards as planner tasks (over-budget append is rejected with an auditable record); replay/restart does not duplicate appended tasks (idempotency key covers appended entries)."
+    },
+    {
+      "id": "append_notice_fanout",
+      "assert": "an appended task fans out capability-matched metadata-only notices exactly like planner tasks: no side-channel assignment, no body in the notice, declining seats keep zero body-reads and zero model turns."
+    },
+    {
+      "id": "phase_and_fence_inheritance",
+      "assert": "appended tasks declare their phase and honor phase barriers; results on appended tasks carry the same owner+attempt fencing and exact-once receipt rules as planner tasks."
+    }
+  ],
+  "fail_signals": [
+    "only the planner can create tasks in the live path",
+    "a creator auto-owns its child without an atomic claim",
+    "an append mutates an existing task retroactively",
+    "an appended task bypasses budget, dedup, notice fan-out, fencing, or receipt rules",
+    "replay duplicates appended tasks"
+  ],
+  "metrics": [
+    "non_planner_created_task_ratio",
+    "creator_child_ownership_rate",
+    "append_notice_latency"
+  ],
+  "regression_floor": "All previously gated conditions (orchestration 15, dynamic graph 11, continuation 10) remain binding on the same SHA."
+}

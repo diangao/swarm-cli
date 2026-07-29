@@ -51,10 +51,12 @@ Current implemented surface:
 - `swarm agent collab-smoke --channel ... --task-author ... --worker ... --verifier ...` to exercise the A→B→C task/report/verify path in canonical state
 - Ordinary human Slack events entering `swarm daemon resident --workspace ...` now follow the live orchestration path automatically: durable ingest → metadata-only worker notices → capability route/claim → owner-only body query → native runtime turn → freshness-aware thread result/receipt → restart recovery. Simple greetings route to one owner; substantive goals can use the dissect/research/execute/verify/receipt lanes. The execute owner publishes one validated workspace-relative artifact path/SHA-256; non-execute lanes reference that exact artifact, and unavailable verification waits without rebuilding.
 - `swarm agent orchestrate --channel ... --message-id ... [--max-workers ...]` exposes the same state-backed path as a replay/manual inspection seam; it is not a separate scripted demo path.
-- `SWARM_DYNAMIC_TASKS_V1=1` enables the gated emergent-task path for ordinary human Slack roots. A claimed native planner turn commits a validated variable `tasks[]` graph; capability-matching seats receive metadata-only notices and self-select through atomic claims. The default remains the frozen fixed-lane path while this feature is independently gated.
+- `SWARM_DYNAMIC_TASKS_V1=1` enables the gated resumable, emergent-task path for ordinary human Slack roots. A claimed native bootstrap turn contributes the first validated variable `tasks[]`; any later claimed owner may append genuinely new work during its own fenced turn. Every accepted task is a visible message-backed task, create and claim remain separate, and open or capability-matched seats self-select through atomic claims. A task that needs more than one model turn persists a bounded checkpoint/next action, resumes the same task-owned harness session, and re-wakes the same owner+attempt until a typed `complete`, `held`, or `failed` verdict. The default remains the frozen fixed-lane path while this feature is independently gated.
 - `swarm agent dynamic-start --channel ... --message-id ...` creates or idempotently reopens a dynamic planning run for a human root.
 - `swarm agent task-claim --run-id ... --graph-version ... --task-key ... --expected-attempt ... --agent ...` exposes the cheap seat-local claim preflight and fencing attempt.
 - `swarm agent plan-commit --run-id ... --attempt ...` accepts typed plan JSON on stdin only from the current live planner turn after its explicit owner read.
+- `swarm agent task-create --run-id ... --graph-version ... --parent-task-key ... --attempt ...` accepts a typed append batch only from the current claimed owner turn. New rows carry creator/parent provenance, are visible and unowned, and reuse the normal notice/claim/fence path.
+- `swarm agent task-progress-commit --run-id ... --graph-version ... --task-key ... --attempt ...` records exactly one typed `continue|complete|held|failed` verdict for the current turn. `continue` requires a privacy-scoped checkpoint and non-empty next action. `complete` requires zero-based `checkpoint.acceptance_evidence` coverage for every declared acceptance criterion; prose alone cannot complete a task. The default eight-turn budget ends in an explicit hold.
 - `swarm agent dynamic-list [--run-id ...] [--json]` inspects dynamic runs, tasks, attempts, leases, and receipts.
 - `swarm slack configure --workspace ... --bot-token-env ... [--signing-secret-env ...] [--app-token-env ...]`
 - `swarm slack env --workspace ...`
@@ -153,6 +155,7 @@ python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-consult-old
 python3 scripts/behavior_eval_loop.py --manifest docs/evals/scenario-chat-task-orchestration.json
 python3 scripts/consult_old_evidence_probe.py
 python3 scripts/dynamic_task_probe.py
+python3 scripts/resumable_emergent_probe.py
 ```
 
 The local implementation stores state in `state.sqlite3`. By default it uses
@@ -230,3 +233,18 @@ hold behavior, no-eligible escalation, exact-once receipts, and restart replay.
 The verifier-owned frozen acceptance contract is
 `docs/evals/scenario-emergent-task-graph-v1.json`; its live five-seat and
 multi-goal matrix remains a separate release gate.
+
+`scripts/resumable_emergent_probe.py` is the focused continuation and
+open-creation gate. It restarts the resident process mid-chain, completes one
+task across three resumed turns under one owner+attempt+session, verifies
+idempotent typed progress and evidence-gated completion, lets that non-bootstrap
+owner append a visible child task, proves create/claim separation by having a
+different seat win the child, observes a real phase barrier, and replays the
+root without duplicating the append. It also rejects and audits conflicting
+same-turn appends and a global over-budget append without mutating existing
+tasks, while checking metadata-only notice fan-out and 0/0/0/0 losing-claim
+economics. A separate chain emits eight consecutive continue verdicts and must
+end in an explicit budget hold with exactly one terminal escalation receipt.
+The neutral locked contracts are
+`docs/evals/scenario-long-horizon-continuation-v1.json` and
+`docs/evals/scenario-open-task-creation-v1.json`.

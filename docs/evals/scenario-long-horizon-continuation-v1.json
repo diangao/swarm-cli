@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "scenario_id": "long-horizon-continuation-v1",
+  "title": "A task larger than one model turn is completed across multiple resumed turns under one ownership: typed per-turn verdicts, durable checkpoints, session resume, fenced re-wakes, budget-exhaustion hold",
+  "owner_note": "Verifier-owned acceptance contract for the long-horizon continuation loop. Locked before implementation completes, per lockstep. Design boundary: the AGENT is long-running (durable seat, workspace, ownership, session); model turns are finite; continuation = durable checkpoint + resume-same-session + fenced re-wake. Regression floor: all previously gated conditions (15 orchestration + 11 dynamic-graph) remain binding on the same SHA.",
+  "accept_intent": "A goal whose honest completion requires more than one model turn is claimed once and completed across several turns without losing ownership, context, or work. Every turn ends with a TYPED verdict committed in that same turn: continue, complete, held, or failed - prose never implies completion. A continue verdict persists a checkpoint and next_action durably, and the runtime re-wakes the SAME owner under the SAME task+attempt fence, resuming the SAME harness session so the next turn demonstrably builds on the prior turn's work. Budget exhaustion produces an explicit HOLD with escalation, never silent death or fake completion. Crash, duplicate wake, takeover, late results, and mid-flight steer all behave safely across the turn chain.",
+  "pass_conditions": [
+    { "id": "typed_turn_verdict", "assert": "every turn in the chain ends with exactly one typed verdict (continue|complete|held|failed) recorded via typed commit IN that turn; a turn with no verdict, two verdicts, or completion inferred from prose fails; 'complete' is only accepted when the task's acceptance criteria are met and evidenced." },
+    { "id": "checkpoint_durability_and_scope", "assert": "each continue verdict persists a checkpoint and next_action that survive restart; checkpoint content is refs/hashes/progress-state only - no chain-of-thought, no message bodies, no prompts (privacy bar applies to every checkpoint in the chain)." },
+    { "id": "resume_same_session_provenance", "assert": "turn N+1 provably resumes the same harness session as turn N (session id continuity in the trace for both Codex exec/resume and Claude resume adapters); a restarted-fresh session where resume was possible fails; the resumed turn's work demonstrably builds on the checkpoint rather than re-planning from scratch." },
+    { "id": "single_ownership_across_turns", "assert": "the whole turn chain runs under one task_id+attempt fence; re-wakes are runtime-scheduled and fenced; no second owner or duplicate execution appears mid-chain while the lease is live and heartbeating." },
+    { "id": "budget_exhaustion_explicit_hold", "assert": "exhausting the per-task turn budget (default 8) produces an explicit HELD state with a human-visible escalation receipt; the task never silently dies, never loops past budget, and never converts exhaustion into a claimed completion." },
+    { "id": "crash_restart_chain_integrity", "assert": "a crash or daemon restart mid-chain resumes from the last durable checkpoint: no completed turn re-executes, no checkpoint is lost, no duplicate receipts; a duplicate wake for a chain in progress is idempotent (single live turn per task at any moment)." },
+    { "id": "takeover_late_result_fencing", "assert": "after lease-expiry takeover mid-chain, the new owner resumes from the last durable checkpoint under an incremented attempt; any late result/receipt/checkpoint from the old attempt is rejected by the fence and recorded." },
+    { "id": "steer_freshness_across_turns", "assert": "a human steer arriving between or during turns is folded into the next turn's context (freshness reread before that turn's shared effects); a shape-changing steer holds the chain for replan per the existing boundary; stale pre-steer output is not committed after the steer." },
+    { "id": "milestone_receipts", "assert": "the thread shows honest progress across the chain: at minimum an accepted receipt at claim, progress/status on continue verdicts, and one final receipt at terminal state; final receipt reflects the true terminal verdict (complete/held/failed), authored by the current owner with the delivery trailer." },
+    { "id": "long_horizon_endtoend", "assert": "at least one acceptance run completes a genuinely multi-turn task (3+ turns) to real acceptance-criteria completion, and one run terminates in HELD via budget exhaustion - both chains fully evidenced in ledger/trace." }
+  ],
+  "fail_signals": [
+    "completion inferred from prose or turn-end rather than a typed verdict",
+    "checkpoint lost on restart, or checkpoint containing CoT/bodies/prompts",
+    "fresh session started where resume was possible",
+    "second live turn for one task, or duplicate execution mid-chain",
+    "budget exhaustion silently dying or claiming completion",
+    "late old-attempt write landing after takeover",
+    "stale output committed after a steer",
+    "task ended per-turn (chain not continued) despite a continue verdict"
+  ],
+  "metrics": ["turns_per_completed_task", "checkpoint_resume_latency", "chain_completion_rate", "budget_hold_rate", "stale_write_rejections"],
+  "regression_floor": "All 15 orchestration conditions and all 11 dynamic-task-graph conditions remain binding on the same SHA; the live rerun matrix (2/3/5 graphs, human root, real steer, live fence, escalation, freeze-window audit) still gates final ready."
+}

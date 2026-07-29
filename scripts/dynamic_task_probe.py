@@ -114,7 +114,42 @@ if task_key == "plan":
         raise SystemExit(completed.returncode)
     print("SILENT")
 else:
-    print(f"completed task={task_key} owner={os.environ['SWARM_AGENT_NAME']}")
+    payload = {
+        "schema": "swarm.dynamic-task-progress.v1",
+        "run_id": run_id,
+        "graph_version": 1,
+        "task_key": task_key,
+        "attempt": attempt,
+        "status": "complete",
+        "summary": f"completed task={task_key} owner={os.environ['SWARM_AGENT_NAME']}",
+        "checkpoint": {
+            "completed": [task_key],
+            "acceptance_evidence": [
+                {
+                    "criterion_index": 0,
+                    "evidence_ref": f"artifact://{task_key}-result",
+                }
+            ],
+        },
+        "next_action": "",
+    }
+    completed = subprocess.run(
+        [
+            "swarm", "agent", "task-progress-commit",
+            "--run-id", run_id,
+            "--graph-version", "1",
+            "--task-key", task_key,
+            "--attempt", str(attempt),
+        ],
+        input=json.dumps(payload, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        sys.stderr.write(completed.stderr)
+        raise SystemExit(completed.returncode)
+    print("SILENT")
 """,
         encoding="utf-8",
     )
@@ -239,6 +274,46 @@ if task_key == "plan":
 else:
     state_dir = Path(os.environ["SWARM_CANDIDATE_STATE_DIR"])
     marker = state_dir / "freshness-injected"
+    summary = (
+        "stale dynamic result must not commit"
+        if not marker.exists()
+        else "fresh dynamic result committed after reread"
+    )
+    progress = {
+        "schema": "swarm.dynamic-task-progress.v1",
+        "run_id": run_id,
+        "graph_version": 1,
+        "task_key": task_key,
+        "attempt": attempt,
+        "status": "complete",
+        "summary": summary,
+        "checkpoint": {
+            "completed": [task_key],
+            "acceptance_evidence": [
+                {
+                    "criterion_index": 0,
+                    "evidence_ref": f"artifact://{task_key}-fresh-result",
+                }
+            ],
+        },
+        "next_action": "",
+    }
+    completed = subprocess.run(
+        [
+            "swarm", "agent", "task-progress-commit",
+            "--run-id", run_id,
+            "--graph-version", "1",
+            "--task-key", task_key,
+            "--attempt", str(attempt),
+        ],
+        input=json.dumps(progress, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        sys.stderr.write(completed.stderr)
+        raise SystemExit(completed.returncode)
     if not marker.exists():
         sent = subprocess.run(
             ["swarm", "message", "send", "--target", target],
@@ -274,9 +349,7 @@ else:
             )
             conn.commit()
         marker.write_text(message_id, encoding="utf-8")
-        print("stale dynamic result must not commit")
-    else:
-        print("fresh dynamic result committed after reread")
+    print("SILENT")
 """,
         encoding="utf-8",
     )
@@ -368,30 +441,6 @@ def probe_invalid_plan(parent_dir: Path) -> dict[str, object]:
         state_dir=state_dir,
     )
     run_id = re.search(r"Run ID: (orch_[a-z0-9]+)", started.stdout).group(1)
-    register_agent(
-        state_dir,
-        "worker-only",
-        f"{sys.executable} {runtime}",
-        "worker",
-    )
-    mismatched = run(
-        "agent",
-        "task-claim",
-        "--run-id",
-        run_id,
-        "--graph-version",
-        "1",
-        "--task-key",
-        "plan",
-        "--expected-attempt",
-        "0",
-        "--agent",
-        "worker-only",
-        state_dir=state_dir,
-        expected=1,
-    )
-    assert "CAPABILITY_MISMATCH" in mismatched.stderr
-
     # Malformed JSON from a non-owner/stale turn must not be able to hold a
     # planning run. Provenance/fencing checks precede validation side effects.
     unauthorized = run(
@@ -461,7 +510,7 @@ def probe_invalid_plan(parent_dir: Path) -> dict[str, object]:
         assert len(details) == 1
         assert details[0]["tasks_created"] == 0
     return {
-        "capability_mismatch_zero_turn": "PASS",
+        "open_planner_any_seat": "PASS",
         "invalid_plan_fail_closed": "PASS",
         "unauthorized_malformed_plan_fenced": "PASS",
     }

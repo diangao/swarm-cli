@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 25
 CONTEXT_MANIFEST_VERSION = 1
 STATE_FILE = "state.sqlite3"
 TASK_STATUSES = {"todo", "in_progress", "in_review", "done", "closed"}
@@ -897,6 +897,19 @@ def create_schema(conn: sqlite3.Connection) -> None:
             attempt INTEGER NOT NULL,
             lease_expires_at TEXT,
             last_heartbeat_at TEXT,
+            session_id TEXT,
+            checkpoint_json TEXT NOT NULL DEFAULT '{}',
+            next_action TEXT,
+            progress_status TEXT,
+            progress_summary TEXT,
+            progress_turn_id INTEGER,
+            progress_sha256 TEXT,
+            turn_count INTEGER NOT NULL DEFAULT 0,
+            max_turns INTEGER NOT NULL DEFAULT 8,
+            parent_task_key TEXT,
+            creator_agent TEXT,
+            creator_turn_id INTEGER,
+            creation_sha256 TEXT,
             result_sha256 TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -1119,6 +1132,33 @@ def ensure_agent_presence_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE agents ADD COLUMN presence_updated_at TEXT")
     if "last_turn_at" not in columns:
         conn.execute("ALTER TABLE agents ADD COLUMN last_turn_at TEXT")
+
+
+def ensure_orchestration_task_columns(conn: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(orchestration_tasks)").fetchall()
+    }
+    additions = (
+        ("session_id", "TEXT"),
+        ("checkpoint_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("next_action", "TEXT"),
+        ("progress_status", "TEXT"),
+        ("progress_summary", "TEXT"),
+        ("progress_turn_id", "INTEGER"),
+        ("progress_sha256", "TEXT"),
+        ("turn_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("max_turns", "INTEGER NOT NULL DEFAULT 8"),
+        ("parent_task_key", "TEXT"),
+        ("creator_agent", "TEXT"),
+        ("creator_turn_id", "INTEGER"),
+        ("creation_sha256", "TEXT"),
+    )
+    for name, declaration in additions:
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE orchestration_tasks ADD COLUMN {name} {declaration}"
+            )
 
 
 def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
@@ -1344,10 +1384,13 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             run_id, graph_version, task_key, task_number, title, objective, phase,
             delivery_target, required_capabilities_json, acceptance_json,
             planner_turn_id, plan_attempt, plan_sha256, state, owner, attempt,
-            lease_expires_at, last_heartbeat_at, result_sha256,
+            lease_expires_at, last_heartbeat_at, session_id, checkpoint_json,
+            next_action, progress_status, progress_summary, progress_turn_id,
+            progress_sha256, turn_count, max_turns, parent_task_key,
+            creator_agent, creator_turn_id, creation_sha256, result_sha256,
             created_at, updated_at, committed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -1369,6 +1412,24 @@ def replace_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 int(row.get("attempt", 0)),
                 row.get("lease_expires_at"),
                 row.get("last_heartbeat_at"),
+                row.get("session_id"),
+                json.dumps(
+                    row.get("checkpoint", {}),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                row.get("next_action"),
+                row.get("progress_status"),
+                row.get("progress_summary"),
+                row.get("progress_turn_id"),
+                row.get("progress_sha256"),
+                int(row.get("turn_count", 0)),
+                int(row.get("max_turns", 8)),
+                row.get("parent_task_key"),
+                row.get("creator_agent"),
+                row.get("creator_turn_id"),
+                row.get("creation_sha256"),
                 row.get("result_sha256"),
                 row["created_at"],
                 row["updated_at"],
@@ -1739,6 +1800,7 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         create_schema(conn)
         ensure_profile_columns(conn)
         ensure_agent_presence_columns(conn)
+        ensure_orchestration_task_columns(conn)
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         if row is None:
             replace_state(conn, initial_state())
@@ -1948,6 +2010,19 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             "attempt": row["attempt"],
             "lease_expires_at": row["lease_expires_at"],
             "last_heartbeat_at": row["last_heartbeat_at"],
+            "session_id": row["session_id"],
+            "checkpoint": json.loads(row["checkpoint_json"] or "{}"),
+            "next_action": row["next_action"],
+            "progress_status": row["progress_status"],
+            "progress_summary": row["progress_summary"],
+            "progress_turn_id": row["progress_turn_id"],
+            "progress_sha256": row["progress_sha256"],
+            "turn_count": row["turn_count"],
+            "max_turns": row["max_turns"],
+            "parent_task_key": row["parent_task_key"],
+            "creator_agent": row["creator_agent"],
+            "creator_turn_id": row["creator_turn_id"],
+            "creation_sha256": row["creation_sha256"],
             "result_sha256": row["result_sha256"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -1958,7 +2033,10 @@ def read_state(conn: sqlite3.Connection) -> dict[str, Any]:
             SELECT run_id, graph_version, task_key, task_number, title, objective, phase,
                    delivery_target, required_capabilities_json, acceptance_json,
                    planner_turn_id, plan_attempt, plan_sha256, state, owner, attempt,
-                   lease_expires_at, last_heartbeat_at, result_sha256,
+                   lease_expires_at, last_heartbeat_at, session_id, checkpoint_json,
+                   next_action, progress_status, progress_summary, progress_turn_id,
+                   progress_sha256, turn_count, max_turns, parent_task_key,
+                   creator_agent, creator_turn_id, creation_sha256, result_sha256,
                    created_at, updated_at, committed_at
             FROM orchestration_tasks
             ORDER BY created_at, run_id, graph_version, phase, task_key
@@ -6019,6 +6097,8 @@ def prepare_daemon_turn(
         # must survive that turn and be handled with its fresher channel view.
         consumes_wake = bool(wake is not None and wake.get("running"))
         wake_context_head_seq: int | None = None
+        dynamic_task_selected = False
+        dynamic_session_id: str | None = None
         input_message_id = payload_fields.get("input_message_id")
         input_text = explicit_input if explicit_input is not None else payload_fields.get("input_text", "")
         target = explicit_target if explicit_target is not None else payload_fields.get("target")
@@ -6048,6 +6128,10 @@ def prepare_daemon_turn(
                             "error": "dynamic owner wake has no current fenced claim",
                             "code": "CLAIM_REQUIRED",
                         }
+                    dynamic_task_selected = True
+                    dynamic_session_id = (
+                        str(task.get("session_id") or "").strip() or None
+                    )
                     root_record = message_by_full_id(
                         state,
                         str(run["root_message_id"]),
@@ -6122,8 +6206,10 @@ def prepare_daemon_turn(
                             + "[owner QUERY required]\n"
                             + owner_query
                             + "\n\n[typed planner contract]\n"
-                            + "After the read, use your judgment to decompose the human goal into a variable "
-                            + "set of 1–8 concrete tasks. The runtime must not choose the count or taxonomy. "
+                            + "After the read, use your judgment to bootstrap the first variable set of 1–8 "
+                            + "concrete tasks. The runtime must not choose the count or taxonomy. This is only "
+                            + "the first contribution to an append-only task board: any later claimed owner "
+                            + "may discover and create more work while executing. "
                             + "Commit the graph during this exact native turn by piping strict JSON to:\n"
                             + f"`swarm agent plan-commit --run-id {run_id} --attempt {attempt}`\n"
                             + "The JSON must have exactly schema, run_id, root_message_id, graph_version, "
@@ -6131,12 +6217,26 @@ def prepare_daemon_turn(
                             + "required_capabilities, acceptance, phase, and delivery_target. Use schema "
                             + f"`{DYNAMIC_TASK_SCHEMA}`, root_message_id `{run['root_message_id']}`, "
                             + f"graph_version {graph_version}, and delivery_target `{target}` for every task. "
-                            + "Use phases 0–3 with no gaps and at least one phase-0 task. Do not post internal "
-                            + "task tickets to chat; the typed commit is authoritative. After a successful "
-                            + "commit, output exactly `SILENT` so only the runtime-authored plan receipt is "
-                            + "human-visible."
+                            + "Use an empty required_capabilities list for open self-selection, or declared "
+                            + "capability hints only when eligibility truly matters. "
+                            + "Use phases 0–3 with no gaps and at least one phase-0 task. The runtime will "
+                            + "materialize each accepted item as a visible, unclaimed task message; creating "
+                            + "does not assign it to you. After a successful commit, output exactly `SILENT` "
+                            + "so only runtime-authored task and plan receipts are human-visible."
                         )
                     else:
+                        prior_checkpoint = json.dumps(
+                            task.get("checkpoint") or {},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        )
+                        prior_next_action = str(task.get("next_action") or "")
+                        completed_turns = int(task.get("turn_count") or 0)
+                        max_turns = int(
+                            task.get("max_turns")
+                            or DYNAMIC_MAX_TURNS_DEFAULT
+                        )
                         input_text = (
                             "[metadata-only open-task NOTICE]\n"
                             + json.dumps(
@@ -6156,12 +6256,45 @@ def prepare_daemon_turn(
                                 f"- {criterion}"
                                 for criterion in task.get("acceptance", [])
                             )
-                            + "\n\nComplete only this claimed task. Do not redo a sibling task and do not "
-                            + "speak for other owners. Return a concrete non-empty result. The runtime will "
-                            + "fence and commit the result, status, and exact-once receipt only if this owner "
-                            + f"and attempt are still current.\n\nDelivery trailer: reply to exact target {target} "
-                            + f"for root msg={short_id(str(run['root_message_id']))}. "
-                            + "Complete all work you can safely finish before stopping."
+                            + "\n\n[durable continuation state]\n"
+                            + f"Completed native turns: {completed_turns}/{max_turns}\n"
+                            + f"Checkpoint: {prior_checkpoint}\n"
+                            + "Next action: "
+                            + (prior_next_action or "(first turn; derive from the task)")
+                            + "\n\n[typed turn verdict required]\n"
+                            + "Work only under this claim. Do not redo a sibling task and do not speak "
+                            + "for other owners. Inspect the visible board when useful with "
+                            + f"`swarm task list --channel {shlex.quote(str(run['root_target']))}`. If the "
+                            + "work reveals genuinely new independent work, create it before your verdict "
+                            + "by piping one strict JSON batch to:\n"
+                            + f"`swarm agent task-create --run-id {run_id} --graph-version {graph_version} "
+                            + f"--parent-task-key {task_key} --attempt {attempt}`\n"
+                            + "That JSON must have exactly schema, run_id, graph_version, parent_task_key, "
+                            + "and tasks. Use schema "
+                            + f"`{DYNAMIC_TASK_CREATE_SCHEMA}`. Each task has the same seven fields as a "
+                            + "planned task; its phase must be at least this task's phase. Use an empty "
+                            + "required_capabilities list for open self-selection, or declared capability "
+                            + "hints only when eligibility truly matters. New tasks are visible and unclaimed; "
+                            + "creation never assigns them to you. Do not create duplicates merely to narrate "
+                            + "progress.\n\nBefore ending this native turn, pipe exactly one strict JSON "
+                            + "verdict to:\n"
+                            + f"`swarm agent task-progress-commit --run-id {run_id} "
+                            + f"--graph-version {graph_version} --task-key {task_key} --attempt {attempt}`\n"
+                            + "The JSON must have exactly schema, run_id, graph_version, task_key, attempt, "
+                            + "status, summary, checkpoint, and next_action. Use schema "
+                            + f"`{DYNAMIC_PROGRESS_SCHEMA}` and status `continue`, `complete`, `held`, or "
+                            + "`failed`. Use `continue` whenever more work remains; include a non-empty "
+                            + "next_action and a compact checkpoint containing only refs, hashes, decisions, "
+                            + "completed milestones, blockers, and progress state—never chain-of-thought, "
+                            + "message bodies, prompts, transcripts, or credentials. Use `complete` only "
+                            + "after checking every acceptance criterion, leave next_action empty, and include "
+                            + "checkpoint.acceptance_evidence with exactly one object per criterion: "
+                            + "`{\"criterion_index\":N,\"evidence_ref\":\"...\"}` using zero-based unique "
+                            + "indices that cover the full acceptance list. The "
+                            + "runtime alone commits progress/result/status under the current owner+attempt "
+                            + "fence. After the typed commit succeeds, output exactly `SILENT`; prose output "
+                            + "never implies task completion.\n\nDelivery target for runtime receipts: "
+                            + f"{target} for root msg={short_id(str(run['root_message_id']))}."
                         )
                 elif active_reason.startswith("orchestration_owner:"):
                     assignment = orchestration_assignment_for_agent(
@@ -6349,13 +6482,21 @@ def prepare_daemon_turn(
             if wake_context_head_seq is not None
             else latest_target_message_seq(state, target)
         )
-        session_id = explicit_session_id or payload_fields.get("session_id")
+        session_id = (
+            explicit_session_id
+            or payload_fields.get("session_id")
+            or dynamic_session_id
+        )
         prior_done_sessions = [
             str(item["session_id"])
             for item in state.get("daemon_turns", [])
             if item["agent"] == agent_name and item["status"] == "done" and item.get("session_id")
         ]
-        if not session_id:
+        if not session_id and dynamic_task_selected:
+            # A dynamic task owns its harness session. Never accidentally
+            # resume the most recent unrelated turn from the same seat.
+            session_id = str(uuid.uuid4())
+        elif not session_id:
             session_id = prior_done_sessions[-1] if prior_done_sessions else str(uuid.uuid4())
         resumable = session_id in prior_done_sessions
         runtime_kind = Path(command[0]).name
@@ -6660,6 +6801,62 @@ def finalize_dynamic_daemon_turn(
     message_id: str | None = None
     freshness_held = False
     idempotent_receipt = False
+    requeue_requested = False
+
+    def commit_task_receipt(receipt_kind: str, body: str) -> tuple[str | None, bool]:
+        receipt_key = (
+            str(task["run_id"]),
+            int(task["graph_version"]),
+            str(task["task_key"]),
+            int(task["attempt"]),
+            receipt_kind,
+        )
+        existing = next(
+            (
+                row
+                for row in state.get("orchestration_receipts", [])
+                if (
+                    str(row.get("run_id") or ""),
+                    int(row.get("graph_version") or 0),
+                    str(row.get("task_key") or ""),
+                    int(row.get("attempt") or 0),
+                    str(row.get("receipt_kind") or ""),
+                )
+                == receipt_key
+            ),
+            None,
+        )
+        if existing is not None:
+            return str(existing.get("message_id") or "") or None, True
+        exact_target = dynamic_root_thread(run)
+        trailer = (
+            f"[delivery target={exact_target} "
+            f"root={short_id(str(run['root_message_id']))} "
+            f"run={run['run_id']} graph={task['graph_version']} "
+            f"task={task['task_key']} attempt={task['attempt']}]"
+        )
+        outbound = body if trailer in body else f"{body}\n\n{trailer}"
+        record = append_message(
+            state,
+            exact_target,
+            outbound,
+            author=agent_name,
+        )
+        state.setdefault("orchestration_receipts", []).append(
+            {
+                "run_id": task["run_id"],
+                "graph_version": int(task["graph_version"]),
+                "task_key": task["task_key"],
+                "attempt": int(task["attempt"]),
+                "receipt_kind": receipt_kind,
+                "delivery_target": exact_target,
+                "root_message_id": run["root_message_id"],
+                "author": agent_name,
+                "message_id": str(record["id"]),
+                "committed_at": now,
+            }
+        )
+        return str(record["id"]), False
 
     if planner_turn:
         plan_committed = bool(
@@ -6712,8 +6909,12 @@ def finalize_dynamic_daemon_turn(
             dynamic_error = "task result rejected because the owner lease expired"
         elif not owner_read:
             dynamic_error = "task owner did not perform the required same-turn owner read"
-        elif not stdout_clean or stdout_clean == "SILENT":
-            dynamic_error = "task owner produced no non-empty result"
+        elif (
+            current is None
+            or int(current.get("progress_turn_id") or 0) != turn_id
+            or not current.get("progress_status")
+        ):
+            dynamic_error = "task owner ended without a valid typed turn verdict"
         elif freshness_held:
             append_daemon_event(
                 state,
@@ -6742,103 +6943,189 @@ def finalize_dynamic_daemon_turn(
                 str(run["root_message_id"]),
             )
         else:
-            receipt_key = (
-                str(task["run_id"]),
-                int(task["graph_version"]),
-                str(task["task_key"]),
-                int(task["attempt"]),
-                "result",
-            )
-            existing_receipt = next(
-                (
-                    row
-                    for row in state.get("orchestration_receipts", [])
-                    if (
-                        str(row.get("run_id") or ""),
-                        int(row.get("graph_version") or 0),
-                        str(row.get("task_key") or ""),
-                        int(row.get("attempt") or 0),
-                        str(row.get("receipt_kind") or ""),
-                    )
-                    == receipt_key
-                ),
-                None,
-            )
-            if existing_receipt is not None:
-                idempotent_receipt = True
-                message_id = str(existing_receipt.get("message_id") or "") or None
-            else:
-                exact_target = dynamic_root_thread(run)
-                trailer = (
-                    f"[delivery target={exact_target} "
-                    f"root={short_id(str(run['root_message_id']))} "
-                    f"run={run['run_id']} graph={task['graph_version']} "
-                    f"task={task['task_key']} attempt={task['attempt']}]"
-                )
-                outbound = (
-                    stdout_clean
-                    if trailer in stdout_clean
-                    else f"{stdout_clean}\n\n{trailer}"
-                )
-                record = append_message(
-                    state,
-                    exact_target,
-                    outbound,
-                    author=agent_name,
-                )
-                message_id = str(record["id"])
-                state.setdefault("orchestration_receipts", []).append(
-                    {
-                        "run_id": task["run_id"],
-                        "graph_version": int(task["graph_version"]),
-                        "task_key": task["task_key"],
-                        "attempt": int(task["attempt"]),
-                        "receipt_kind": "result",
-                        "delivery_target": exact_target,
-                        "root_message_id": run["root_message_id"],
-                        "author": agent_name,
-                        "message_id": message_id,
-                        "committed_at": now,
-                    }
-                )
             assert current is not None
-            current["state"] = "done"
-            current["result_sha256"] = hashlib.sha256(
-                stdout_clean.encode("utf-8")
-            ).hexdigest()
-            current["committed_at"] = current.get("committed_at") or now
-            current["updated_at"] = now
-            generic = next(
-                (
-                    row
-                    for row in state.get("tasks", [])
-                    if int(row.get("number") or 0)
-                    == int(current["task_number"])
-                ),
-                None,
+            verdict = str(current["progress_status"])
+            summary = str(current.get("progress_summary") or "")
+            next_action = str(current.get("next_action") or "")
+            turn_count = int(current.get("turn_count") or 0)
+            max_turns = int(
+                current.get("max_turns")
+                or DYNAMIC_MAX_TURNS_DEFAULT
             )
-            if generic is not None:
-                generic["status"] = "in_review"
-                generic["updated_at"] = now
-            append_daemon_event(
-                state,
-                "orchestration_dynamic_execution",
-                {
-                    "run_id": run["run_id"],
-                    "graph_version": task["graph_version"],
-                    "task_key": task["task_key"],
-                    "task_number": task["task_number"],
-                    "agent": agent_name,
-                    "attempt": task["attempt"],
-                    "turn_id": turn_id,
-                    "result_sha256": current["result_sha256"],
-                    "message_id": message_id,
-                    "receipt_idempotent": idempotent_receipt,
-                    "execution_count": 1,
-                    "loser_execution_count": 0,
-                },
-            )
-            advance_dynamic_phase_barrier(state, run)
+            if stdout_clean not in {"", "SILENT"}:
+                append_daemon_event(
+                    state,
+                    "orchestration_dynamic_task_prose_ignored",
+                    {
+                        "run_id": run["run_id"],
+                        "graph_version": task["graph_version"],
+                        "task_key": task["task_key"],
+                        "agent": agent_name,
+                        "attempt": task["attempt"],
+                        "turn_id": turn_id,
+                        "output_sha256": hashlib.sha256(
+                            stdout_clean.encode("utf-8")
+                        ).hexdigest(),
+                        "verdict": verdict,
+                        "result_committed_from_prose": False,
+                    },
+                )
+            if verdict == "continue":
+                message_id, idempotent_receipt = commit_task_receipt(
+                    f"progress:{turn_count}",
+                    (
+                        f"Progress {turn_count}/{max_turns}: {summary}\n"
+                        f"Next: {next_action}"
+                    ),
+                )
+                current["state"] = "running"
+                current["last_heartbeat_at"] = now
+                current["lease_expires_at"] = dynamic_claim_lease_expires_at(
+                    now,
+                    DYNAMIC_CLAIM_LEASE_SECONDS,
+                )
+                current["updated_at"] = now
+                requeue_requested = True
+                enqueue_daemon_wake(
+                    state,
+                    agent_name,
+                    dynamic_owner_reason(
+                        str(task["run_id"]),
+                        int(task["graph_version"]),
+                        str(task["task_key"]),
+                        int(task["attempt"]),
+                    ),
+                    str(run["root_message_id"]),
+                )
+                append_daemon_event(
+                    state,
+                    "orchestration_dynamic_continuation",
+                    {
+                        "run_id": run["run_id"],
+                        "graph_version": task["graph_version"],
+                        "task_key": task["task_key"],
+                        "task_number": task["task_number"],
+                        "agent": agent_name,
+                        "attempt": task["attempt"],
+                        "turn_id": turn_id,
+                        "turn_count": turn_count,
+                        "max_turns": max_turns,
+                        "message_id": message_id,
+                        "receipt_idempotent": idempotent_receipt,
+                        "same_owner_attempt": True,
+                        "requeued": True,
+                    },
+                )
+            elif verdict == "complete":
+                message_id, idempotent_receipt = commit_task_receipt(
+                    "result",
+                    summary,
+                )
+                current["state"] = "done"
+                current["result_sha256"] = hashlib.sha256(
+                    summary.encode("utf-8")
+                ).hexdigest()
+                current["committed_at"] = current.get("committed_at") or now
+                current["updated_at"] = now
+                generic = next(
+                    (
+                        row
+                        for row in state.get("tasks", [])
+                        if int(row.get("number") or 0)
+                        == int(current["task_number"])
+                    ),
+                    None,
+                )
+                if generic is not None:
+                    generic["status"] = "in_review"
+                    generic["updated_at"] = now
+                append_daemon_event(
+                    state,
+                    "orchestration_dynamic_execution",
+                    {
+                        "run_id": run["run_id"],
+                        "graph_version": task["graph_version"],
+                        "task_key": task["task_key"],
+                        "task_number": task["task_number"],
+                        "agent": agent_name,
+                        "attempt": task["attempt"],
+                        "turn_id": turn_id,
+                        "turn_count": turn_count,
+                        "result_sha256": current["result_sha256"],
+                        "message_id": message_id,
+                        "receipt_idempotent": idempotent_receipt,
+                        "execution_count": 1,
+                        "loser_execution_count": 0,
+                    },
+                )
+                advance_dynamic_phase_barrier(state, run)
+            elif verdict == "held":
+                budget_exhausted = turn_count >= max_turns
+                receipt_kind = (
+                    "long_horizon_budget_exhausted"
+                    if budget_exhausted
+                    else f"held:{turn_count}"
+                )
+                body = f"Task held after turn {turn_count}/{max_turns}: {summary}"
+                if next_action:
+                    body += f"\nOperator action: {next_action}"
+                message_id, idempotent_receipt = commit_task_receipt(
+                    receipt_kind,
+                    body,
+                )
+                current["state"] = "held"
+                current["updated_at"] = now
+                run["state"] = "held"
+                run["updated_at"] = now
+                append_daemon_event(
+                    state,
+                    "orchestration_dynamic_task_held",
+                    {
+                        "run_id": run["run_id"],
+                        "graph_version": task["graph_version"],
+                        "task_key": task["task_key"],
+                        "agent": agent_name,
+                        "attempt": task["attempt"],
+                        "turn_id": turn_id,
+                        "turn_count": turn_count,
+                        "max_turns": max_turns,
+                        "budget_exhausted": budget_exhausted,
+                        "message_id": message_id,
+                    },
+                )
+            elif verdict == "failed":
+                message_id, idempotent_receipt = commit_task_receipt(
+                    f"failed:{turn_count}",
+                    f"Task failed after turn {turn_count}/{max_turns}: {summary}",
+                )
+                current["state"] = "failed"
+                current["updated_at"] = now
+                append_daemon_event(
+                    state,
+                    "orchestration_dynamic_task_failed",
+                    {
+                        "run_id": run["run_id"],
+                        "graph_version": task["graph_version"],
+                        "task_key": task["task_key"],
+                        "agent": agent_name,
+                        "attempt": task["attempt"],
+                        "turn_id": turn_id,
+                        "turn_count": turn_count,
+                        "message_id": message_id,
+                    },
+                )
+                advance_dynamic_phase_barrier(state, run)
+            else:
+                dynamic_error = "task owner typed verdict was invalid at finalize"
+
+    if (
+        completed_session_id
+        and status == "done"
+        and dynamic_error is None
+        and current is not None
+    ):
+        current["session_id"] = completed_session_id
+        current["updated_at"] = now
 
     wake_status = None
     wake = daemon_wake_by_agent(state, agent_name)
@@ -6873,6 +7160,12 @@ def finalize_dynamic_daemon_turn(
             "dynamic_attempt": task["attempt"],
             "message_id": message_id,
             "freshness_held": freshness_held,
+            "continuation_requeued": requeue_requested,
+            "typed_verdict": (
+                current.get("progress_status")
+                if current is not None and not planner_turn
+                else None
+            ),
         },
     )
     if dynamic_error is not None:
@@ -7683,6 +7976,12 @@ def execute_daemon_turn(
         )
     elif status == "timeout":
         daemon_record_event("turn_timed_out", {"id": prepared["turn_id"], "agent": prepared["agent"]})
+
+    if status == "done" and not completed_session_id:
+        # Generic runtimes and Claude already receive the authoritative session
+        # id selected at prepare time. Persist that id so a task-owned session
+        # resumes instead of silently starting a fresh context on every turn.
+        completed_session_id = str(prepared["session_id"])
 
     finalized = finalize_daemon_turn(
         int(prepared["turn_id"]),
@@ -8898,12 +9197,18 @@ ORCHESTRATION_NOTICE_FIRST_DELIVERY = {
 }
 
 DYNAMIC_TASK_SCHEMA = "swarm.dynamic-tasks.v1"
+DYNAMIC_PROGRESS_SCHEMA = "swarm.dynamic-task-progress.v1"
+DYNAMIC_TASK_CREATE_SCHEMA = "swarm.dynamic-task-create.v1"
 DYNAMIC_PLAN_TASK_KEY = "plan"
 DYNAMIC_TASK_KEY_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}")
 DYNAMIC_CAPABILITY_RE = re.compile(r"[a-z0-9][a-z0-9:_-]{0,47}")
 DYNAMIC_PLAN_MAX_BYTES = 32 * 1024
+DYNAMIC_PROGRESS_MAX_BYTES = 16 * 1024
+DYNAMIC_TASK_CREATE_MAX_BYTES = 32 * 1024
 DYNAMIC_TASK_MAX_COUNT = 8
+DYNAMIC_GRAPH_MAX_COUNT = 32
 DYNAMIC_CLAIM_LEASE_SECONDS = 60
+DYNAMIC_MAX_TURNS_DEFAULT = 8
 DYNAMIC_SHAPE_STEER_MARKERS = (
     "add a task",
     "add another task",
@@ -9031,7 +9336,7 @@ def dynamic_task_capability_match(
     }
     agent_caps = agent_capability_set(agent)
     matched = sorted(required.intersection(agent_caps))
-    return bool(matched), matched, sorted(agent_caps)
+    return not required or bool(matched), matched, sorted(agent_caps)
 
 
 def dynamic_internal_task_row(
@@ -9196,7 +9501,7 @@ def emit_dynamic_task_notices(
     for agent in sorted(state.get("agents", []), key=lambda row: str(row.get("name") or "")):
         name = str(agent.get("name") or "")
         matched = sorted(agent_capability_set(agent).intersection(required))
-        if not matched:
+        if required and not matched:
             continue
         candidates.append(name)
         append_daemon_event(
@@ -9319,7 +9624,7 @@ def create_dynamic_planning_run(
         "objective": "Read the claimed root and commit a typed variable tasks[] plan.",
         "phase": 0,
         "delivery_target": dynamic_root_thread(run),
-        "required_capabilities": ["dissect", "planner", "orchestrator"],
+        "required_capabilities": [],
         "acceptance": ["Commit one valid swarm.dynamic-tasks.v1 plan through the typed CLI."],
         "planner_turn_id": None,
         "plan_attempt": 0,
@@ -9332,6 +9637,19 @@ def create_dynamic_planning_run(
             DYNAMIC_CLAIM_LEASE_SECONDS,
         ),
         "last_heartbeat_at": None,
+        "session_id": None,
+        "checkpoint": {},
+        "next_action": None,
+        "progress_status": None,
+        "progress_summary": None,
+        "progress_turn_id": None,
+        "progress_sha256": None,
+        "turn_count": 0,
+        "max_turns": DYNAMIC_MAX_TURNS_DEFAULT,
+        "parent_task_key": None,
+        "creator_agent": None,
+        "creator_turn_id": None,
+        "creation_sha256": None,
         "result_sha256": None,
         "created_at": now,
         "updated_at": now,
@@ -9350,7 +9668,7 @@ def create_dynamic_planning_run(
             "graph_version": 1,
             "planner_task_number": parent_task["number"],
             "task_shape_source": "model_pending",
-            "human_visible_internal_tickets": False,
+            "human_visible_internal_tickets": True,
         },
     )
     emit_dynamic_task_notices(state, run, planner_task)
@@ -9414,6 +9732,33 @@ def claim_dynamic_task_in_state(
             "outcome": "run_not_claimable",
             "code": "RUN_NOT_CLAIMABLE",
         }
+    active_for_agent = next(
+        (
+            row
+            for row in state.get("orchestration_tasks", [])
+            if str(row.get("run_id") or "") == run_id
+            and int(row.get("graph_version") or 0) == graph_version
+            and str(row.get("task_key") or "") != task_key
+            and str(row.get("owner") or "") == agent_name
+            and str(row.get("state") or "") in {"claimed", "running"}
+        ),
+        None,
+    )
+    if active_for_agent is not None:
+        append_daemon_event(
+            state,
+            "orchestration_dynamic_claim",
+            {
+                **base_detail,
+                "outcome": "owner_busy",
+                "active_task_key": active_for_agent.get("task_key"),
+                "body_reads": 0,
+                "full_model_turns": 0,
+                "outward_replies": 0,
+                "executions": 0,
+            },
+        )
+        return {"outcome": "owner_busy", "code": "OWNER_BUSY"}
     capability_match, matched, agent_caps = dynamic_task_capability_match(
         state,
         task,
@@ -9548,6 +9893,750 @@ def canonical_dynamic_plan_bytes(payload: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def canonical_dynamic_progress_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def canonical_dynamic_task_create_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def dynamic_checkpoint_safe(value: Any, depth: int = 0) -> bool:
+    if depth > 4:
+        return False
+    if value is None or isinstance(value, (bool, int, float)):
+        return True
+    if isinstance(value, str):
+        return len(value) <= 1000 and not contains_credential_shape(value)
+    if isinstance(value, list):
+        return len(value) <= 32 and all(
+            dynamic_checkpoint_safe(item, depth + 1) for item in value
+        )
+    if isinstance(value, dict):
+        if len(value) > 32:
+            return False
+        banned_fragments = {
+            "body",
+            "prompt",
+            "reasoning",
+            "thought",
+            "chain",
+            "transcript",
+            "secret",
+            "credential",
+            "token",
+            "password",
+        }
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > 80:
+                return False
+            normalized = key.lower().replace("-", "_")
+            if any(fragment in normalized for fragment in banned_fragments):
+                return False
+            if not dynamic_checkpoint_safe(item, depth + 1):
+                return False
+        return True
+    return False
+
+
+def validate_dynamic_progress(
+    payload: Any,
+    run: dict[str, Any],
+    task: dict[str, Any],
+    attempt: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, "PROGRESS_NOT_OBJECT"
+    expected = {
+        "schema",
+        "run_id",
+        "graph_version",
+        "task_key",
+        "attempt",
+        "status",
+        "summary",
+        "checkpoint",
+        "next_action",
+    }
+    if set(payload) != expected:
+        return None, "PROGRESS_UNKNOWN_OR_MISSING_FIELD"
+    if payload.get("schema") != DYNAMIC_PROGRESS_SCHEMA:
+        return None, "PROGRESS_SCHEMA_MISMATCH"
+    if payload.get("run_id") != run.get("run_id"):
+        return None, "PROGRESS_RUN_MISMATCH"
+    if payload.get("graph_version") != task.get("graph_version"):
+        return None, "PROGRESS_GRAPH_VERSION_MISMATCH"
+    if payload.get("task_key") != task.get("task_key"):
+        return None, "PROGRESS_TASK_MISMATCH"
+    if payload.get("attempt") != attempt:
+        return None, "PROGRESS_ATTEMPT_MISMATCH"
+    status = payload.get("status")
+    if status not in {"continue", "complete", "held", "failed"}:
+        return None, "PROGRESS_STATUS_INVALID"
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or not (1 <= len(summary.strip()) <= 4000):
+        return None, "PROGRESS_SUMMARY_INVALID"
+    if contains_credential_shape(summary):
+        return None, "PROGRESS_CREDENTIAL_SHAPE"
+    checkpoint = payload.get("checkpoint")
+    if not isinstance(checkpoint, dict) or not dynamic_checkpoint_safe(checkpoint):
+        return None, "PROGRESS_CHECKPOINT_INVALID"
+    next_action = payload.get("next_action")
+    if not isinstance(next_action, str) or len(next_action.strip()) > 2000:
+        return None, "PROGRESS_NEXT_ACTION_INVALID"
+    if contains_credential_shape(next_action):
+        return None, "PROGRESS_CREDENTIAL_SHAPE"
+    if status == "continue" and not next_action.strip():
+        return None, "PROGRESS_NEXT_ACTION_REQUIRED"
+    if status == "complete" and next_action.strip():
+        return None, "PROGRESS_COMPLETE_HAS_NEXT_ACTION"
+    if status == "complete":
+        acceptance = task.get("acceptance")
+        if not isinstance(acceptance, list) or not acceptance:
+            return None, "PROGRESS_ACCEPTANCE_MISSING"
+        evidence = checkpoint.get("acceptance_evidence")
+        if not isinstance(evidence, list) or len(evidence) != len(acceptance):
+            return None, "PROGRESS_ACCEPTANCE_EVIDENCE_REQUIRED"
+        expected_indices = set(range(len(acceptance)))
+        actual_indices: set[int] = set()
+        for item in evidence:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"criterion_index", "evidence_ref"}
+            ):
+                return None, "PROGRESS_ACCEPTANCE_EVIDENCE_INVALID"
+            criterion_index = item.get("criterion_index")
+            evidence_ref = item.get("evidence_ref")
+            if (
+                not isinstance(criterion_index, int)
+                or isinstance(criterion_index, bool)
+                or criterion_index not in expected_indices
+                or criterion_index in actual_indices
+                or not isinstance(evidence_ref, str)
+                or not (1 <= len(evidence_ref.strip()) <= 500)
+                or contains_credential_shape(evidence_ref)
+            ):
+                return None, "PROGRESS_ACCEPTANCE_EVIDENCE_INVALID"
+            actual_indices.add(criterion_index)
+        if actual_indices != expected_indices:
+            return None, "PROGRESS_ACCEPTANCE_EVIDENCE_INVALID"
+    normalized = {
+        "schema": DYNAMIC_PROGRESS_SCHEMA,
+        "run_id": run["run_id"],
+        "graph_version": int(task["graph_version"]),
+        "task_key": task["task_key"],
+        "attempt": attempt,
+        "status": status,
+        "summary": summary.strip(),
+        "checkpoint": checkpoint,
+        "next_action": next_action.strip(),
+    }
+    if len(canonical_dynamic_progress_bytes(normalized)) > DYNAMIC_PROGRESS_MAX_BYTES:
+        return None, "PROGRESS_BUDGET_EXCEEDED"
+    return normalized, None
+
+
+def commit_dynamic_progress_in_state(
+    state: dict[str, Any],
+    run_id: str,
+    graph_version: int,
+    task_key: str,
+    attempt: int,
+    agent_name: str,
+    turn_id: int,
+    payload: Any,
+    parse_error: str | None = None,
+) -> dict[str, Any]:
+    run = dynamic_run_by_id(state, run_id)
+    task = dynamic_task_by_key(state, run_id, graph_version, task_key)
+    if run is None or task is None:
+        return {"outcome": "rejected", "code": "NOT_FOUND"}
+    def reject(code: str) -> dict[str, Any]:
+        append_daemon_event(
+            state,
+            "orchestration_dynamic_progress_rejected",
+            {
+                "run_id": run_id,
+                "graph_version": graph_version,
+                "task_key": task_key,
+                "agent": agent_name,
+                "attempt": attempt,
+                "turn_id": turn_id,
+                "error_code": code,
+                "checkpoint_mutated": False,
+                "task_state_mutated": False,
+                "body_present": False,
+            },
+        )
+        return {"outcome": "rejected", "code": code}
+
+    if task_key == DYNAMIC_PLAN_TASK_KEY:
+        return reject("PROGRESS_PLANNER_UNSUPPORTED")
+    if (
+        str(run.get("state") or "") != "active"
+        or str(task.get("owner") or "") != agent_name
+        or int(task.get("attempt") or 0) != attempt
+        or str(task.get("state") or "") not in {"claimed", "running"}
+    ):
+        return reject("PROGRESS_FENCE_MISMATCH")
+    now = current_timestamp()
+    if (
+        not task.get("lease_expires_at")
+        or str(task["lease_expires_at"]) < now
+    ):
+        return reject("PROGRESS_LEASE_EXPIRED")
+    turn = next(
+        (
+            row
+            for row in state.get("daemon_turns", [])
+            if int(row.get("id") or 0) == turn_id
+        ),
+        None,
+    )
+    if (
+        turn is None
+        or str(turn.get("agent") or "") != agent_name
+        or str(turn.get("status") or "") != "running"
+        or str(turn.get("input_message_id") or "") != str(run["root_message_id"])
+    ):
+        return reject("PROGRESS_TURN_PROVENANCE_INVALID")
+    if not dynamic_owner_read_satisfied(state, task, agent_name, turn_id):
+        return reject("PROGRESS_BODY_READ_REQUIRED")
+    owner_reads = [
+        detail
+        for detail in orchestration_event_details(
+            state,
+            "orchestration_dynamic_body_read",
+            run_id,
+        )
+        if str(detail.get("task_key") or "") == task_key
+        and str(detail.get("agent") or "") == agent_name
+        and int(detail.get("attempt") or 0) == attempt
+        and str(detail.get("query_turn_id") or "") == str(turn_id)
+        and detail.get("explicit_query") is True
+    ]
+    read_human_seq = max(
+        (int(detail.get("query_human_head_seq") or 0) for detail in owner_reads),
+        default=0,
+    )
+    current_human_seq = latest_human_target_message_seq(
+        state,
+        dynamic_root_thread(run),
+    )
+    if current_human_seq > read_human_seq:
+        return reject("PROGRESS_FRESHNESS_REQUIRED")
+    if parse_error is not None:
+        return reject(parse_error)
+    normalized, validation_error = validate_dynamic_progress(
+        payload,
+        run,
+        task,
+        attempt,
+    )
+    if validation_error is not None:
+        return reject(validation_error)
+    assert normalized is not None
+    progress_bytes = canonical_dynamic_progress_bytes(normalized)
+    progress_sha256 = hashlib.sha256(progress_bytes).hexdigest()
+    if int(task.get("progress_turn_id") or 0) == turn_id:
+        if str(task.get("progress_sha256") or "") == progress_sha256:
+            return {
+                "outcome": "idempotent",
+                "status": task.get("progress_status"),
+                "turn_count": int(task.get("turn_count") or 0),
+                "max_turns": int(task.get("max_turns") or DYNAMIC_MAX_TURNS_DEFAULT),
+                "progress_sha256": progress_sha256,
+            }
+        return reject("PROGRESS_TURN_CONFLICT")
+
+    turn_count = int(task.get("turn_count") or 0) + 1
+    max_turns = int(task.get("max_turns") or DYNAMIC_MAX_TURNS_DEFAULT)
+    committed_status = str(normalized["status"])
+    summary = str(normalized["summary"])
+    next_action = str(normalized["next_action"])
+    outcome = "committed"
+    if committed_status == "continue" and turn_count >= max_turns:
+        committed_status = "held"
+        summary = (
+            f"Long-horizon turn budget exhausted at {turn_count}/{max_turns}. "
+            f"Last progress: {summary}"
+        )
+        outcome = "budget_exhausted"
+    task["checkpoint"] = normalized["checkpoint"]
+    task["next_action"] = next_action or None
+    task["progress_status"] = committed_status
+    task["progress_summary"] = summary
+    task["progress_turn_id"] = turn_id
+    task["progress_sha256"] = progress_sha256
+    task["turn_count"] = turn_count
+    task["updated_at"] = now
+    append_daemon_event(
+        state,
+        "orchestration_dynamic_progress_committed",
+        {
+            "run_id": run_id,
+            "graph_version": graph_version,
+            "task_key": task_key,
+            "task_number": task["task_number"],
+            "agent": agent_name,
+            "attempt": attempt,
+            "turn_id": turn_id,
+            "turn_count": turn_count,
+            "max_turns": max_turns,
+            "status": committed_status,
+            "progress_sha256": progress_sha256,
+            "checkpoint_sha256": hashlib.sha256(
+                json.dumps(
+                    normalized["checkpoint"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "next_action_present": bool(next_action),
+            "body_present": False,
+        },
+    )
+    return {
+        "outcome": outcome,
+        "status": committed_status,
+        "turn_count": turn_count,
+        "max_turns": max_turns,
+        "progress_sha256": progress_sha256,
+    }
+
+
+def validate_dynamic_task_create(
+    payload: Any,
+    run: dict[str, Any],
+    parent: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, "TASK_CREATE_NOT_OBJECT"
+    expected_top = {
+        "schema",
+        "run_id",
+        "graph_version",
+        "parent_task_key",
+        "tasks",
+    }
+    if set(payload) != expected_top:
+        return None, "TASK_CREATE_UNKNOWN_OR_MISSING_FIELD"
+    if payload.get("schema") != DYNAMIC_TASK_CREATE_SCHEMA:
+        return None, "TASK_CREATE_SCHEMA_MISMATCH"
+    if payload.get("run_id") != run.get("run_id"):
+        return None, "TASK_CREATE_RUN_MISMATCH"
+    if payload.get("graph_version") != run.get("graph_version"):
+        return None, "TASK_CREATE_GRAPH_VERSION_MISMATCH"
+    if payload.get("parent_task_key") != parent.get("task_key"):
+        return None, "TASK_CREATE_PARENT_MISMATCH"
+    raw_tasks = payload.get("tasks")
+    if not isinstance(raw_tasks, list) or not (
+        1 <= len(raw_tasks) <= DYNAMIC_TASK_MAX_COUNT
+    ):
+        return None, "TASK_CREATE_COUNT_INVALID"
+    if (
+        len(canonical_dynamic_task_create_bytes(payload))
+        > DYNAMIC_TASK_CREATE_MAX_BYTES
+    ):
+        return None, "TASK_CREATE_BUDGET_EXCEEDED"
+    expected_task_keys = {
+        "task_key",
+        "title",
+        "objective",
+        "required_capabilities",
+        "acceptance",
+        "phase",
+        "delivery_target",
+    }
+    expected_target = dynamic_root_thread(run)
+    parent_phase = int(parent.get("phase") or 0)
+    normalized_tasks: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for item in raw_tasks:
+        if not isinstance(item, dict) or set(item) != expected_task_keys:
+            return None, "TASK_CREATE_TASK_UNKNOWN_OR_MISSING_FIELD"
+        task_key = item.get("task_key")
+        if (
+            not isinstance(task_key, str)
+            or DYNAMIC_TASK_KEY_RE.fullmatch(task_key) is None
+            or task_key == DYNAMIC_PLAN_TASK_KEY
+            or task_key in seen_keys
+        ):
+            return None, "TASK_CREATE_TASK_KEY_INVALID"
+        seen_keys.add(task_key)
+        title = item.get("title")
+        objective = item.get("objective")
+        if not isinstance(title, str) or not (1 <= len(title.strip()) <= 120):
+            return None, "TASK_CREATE_TITLE_INVALID"
+        if not isinstance(objective, str) or not (
+            1 <= len(objective.strip()) <= 1000
+        ):
+            return None, "TASK_CREATE_OBJECTIVE_INVALID"
+        capabilities = item.get("required_capabilities")
+        if not isinstance(capabilities, list) or len(capabilities) > 8:
+            return None, "TASK_CREATE_CAPABILITIES_INVALID"
+        normalized_caps: list[str] = []
+        for capability in capabilities:
+            if not isinstance(capability, str):
+                return None, "TASK_CREATE_CAPABILITIES_INVALID"
+            normalized = capability.strip().lower()
+            if DYNAMIC_CAPABILITY_RE.fullmatch(normalized) is None:
+                return None, "TASK_CREATE_CAPABILITIES_INVALID"
+            if normalized not in normalized_caps:
+                normalized_caps.append(normalized)
+        acceptance = item.get("acceptance")
+        if not isinstance(acceptance, list) or not (1 <= len(acceptance) <= 8):
+            return None, "TASK_CREATE_ACCEPTANCE_INVALID"
+        normalized_acceptance: list[str] = []
+        for criterion in acceptance:
+            if (
+                not isinstance(criterion, str)
+                or not criterion.strip()
+                or len(criterion.strip()) > 500
+            ):
+                return None, "TASK_CREATE_ACCEPTANCE_INVALID"
+            normalized_acceptance.append(criterion.strip())
+        phase = item.get("phase")
+        if (
+            not isinstance(phase, int)
+            or isinstance(phase, bool)
+            or not (parent_phase <= phase <= 3)
+        ):
+            return None, "TASK_CREATE_PHASE_INVALID"
+        if item.get("delivery_target") != expected_target:
+            return None, "TASK_CREATE_DELIVERY_TARGET_INVALID"
+        normalized_tasks.append(
+            {
+                "task_key": task_key,
+                "title": title.strip(),
+                "objective": objective.strip(),
+                "required_capabilities": normalized_caps,
+                "acceptance": normalized_acceptance,
+                "phase": phase,
+                "delivery_target": expected_target,
+            }
+        )
+    return {
+        "schema": DYNAMIC_TASK_CREATE_SCHEMA,
+        "run_id": run["run_id"],
+        "graph_version": int(run["graph_version"]),
+        "parent_task_key": parent["task_key"],
+        "tasks": normalized_tasks,
+    }, None
+
+
+def commit_dynamic_task_create_in_state(
+    state: dict[str, Any],
+    run_id: str,
+    graph_version: int,
+    parent_task_key: str,
+    attempt: int,
+    agent_name: str,
+    turn_id: int,
+    payload: Any,
+    parse_error: str | None = None,
+) -> dict[str, Any]:
+    run = dynamic_run_by_id(state, run_id)
+    parent = dynamic_task_by_key(
+        state,
+        run_id,
+        graph_version,
+        parent_task_key,
+    )
+    if run is None or parent is None:
+        return {"outcome": "rejected", "code": "NOT_FOUND"}
+    def reject(code: str) -> dict[str, Any]:
+        append_daemon_event(
+            state,
+            "orchestration_dynamic_task_create_rejected",
+            {
+                "run_id": run_id,
+                "graph_version": graph_version,
+                "parent_task_key": parent_task_key,
+                "agent": agent_name,
+                "attempt": attempt,
+                "turn_id": turn_id,
+                "error_code": code,
+                "tasks_created": 0,
+                "graph_mutated": False,
+                "body_present": False,
+            },
+        )
+        return {"outcome": "rejected", "code": code}
+
+    if str(run.get("state") or "") != "active":
+        return reject("TASK_CREATE_RUN_NOT_ACTIVE")
+    now = current_timestamp()
+    if (
+        str(parent.get("owner") or "") != agent_name
+        or int(parent.get("attempt") or 0) != attempt
+        or str(parent.get("state") or "") not in {"claimed", "running"}
+    ):
+        return reject("TASK_CREATE_FENCE_MISMATCH")
+    if (
+        not parent.get("lease_expires_at")
+        or str(parent["lease_expires_at"]) < now
+    ):
+        return reject("TASK_CREATE_LEASE_EXPIRED")
+    turn = next(
+        (
+            row
+            for row in state.get("daemon_turns", [])
+            if int(row.get("id") or 0) == turn_id
+        ),
+        None,
+    )
+    if (
+        turn is None
+        or str(turn.get("agent") or "") != agent_name
+        or str(turn.get("status") or "") != "running"
+        or str(turn.get("input_message_id") or "") != str(run["root_message_id"])
+    ):
+        return reject("TASK_CREATE_TURN_PROVENANCE_INVALID")
+    if not dynamic_owner_read_satisfied(state, parent, agent_name, turn_id):
+        return reject("TASK_CREATE_BODY_READ_REQUIRED")
+    owner_reads = [
+        detail
+        for detail in orchestration_event_details(
+            state,
+            "orchestration_dynamic_body_read",
+            run_id,
+        )
+        if str(detail.get("task_key") or "") == parent_task_key
+        and str(detail.get("agent") or "") == agent_name
+        and int(detail.get("attempt") or 0) == attempt
+        and str(detail.get("query_turn_id") or "") == str(turn_id)
+        and detail.get("explicit_query") is True
+    ]
+    read_human_seq = max(
+        (int(detail.get("query_human_head_seq") or 0) for detail in owner_reads),
+        default=0,
+    )
+    current_human_seq = latest_human_target_message_seq(
+        state,
+        dynamic_root_thread(run),
+    )
+    if current_human_seq > read_human_seq:
+        return reject("TASK_CREATE_FRESHNESS_REQUIRED")
+    if parse_error is not None:
+        return reject(parse_error)
+    normalized, validation_error = validate_dynamic_task_create(
+        payload,
+        run,
+        parent,
+    )
+    if validation_error is not None:
+        return reject(validation_error)
+    assert normalized is not None
+    creation_bytes = canonical_dynamic_task_create_bytes(normalized)
+    creation_sha256 = hashlib.sha256(creation_bytes).hexdigest()
+    requested_keys = {
+        str(item["task_key"])
+        for item in normalized["tasks"]
+    }
+    same_turn_children = [
+        row
+        for row in state.get("orchestration_tasks", [])
+        if str(row.get("run_id") or "") == run_id
+        and int(row.get("graph_version") or 0) == graph_version
+        and str(row.get("parent_task_key") or "") == parent_task_key
+        and str(row.get("creator_agent") or "") == agent_name
+        and int(row.get("creator_turn_id") or 0) == turn_id
+    ]
+    if same_turn_children and {
+        str(row.get("task_key") or "") for row in same_turn_children
+    } != requested_keys:
+        return reject("TASK_CREATE_TURN_CONFLICT")
+    existing = {
+        str(row.get("task_key") or ""): row
+        for row in state.get("orchestration_tasks", [])
+        if str(row.get("run_id") or "") == run_id
+        and int(row.get("graph_version") or 0) == graph_version
+        and str(row.get("task_key") or "") in requested_keys
+    }
+    if existing:
+        if (
+            set(existing) == requested_keys
+            and all(
+                str(row.get("parent_task_key") or "") == parent_task_key
+                and str(row.get("creator_agent") or "") == agent_name
+                and int(row.get("creator_turn_id") or 0) == turn_id
+                and str(row.get("creation_sha256") or "") == creation_sha256
+                for row in existing.values()
+            )
+        ):
+            return {
+                "outcome": "idempotent",
+                "creation_sha256": creation_sha256,
+                "task_count": len(existing),
+                "task_keys": sorted(existing),
+            }
+        return reject("TASK_CREATE_KEY_CONFLICT")
+    graph_count = sum(
+        1
+        for row in state.get("orchestration_tasks", [])
+        if str(row.get("run_id") or "") == run_id
+        and int(row.get("graph_version") or 0) == graph_version
+        and str(row.get("task_key") or "") != DYNAMIC_PLAN_TASK_KEY
+    )
+    if graph_count + len(normalized["tasks"]) > DYNAMIC_GRAPH_MAX_COUNT:
+        return reject("TASK_CREATE_GRAPH_BUDGET_EXCEEDED")
+
+    created: list[dict[str, Any]] = []
+    graph_rows = [
+        row
+        for row in state.get("orchestration_tasks", [])
+        if str(row.get("run_id") or "") == run_id
+        and int(row.get("graph_version") or 0) == graph_version
+        and str(row.get("task_key") or "") != DYNAMIC_PLAN_TASK_KEY
+    ]
+    for item in normalized["tasks"]:
+        phase = int(item["phase"])
+        prior = [row for row in graph_rows + created if int(row["phase"]) < phase]
+        state_value = (
+            "open"
+            if not prior
+            or all(str(row.get("state") or "") == "done" for row in prior)
+            else "blocked"
+        )
+        generic = append_task_for_author(
+            state,
+            str(run["root_target"]),
+            str(item["title"]),
+            agent_name,
+        )
+        row = {
+            "run_id": run_id,
+            "graph_version": graph_version,
+            "task_key": item["task_key"],
+            "task_number": int(generic["number"]),
+            "title": item["title"],
+            "objective": item["objective"],
+            "phase": phase,
+            "delivery_target": item["delivery_target"],
+            "required_capabilities": list(item["required_capabilities"]),
+            "acceptance": list(item["acceptance"]),
+            "planner_turn_id": turn_id,
+            "plan_attempt": attempt,
+            "plan_sha256": creation_sha256,
+            "state": state_value,
+            "owner": None,
+            "attempt": 0,
+            "lease_expires_at": (
+                dynamic_claim_lease_expires_at(
+                    now,
+                    DYNAMIC_CLAIM_LEASE_SECONDS,
+                )
+                if state_value == "open"
+                else None
+            ),
+            "last_heartbeat_at": None,
+            "session_id": None,
+            "checkpoint": {},
+            "next_action": None,
+            "progress_status": None,
+            "progress_summary": None,
+            "progress_turn_id": None,
+            "progress_sha256": None,
+            "turn_count": 0,
+            "max_turns": DYNAMIC_MAX_TURNS_DEFAULT,
+            "parent_task_key": parent_task_key,
+            "creator_agent": agent_name,
+            "creator_turn_id": turn_id,
+            "creation_sha256": creation_sha256,
+            "result_sha256": None,
+            "created_at": now,
+            "updated_at": now,
+            "committed_at": None,
+        }
+        state.setdefault("orchestration_tasks", []).append(row)
+        created.append(row)
+    run["updated_at"] = now
+    append_daemon_event(
+        state,
+        "orchestration_dynamic_tasks_created",
+        {
+            "run_id": run_id,
+            "graph_version": graph_version,
+            "parent_task_key": parent_task_key,
+            "creator_agent": agent_name,
+            "creator_attempt": attempt,
+            "creator_turn_id": turn_id,
+            "creation_sha256": creation_sha256,
+            "task_count": len(created),
+            "task_keys": [str(row["task_key"]) for row in created],
+            "graph_count": graph_count + len(created),
+            "append_only": True,
+            "creator_claimed_children": 0,
+            "body_present": False,
+        },
+    )
+    receipt_kind = f"tasks_created:{turn_id}"
+    receipt_key = (
+        run_id,
+        graph_version,
+        parent_task_key,
+        attempt,
+        receipt_kind,
+    )
+    if not any(
+        (
+            str(row.get("run_id") or ""),
+            int(row.get("graph_version") or 0),
+            str(row.get("task_key") or ""),
+            int(row.get("attempt") or 0),
+            str(row.get("receipt_kind") or ""),
+        )
+        == receipt_key
+        for row in state.get("orchestration_receipts", [])
+    ):
+        thread = dynamic_root_thread(run)
+        record = append_message(
+            state,
+            thread,
+            (
+                f"New work discovered: run={run_id} graph={graph_version} "
+                f"parent={parent_task_key} tasks={len(created)} "
+                f"creation_sha256={creation_sha256}."
+            ),
+            author=agent_name,
+        )
+        state.setdefault("orchestration_receipts", []).append(
+            {
+                "run_id": run_id,
+                "graph_version": graph_version,
+                "task_key": parent_task_key,
+                "attempt": attempt,
+                "receipt_kind": receipt_kind,
+                "delivery_target": thread,
+                "root_message_id": run["root_message_id"],
+                "author": agent_name,
+                "message_id": str(record["id"]),
+                "committed_at": now,
+            }
+        )
+    for row in created:
+        if str(row["state"]) == "open":
+            emit_dynamic_task_notices(state, run, row)
+    return {
+        "outcome": "committed",
+        "creation_sha256": creation_sha256,
+        "task_count": len(created),
+        "task_keys": [str(row["task_key"]) for row in created],
+    }
+
+
 def validate_dynamic_plan(
     payload: Any,
     run: dict[str, Any],
@@ -9605,7 +10694,7 @@ def validate_dynamic_plan(
         if not isinstance(objective, str) or not (1 <= len(objective.strip()) <= 1000):
             return None, "PLAN_OBJECTIVE_INVALID"
         capabilities = item.get("required_capabilities")
-        if not isinstance(capabilities, list) or not (1 <= len(capabilities) <= 8):
+        if not isinstance(capabilities, list) or len(capabilities) > 8:
             return None, "PLAN_CAPABILITIES_INVALID"
         normalized_caps: list[str] = []
         for capability in capabilities:
@@ -9897,13 +10986,11 @@ def commit_dynamic_plan_in_state(
     now = current_timestamp()
     created_tasks: list[dict[str, Any]] = []
     for planned in normalized["tasks"]:
-        internal_message_id = f"dynamic:{run_id}:{int(run['graph_version'])}:{planned['task_key']}"
-        generic = dynamic_internal_task_row(
+        generic = append_task_for_author(
             state,
             str(run["root_target"]),
             str(planned["title"]),
-            "swarm-runtime",
-            internal_message_id,
+            agent_name,
         )
         row = {
             "run_id": run_id,
@@ -9931,6 +11018,19 @@ def commit_dynamic_plan_in_state(
                 else None
             ),
             "last_heartbeat_at": None,
+            "session_id": None,
+            "checkpoint": {},
+            "next_action": None,
+            "progress_status": None,
+            "progress_summary": None,
+            "progress_turn_id": None,
+            "progress_sha256": None,
+            "turn_count": 0,
+            "max_turns": DYNAMIC_MAX_TURNS_DEFAULT,
+            "parent_task_key": None,
+            "creator_agent": agent_name,
+            "creator_turn_id": turn_id,
+            "creation_sha256": plan_sha256,
             "result_sha256": None,
             "created_at": now,
             "updated_at": now,
@@ -11098,7 +12198,7 @@ def command_agent_dynamic_start(argv: list[str]) -> int:
             + f"Graph version: {run['graph_version']}\n"
             + f"Planner task: {planner_task['task_number'] if planner_task else '-'}\n"
             + f"Eligible planner notices: {candidate_count}\n"
-            + "Human-visible internal tickets: 0\n"
+            + "Task board mode: visible message-backed tasks; create and claim are separate\n"
         )
 
     return with_mutable_state(action)
@@ -11225,6 +12325,185 @@ def command_agent_plan_commit(argv: list[str]) -> int:
     return write_stderr(
         f"Error: dynamic task plan rejected ({result.get('code')})\n"
         f"Code: {result.get('code') or 'PLAN_REJECTED'}\n"
+    )
+
+
+def command_agent_task_create(argv: list[str]) -> int:
+    allowed = {
+        "--run-id",
+        "--graph-version",
+        "--parent-task-key",
+        "--attempt",
+    }
+    unknown = unknown_flags(argv, allowed)
+    if unknown:
+        return write_stderr(
+            f"Error: unknown agent task-create flag: {unknown[0]}\n"
+            "Code: INVALID_ARG\n"
+        )
+    for flag in allowed:
+        if flag_missing_value(argv, flag):
+            return write_stderr(f"Error: {flag} requires a value\nCode: INVALID_ARG\n")
+    run_id = arg_value(argv, "--run-id")
+    parent_task_key = arg_value(argv, "--parent-task-key")
+    graph_text = arg_value(argv, "--graph-version")
+    attempt_text = arg_value(argv, "--attempt")
+    agent_name = str(os.environ.get("SWARM_AGENT_NAME") or "").removeprefix("@")
+    turn_text = str(os.environ.get("SWARM_TURN_ID") or "")
+    if (
+        not run_id
+        or not parent_task_key
+        or graph_text is None
+        or attempt_text is None
+    ):
+        return write_stderr(
+            "Error: --run-id, --graph-version, --parent-task-key, and --attempt "
+            "are required\nCode: INVALID_ARG\n"
+        )
+    if not agent_name or not turn_text:
+        return write_stderr(
+            "Error: task-create requires SWARM_AGENT_NAME and SWARM_TURN_ID "
+            "from a live turn\nCode: TASK_CREATE_PROVENANCE_REQUIRED\n"
+        )
+    try:
+        graph_version = int(graph_text)
+        attempt = int(attempt_text)
+        turn_id = int(turn_text)
+    except ValueError:
+        return write_stderr(
+            "Error: --graph-version/--attempt/SWARM_TURN_ID must be integers\n"
+            "Code: INVALID_ARG\n"
+        )
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return write_stderr(
+            "Error: typed task-create JSON is required on stdin\n"
+            "Code: EMPTY_TASK_CREATE\n"
+        )
+    if len(raw.encode("utf-8")) > DYNAMIC_TASK_CREATE_MAX_BYTES:
+        payload: Any = {}
+        parse_error = "TASK_CREATE_BUDGET_EXCEEDED"
+    else:
+        try:
+            payload = json.loads(raw)
+            parse_error = None
+        except json.JSONDecodeError:
+            payload = {}
+            parse_error = "TASK_CREATE_JSON_INVALID"
+    result = with_mutable_state_value(
+        lambda state: commit_dynamic_task_create_in_state(
+            state,
+            run_id,
+            graph_version,
+            parent_task_key,
+            attempt,
+            agent_name,
+            turn_id,
+            payload,
+            parse_error,
+        )
+    )
+    if result.get("outcome") in {"committed", "idempotent"}:
+        return write_stdout(
+            "Dynamic tasks created.\n"
+            f"Outcome: {result['outcome']}\n"
+            f"Run ID: {run_id}\n"
+            f"Graph version: {graph_version}\n"
+            f"Parent task key: {parent_task_key}\n"
+            f"Tasks: {result['task_count']}\n"
+            f"Creation SHA256: {result['creation_sha256']}\n"
+        )
+    return write_stderr(
+        f"Error: dynamic task creation rejected ({result.get('code')})\n"
+        f"Code: {result.get('code') or 'TASK_CREATE_REJECTED'}\n"
+    )
+
+
+def command_agent_task_progress_commit(argv: list[str]) -> int:
+    allowed = {"--run-id", "--graph-version", "--task-key", "--attempt"}
+    unknown = unknown_flags(argv, allowed)
+    if unknown:
+        return write_stderr(
+            f"Error: unknown agent task-progress-commit flag: {unknown[0]}\n"
+            "Code: INVALID_ARG\n"
+        )
+    for flag in allowed:
+        if flag_missing_value(argv, flag):
+            return write_stderr(f"Error: {flag} requires a value\nCode: INVALID_ARG\n")
+    run_id = arg_value(argv, "--run-id")
+    task_key = arg_value(argv, "--task-key")
+    graph_text = arg_value(argv, "--graph-version")
+    attempt_text = arg_value(argv, "--attempt")
+    agent_name = str(os.environ.get("SWARM_AGENT_NAME") or "").removeprefix("@")
+    turn_text = str(os.environ.get("SWARM_TURN_ID") or "")
+    if not run_id or not task_key or graph_text is None or attempt_text is None:
+        return write_stderr(
+            "Error: --run-id, --graph-version, --task-key, and --attempt are required\n"
+            "Code: INVALID_ARG\n"
+        )
+    if not agent_name or not turn_text:
+        return write_stderr(
+            "Error: task-progress-commit requires SWARM_AGENT_NAME and SWARM_TURN_ID "
+            "from a live turn\nCode: PROGRESS_PROVENANCE_REQUIRED\n"
+        )
+    try:
+        graph_version = int(graph_text)
+        attempt = int(attempt_text)
+        turn_id = int(turn_text)
+    except ValueError:
+        return write_stderr(
+            "Error: --graph-version/--attempt/SWARM_TURN_ID must be integers\n"
+            "Code: INVALID_ARG\n"
+        )
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return write_stderr(
+            "Error: typed progress JSON is required on stdin\n"
+            "Code: EMPTY_PROGRESS\n"
+        )
+    if len(raw.encode("utf-8")) > DYNAMIC_PROGRESS_MAX_BYTES:
+        payload: Any = {}
+        parse_error = "PROGRESS_BUDGET_EXCEEDED"
+    else:
+        try:
+            payload = json.loads(raw)
+            parse_error = None
+        except json.JSONDecodeError:
+            payload = {}
+            parse_error = "PROGRESS_JSON_INVALID"
+
+    result = with_mutable_state_value(
+        lambda state: commit_dynamic_progress_in_state(
+            state,
+            run_id,
+            graph_version,
+            task_key,
+            attempt,
+            agent_name,
+            turn_id,
+            payload,
+            parse_error,
+        )
+    )
+    if result.get("outcome") in {
+        "committed",
+        "idempotent",
+        "budget_exhausted",
+    }:
+        return write_stdout(
+            "Dynamic task progress committed.\n"
+            f"Outcome: {result['outcome']}\n"
+            f"Run ID: {run_id}\n"
+            f"Graph version: {graph_version}\n"
+            f"Task key: {task_key}\n"
+            f"Attempt: {attempt}\n"
+            f"Status: {result['status']}\n"
+            f"Turn: {result['turn_count']}/{result['max_turns']}\n"
+            f"Progress SHA256: {result['progress_sha256']}\n"
+        )
+    return write_stderr(
+        f"Error: dynamic task progress rejected ({result.get('code')})\n"
+        f"Code: {result.get('code') or 'PROGRESS_REJECTED'}\n"
     )
 
 
@@ -12256,6 +13535,10 @@ def command_agent(argv: list[str]) -> int:
         return command_agent_task_claim(rest)
     if subcommand == "plan-commit":
         return command_agent_plan_commit(rest)
+    if subcommand == "task-create":
+        return command_agent_task_create(rest)
+    if subcommand == "task-progress-commit":
+        return command_agent_task_progress_commit(rest)
     if subcommand == "dynamic-list":
         return command_agent_dynamic_list(rest)
     return write_stderr(f"Error: unknown agent subcommand: {subcommand}\nCode: INVALID_ARG\n")
