@@ -67,12 +67,30 @@ if task_key == "plan":
     )
     if required_contract not in prompt or "never put objects" not in prompt:
         raise SystemExit("planner prompt omitted the strict acceptance string-array contract")
+    native_contract = (
+        "[native coding-agent runtime contract]",
+        "The native conversation loop is primary.",
+        "[native dialogue gate]",
+        "This early reply must happen before `swarm agent plan-commit`",
+    )
+    if any(fragment not in prompt for fragment in native_contract):
+        raise SystemExit("planner prompt omitted the native reply-before-task contract")
 subprocess.run(
     ["swarm", "message", "read", "--channel", target, "--around", root_id[:8]],
     check=True,
     stdout=subprocess.DEVNULL,
 )
 if task_key == "plan":
+    acknowledged = subprocess.run(
+        ["swarm", "message", "send", "--target", target],
+        input="yeah, I’ll handle the request first, then coordinate any execution work.",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if acknowledged.returncode != 0:
+        sys.stderr.write(acknowledged.stderr)
+        raise SystemExit(acknowledged.returncode)
     payload = {
         "schema": "swarm.dynamic-tasks.v1",
         "run_id": run_id,
@@ -1314,6 +1332,29 @@ def main() -> int:
             )
             assert len(receipts) == 4
             assert len({row["message_id"] for row in receipts}) == 4
+            acknowledgment = rows(
+                conn,
+                """
+                SELECT seq,body FROM messages
+                WHERE target=? AND body=?
+                """,
+                (
+                    f"#general:{root_id[:8]}",
+                    "yeah, I’ll handle the request first, then coordinate any execution work.",
+                ),
+            )
+            assert len(acknowledgment) == 1
+            first_task_receipt_seq = rows(
+                conn,
+                """
+                SELECT MIN(m.seq) AS seq
+                FROM orchestration_receipts r
+                JOIN messages m ON m.id=r.message_id
+                WHERE r.run_id=?
+                """,
+                (run_id,),
+            )[0]["seq"]
+            assert int(acknowledgment[0]["seq"]) < int(first_task_receipt_seq)
             claims = event_details(conn, "orchestration_dynamic_claim")
             collision_groups: dict[str, list[dict]] = {}
             for claim in claims:

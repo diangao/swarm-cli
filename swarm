@@ -42,6 +42,44 @@ CREDENTIAL_SHAPE_RE = re.compile(
     r")"
 )
 
+NATIVE_AGENT_RUNTIME_PROMPT = """[native coding-agent runtime contract]
+## Startup sequence
+
+1. If this turn already includes a concrete incoming message, first decide whether that message needs a visible acknowledgment, blocker question, or ownership signal. If it does, send it early with `swarm message send` before deep context gathering.
+2. Read MEMORY.md (in your cwd) and then only the additional memory/files you need to handle the current turn well.
+3. When you receive a message, process it and reply with `swarm message send`.
+4. **Complete ALL your work before stopping.** If a task requires multi-step work (research, code changes, testing), finish everything, report results, then stop.
+
+### Tasks
+
+When someone sends a message that asks you to do something — fix a bug, write code, review a PR, deploy, investigate an issue — that is work. Claim it before you start.
+
+**Decision rule:** if fulfilling a message requires you to take action beyond just replying (running tools, writing code, making changes), claim the message first. If you're only answering a question or having a conversation, no claim is needed.
+
+**Workflow:**
+1. Receive a message that requires action → acknowledge it normally, then claim the existing message/task before starting work.
+2. If the claim fails, someone else is working on it — do not work on that task unless an owner/admin explicitly redirects it to you.
+3. Post progress in the task's existing thread.
+4. When done, set status to `in_review` so a human can validate it.
+5. After approval, set status to `done`.
+
+**What `swarm task create` means:**
+- Tasks live in the same chat flow as messages. A task is a message with task metadata, not a separate source of truth.
+- `swarm task create` creates a brand-new message and publishes it as a task-message. It does not assign the task.
+- Use it only for genuinely new parallel subtasks or follow-up work.
+- If the user already sent the work item as a message, claim that existing message/task instead of creating a duplicate.
+
+## Communication style
+
+Keep the user informed. They cannot see your internal reasoning, so:
+- Reply to the user normally before exposing task mechanics.
+- When you receive work, acknowledge it and briefly outline your plan before starting.
+- For multi-step work, send short progress updates.
+- When done, summarize the result.
+- Keep updates concise — one or two sentences. Do not flood the chat.
+
+The native conversation loop is primary. Do not lead with a task breakdown, claim receipt, or planner narration. Task metadata coordinates execution after the normal reply; it does not replace that reply."""
+
 
 def message(
     seq: int,
@@ -6212,6 +6250,15 @@ def prepare_daemon_turn(
                             + f"owner=@{agent_name} attempt={attempt} lease={task['lease_expires_at']}\n\n"
                             + "[owner QUERY required]\n"
                             + owner_query
+                            + "\n\n[native dialogue gate]\n"
+                            + "After the required owner read and before committing any plan, handle the "
+                            + "human root through the normal coding-agent conversation loop. If the message "
+                            + "needs a visible acknowledgment, blocker question, ownership signal, or direct "
+                            + "answer, send that first with `swarm message send --target "
+                            + shlex.quote(target)
+                            + "`. Speak naturally about the request; do not lead with a task breakdown, "
+                            + "claim receipt, or planner mechanics. This early reply must happen before "
+                            + "`swarm agent plan-commit` materializes any subtasks. "
                             + "\n\n[typed planner contract]\n"
                             + "After the read, use your judgment to bootstrap the first variable set of 1–8 "
                             + "concrete tasks. The runtime must not choose the count or taxonomy. This is only "
@@ -6485,6 +6532,7 @@ def prepare_daemon_turn(
                         + "\n\nLive agent presence snapshot (ledger at turn start):\n"
                         + (presence_context or "(no agent presence available)")
                     )
+        input_text = input_text.rstrip() + "\n\n" + NATIVE_AGENT_RUNTIME_PROMPT
         # For a wake, freshness is relative to the newest fact actually
         # included in that wake's bounded view. A newer human may already be
         # queued before this older turn starts; using the absolute target head

@@ -3545,9 +3545,9 @@ def probe_daemon_turn_runner(cli: Path, state_dir: Path) -> None:
         "\n".join(
             [
                 "args = sys.argv[1:]",
-                "if payload == 'sleep':",
+                "if payload.startswith('sleep'):",
                 "    time.sleep(2)",
-                "if payload == 'leak':",
+                "if payload.startswith('leak'):",
                 "    print('sk' + '_agent_probe_runtime_secret')",
                 "    raise SystemExit(0)",
                 "print(json.dumps({",
@@ -3948,20 +3948,35 @@ def probe_codex_turn_adapter(cli: Path, state_dir: Path) -> None:
     require("completed" in second and "message=" in second, "Codex resume turn did not complete")
 
     history = run(cli, state_dir, "message", "read", "--channel", "#codex-adapter").stdout
-    require("codex first: first codex_home=True" in history, "Codex first-turn final message was not extracted")
-    require("codex resume: second codex_home=True" in history, "Codex resumed final message was not extracted")
+    require(
+        "codex first: first" in history and "codex_home=True" in history,
+        "Codex first-turn final message was not extracted",
+    )
+    require(
+        "codex resume: second" in history and history.count("codex_home=True") >= 2,
+        "Codex resumed final message was not extracted",
+    )
     require('"thread.started"' not in history, "Codex JSONL transport leaked into channel output")
 
     conn = connect_state(state_dir)
     try:
         turns = conn.execute(
-            "SELECT session_id, command_json, stdout_text FROM daemon_turns WHERE agent = ? ORDER BY id",
+            "SELECT session_id, command_json, stdout_text, input_text FROM daemon_turns WHERE agent = ? ORDER BY id",
             (agent,),
         ).fetchall()
     finally:
         conn.close()
     require(len(turns) == 2, "Codex adapter did not persist exactly two turns")
     require(all(row["session_id"] == thread_id for row in turns), "Codex thread id did not persist across resume")
+    require(
+        all(
+            "[native coding-agent runtime contract]" in row["input_text"]
+            and "The native conversation loop is primary." in row["input_text"]
+            and "Reply to the user normally before exposing task mechanics." in row["input_text"]
+            for row in turns
+        ),
+        "ordinary Codex turns omitted the native reply-before-task contract",
+    )
     first_command = json.loads(turns[0]["command_json"])
     second_command = json.loads(turns[1]["command_json"])
     require(first_command[1] == "exec" and "resume" not in first_command, "Codex first command used wrong CLI shape")
