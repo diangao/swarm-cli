@@ -1,0 +1,297 @@
+{
+  "targets": {
+    "channel": {
+      "kind": "channel",
+      "channelId": "chn_00000000000000000000000000"
+    },
+    "threadedChannel": {
+      "kind": "channel",
+      "channelId": "chn_00000000000000000000000000",
+      "threadRootMessageId": "msg_00000000000000000000000000"
+    },
+    "direct": {
+      "kind": "direct",
+      "conversationId": "cvs_00000000000000000000000000"
+    },
+    "threadedDirect": {
+      "kind": "direct",
+      "conversationId": "cvs_00000000000000000000000000",
+      "threadRootMessageId": "msg_00000000000000000000000000"
+    }
+  },
+  "deliveries": {
+    "first": {
+      "protocolVersion": 1,
+      "deliveryId": "dlv_00000000000000000000000000",
+      "attempt": 1,
+      "messageId": "msg_00000000000000000000000000",
+      "target": {
+        "kind": "channel",
+        "channelId": "chn_00000000000000000000000000"
+      },
+      "serverSeq": 1,
+      "producerFactId": "fac_00000000000000000000000000",
+      "agentId": "agt_00000000000000000000000000",
+      "machineId": "mch_00000000000000000000000000"
+    },
+    "launchFenced": {
+      "protocolVersion": 1,
+      "deliveryId": "dlv_11111111111111111111111111",
+      "attempt": 1,
+      "messageId": "msg_11111111111111111111111111",
+      "target": {
+        "kind": "direct",
+        "conversationId": "cvs_11111111111111111111111111",
+        "threadRootMessageId": "msg_22222222222222222222222222"
+      },
+      "serverSeq": 2,
+      "producerFactId": "fac_11111111111111111111111111",
+      "agentId": "agt_11111111111111111111111111",
+      "machineId": "mch_11111111111111111111111111",
+      "expectedLaunchId": "lnc_11111111111111111111111111"
+    },
+    "replay": {
+      "protocolVersion": 1,
+      "deliveryId": "dlv_22222222222222222222222222",
+      "attempt": 2,
+      "messageId": "msg_00000000000000000000000000",
+      "target": {
+        "kind": "channel",
+        "channelId": "chn_00000000000000000000000000",
+        "threadRootMessageId": "msg_33333333333333333333333333"
+      },
+      "serverSeq": 3,
+      "producerFactId": "fac_00000000000000000000000000",
+      "agentId": "agt_00000000000000000000000000",
+      "machineId": "mch_00000000000000000000000000",
+      "replayOf": "dlv_00000000000000000000000000"
+    }
+  },
+  "leases": {
+    "live": {
+      "taskId": "tsk_00000000000000000000000000",
+      "claimId": "clm_00000000000000000000000000",
+      "leaseId": "lse_00000000000000000000000000",
+      "leaseEpoch": 1,
+      "fenceToken": "fnc_00000000000000000000000000",
+      "attempt": 1,
+      "acquiredAt": "2026-08-06T08:00:00.000Z",
+      "expiresAt": "2026-08-06T08:05:00.000Z"
+    },
+    "renewal": {
+      "taskId": "tsk_00000000000000000000000000",
+      "claimId": "clm_00000000000000000000000000",
+      "leaseId": "lse_00000000000000000000000000",
+      "leaseEpoch": 1,
+      "fenceToken": "fnc_00000000000000000000000000",
+      "attempt": 1,
+      "acquiredAt": "2026-08-06T08:00:00.000Z",
+      "expiresAt": "2026-08-06T08:10:00.000Z"
+    }
+  },
+  "launches": {
+    "withoutWake": {
+      "protocolVersion": 1,
+      "commandId": "cmd_00000000000000000000000000",
+      "agentId": "agt_00000000000000000000000000",
+      "machineId": "mch_00000000000000000000000000",
+      "launchId": "lnc_00000000000000000000000000",
+      "runtime": "codex",
+      "workspaceGeneration": 1
+    },
+    "withWake": {
+      "protocolVersion": 1,
+      "commandId": "cmd_11111111111111111111111111",
+      "agentId": "agt_11111111111111111111111111",
+      "machineId": "mch_11111111111111111111111111",
+      "launchId": "lnc_11111111111111111111111111",
+      "runtime": "claude",
+      "workspaceGeneration": 2,
+      "wakeDeliveryId": "dlv_11111111111111111111111111"
+    }
+  },
+  "receipts": {
+    "serverAccepted": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_00000000000000000000000000",
+      "kind": "server_accepted",
+      "producerFactId": "fac_00000000000000000000000000",
+      "actor": { "serverId": "srv_00000000000000000000000000" },
+      "fence": {},
+      "occurredAt": "2026-08-06T08:00:00.000Z"
+    },
+    "claimWon": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_11111111111111111111111111",
+      "kind": "claim_won",
+      "producerFactId": "fac_11111111111111111111111111",
+      "actor": {
+        "serverId": "srv_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {
+        "leaseEpoch": 1,
+        "fenceToken": "fnc_00000000000000000000000000"
+      },
+      "occurredAt": "2026-08-06T08:00:01.000Z"
+    },
+    "daemonAccepted": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_22222222222222222222222222",
+      "kind": "daemon_accepted",
+      "producerFactId": "fac_22222222222222222222222222",
+      "actor": {
+        "machineId": "mch_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {},
+      "occurredAt": "2026-08-06T08:00:02.000Z"
+    },
+    "processSpawned": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_33333333333333333333333333",
+      "kind": "process_spawned",
+      "producerFactId": "fac_33333333333333333333333333",
+      "actor": {
+        "machineId": "mch_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {
+        "launchId": "lnc_00000000000000000000000000",
+        "stateInstanceId": "sti_00000000000000000000000000"
+      },
+      "occurredAt": "2026-08-06T08:00:03.000Z"
+    },
+    "runtimeReady": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_44444444444444444444444444",
+      "kind": "runtime_ready",
+      "producerFactId": "fac_44444444444444444444444444",
+      "actor": {
+        "machineId": "mch_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {
+        "launchId": "lnc_00000000000000000000000000",
+        "stateInstanceId": "sti_00000000000000000000000000",
+        "sessionId": "ses_00000000000000000000000000"
+      },
+      "occurredAt": "2026-08-06T08:00:04.000Z"
+    },
+    "inputWritten": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_55555555555555555555555555",
+      "kind": "input_written",
+      "producerFactId": "fac_55555555555555555555555555",
+      "actor": {
+        "machineId": "mch_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {
+        "launchId": "lnc_00000000000000000000000000",
+        "stateInstanceId": "sti_00000000000000000000000000",
+        "turnId": "trn_00000000000000000000000000",
+        "sessionId": "ses_00000000000000000000000000"
+      },
+      "occurredAt": "2026-08-06T08:00:05.000Z"
+    },
+    "modelVisible": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_66666666666666666666666666",
+      "kind": "model_visible",
+      "producerFactId": "fac_66666666666666666666666666",
+      "actor": {
+        "machineId": "mch_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {
+        "launchId": "lnc_00000000000000000000000000",
+        "stateInstanceId": "sti_00000000000000000000000000",
+        "turnId": "trn_00000000000000000000000000",
+        "sessionId": "ses_00000000000000000000000000"
+      },
+      "occurredAt": "2026-08-06T08:00:06.000Z"
+    },
+    "sideEffectTurn": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_77777777777777777777777777",
+      "kind": "side_effect_applied",
+      "producerFactId": "fac_77777777777777777777777777",
+      "actor": {
+        "machineId": "mch_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {
+        "launchId": "lnc_00000000000000000000000000",
+        "stateInstanceId": "sti_00000000000000000000000000",
+        "turnId": "trn_00000000000000000000000000",
+        "sessionId": "ses_00000000000000000000000000"
+      },
+      "occurredAt": "2026-08-06T08:00:07.000Z"
+    },
+    "sideEffectLeaseTurn": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_88888888888888888888888888",
+      "kind": "side_effect_applied",
+      "producerFactId": "fac_88888888888888888888888888",
+      "actor": {
+        "machineId": "mch_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {
+        "leaseEpoch": 1,
+        "fenceToken": "fnc_00000000000000000000000000",
+        "launchId": "lnc_00000000000000000000000000",
+        "stateInstanceId": "sti_00000000000000000000000000",
+        "turnId": "trn_00000000000000000000000000",
+        "sessionId": "ses_00000000000000000000000000"
+      },
+      "occurredAt": "2026-08-06T08:00:08.000Z"
+    },
+    "artifactPublished": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_99999999999999999999999999",
+      "kind": "artifact_published",
+      "producerFactId": "fac_99999999999999999999999999",
+      "actor": {
+        "machineId": "mch_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {
+        "leaseEpoch": 1,
+        "fenceToken": "fnc_00000000000000000000000000",
+        "launchId": "lnc_00000000000000000000000000",
+        "stateInstanceId": "sti_00000000000000000000000000",
+        "turnId": "trn_00000000000000000000000000",
+        "sessionId": "ses_00000000000000000000000000"
+      },
+      "artifactDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "occurredAt": "2026-08-06T08:00:09.000Z"
+    },
+    "reviewVerdict": {
+      "protocolVersion": 1,
+      "receiptId": "rcp_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kind": "review_verdict",
+      "producerFactId": "fac_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "actor": {
+        "machineId": "mch_00000000000000000000000000",
+        "agentId": "agt_00000000000000000000000000"
+      },
+      "fence": {
+        "leaseEpoch": 1,
+        "fenceToken": "fnc_00000000000000000000000000",
+        "launchId": "lnc_00000000000000000000000000",
+        "stateInstanceId": "sti_00000000000000000000000000",
+        "turnId": "trn_00000000000000000000000000",
+        "sessionId": "ses_00000000000000000000000000"
+      },
+      "artifactDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurredAt": "2026-08-06T08:00:10.000Z"
+    }
+  },
+  "negotiation": {
+    "exact": [{ "major": 0, "minMinor": 1, "maxMinor": 1 }, { "major": 0, "minMinor": 1, "maxMinor": 1 }, 1],
+    "newLocalOldRemote": [{ "major": 0, "minMinor": 1, "maxMinor": 2 }, { "major": 0, "minMinor": 1, "maxMinor": 1 }, 1],
+    "oldLocalNewRemote": [{ "major": 0, "minMinor": 1, "maxMinor": 1 }, { "major": 0, "minMinor": 1, "maxMinor": 2 }, 1]
+  }
+}
