@@ -1,0 +1,21 @@
+{
+  "name": "swarm-cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.19.0",
+    "pnpm": "10.15.1"
+  },
+  "packageManager": "pnpm@10.15.1+sha512.34e538c329b5553014ca8e8f4535997f96180a1d0f614339357449935350d924e22f8614682191264ec33d1462ac21561aff97f6bb18065351c162c7e8f6de67",
+  "scripts": {
+    "typecheck": "pnpm --recursive run typecheck",
+    "test": "pnpm --recursive run test",
+    "check:boundaries": "node scripts/check-package-boundaries.mjs",
+    "check:boundaries:negative": "node scripts/check-package-boundaries.mjs --seeded-negative"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "5.9.3"
+  }
+}

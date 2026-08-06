@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "../../build/protocol-test",
+    "declaration": false,
+    "sourceMap": true
+  }
+}

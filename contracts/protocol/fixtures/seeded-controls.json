@@ -1,0 +1,10 @@
+[
+  { "seed": "unknown-field-stripping", "expected": "UNKNOWN_FIELD" },
+  { "seed": "permissive-enum", "expected": "UNSUPPORTED_VARIANT" },
+  { "seed": "mixed-union", "expected": "UNKNOWN_FIELD" },
+  { "seed": "partial-fence", "expected": "INVARIANT_VIOLATION" },
+  { "seed": "number-coercion", "expected": "INVALID_SCALAR" },
+  { "seed": "id-only-retry", "expected": "IDEMPOTENCY_CONFLICT" },
+  { "seed": "duplicate-key-reader", "expected": "DUPLICATE_KEY" },
+  { "seed": "same-major-version", "expected": "PROTOCOL_VERSION_NOT_NEGOTIATED" }
+]
