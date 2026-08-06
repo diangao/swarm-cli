@@ -1,0 +1,56 @@
+[
+  {
+    "name": "protocol-storage-import",
+    "package": "protocol",
+    "source": "import type { StorageRecord } from \"@swarm/storage\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "storage-security-lateral-import",
+    "package": "storage",
+    "source": "import { policy } from \"@swarm/security\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "verifier-storage-import",
+    "package": "verifiers",
+    "source": "import { repository } from \"@swarm/storage\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "testkit-process-import",
+    "package": "testkit",
+    "source": "import { spawn } from \"node:child_process\";",
+    "expectedKind": "forbidden-builtin"
+  },
+  {
+    "name": "undeclared-workspace-import",
+    "package": "testkit",
+    "source": "import type { DeliveryId } from \"@swarm/protocol\";",
+    "expectedKind": "undeclared-workspace-import"
+  },
+  {
+    "name": "undeclared-external-import",
+    "package": "storage",
+    "source": "import postgres from \"pg\";",
+    "expectedKind": "undeclared-external-import"
+  },
+  {
+    "name": "unknown-package",
+    "package": "unknown",
+    "source": "export const value = 1;",
+    "expectedKind": "unknown-package"
+  },
+  {
+    "name": "relative-cross-package-escape",
+    "package": "protocol",
+    "source": "export { value } from \"../../../scripts/value.js\";",
+    "expectedKind": "relative-package-escape"
+  },
+  {
+    "name": "absolute-import",
+    "package": "security",
+    "source": "import value from \"/tmp/value.js\";",
+    "expectedKind": "absolute-import"
+  }
+]
