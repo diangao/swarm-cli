@@ -35,10 +35,32 @@ jobs:
     name: regression
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16-bookworm@sha256:64154d0babcb1741988719e703419af0382b19953706149f9872fbd0f438efa8 # 16.14-bookworm
+        env:
+          POSTGRES_DB: swarm_gate0
+          POSTGRES_USER: swarm_gate0
+          POSTGRES_PASSWORD: gate0-local-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U swarm_gate0 -d swarm_gate0"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     env:
       PYTHONUNBUFFERED: "1"
+      DATABASE_URL: postgresql://swarm_gate0:gate0-local-only@127.0.0.1:5432/swarm_gate0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify PostgreSQL 16 service
+        run: |
+          client_version="$(psql --version)"
+          server_version_num="$(psql "$DATABASE_URL" --no-psqlrc --tuples-only --no-align --command 'SHOW server_version_num')"
+          printf 'postgres_client=%s\npostgres_server_version_num=%s\n' "$client_version" "$server_version_num"
+          test "$server_version_num" -ge 160000
+          test "$server_version_num" -lt 170000
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24.19.0"
