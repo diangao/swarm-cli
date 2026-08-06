@@ -39,19 +39,19 @@ jobs:
       postgres:
         image: postgres:16-bookworm@sha256:64154d0babcb1741988719e703419af0382b19953706149f9872fbd0f438efa8 # 16.14-bookworm
         env:
-          POSTGRES_DB: swarm_gate0
+          POSTGRES_DB: swarm_storage_test_gate0
           POSTGRES_USER: swarm_gate0
           POSTGRES_PASSWORD: gate0-local-only
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U swarm_gate0 -d swarm_gate0"
+          --health-cmd "pg_isready -U swarm_gate0 -d swarm_storage_test_gate0"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
     env:
       PYTHONUNBUFFERED: "1"
-      DATABASE_URL: postgresql://swarm_gate0:gate0-local-only@127.0.0.1:5432/swarm_gate0
+      DATABASE_URL: postgresql://swarm_gate0:gate0-local-only@127.0.0.1:5432/swarm_storage_test_gate0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify PostgreSQL 16 service
