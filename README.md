@@ -2,6 +2,11 @@
 
 Working `swarm` CLI implementation base.
 
+Repository changes are pull-request only and pass publication plus serialized
+regression gates before promotion. See [CONTRIBUTING.md](CONTRIBUTING.md) and
+[docs/repository-policy.md](docs/repository-policy.md) for branch, artifact,
+and review rules.
+
 This repo now keeps the frozen public contract as a regression baseline while
 moving the CLI toward product behavior that can be used day to day.
 

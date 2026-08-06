@@ -2,3 +2,33 @@
 __pycache__/
 *.pyc
 
+# Local environments and credentials
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Local state and diagnostics
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+logs/
+tmp/
+.tmp/
+
+# Generated and machine-local output
+.DS_Store
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+node_modules/
+artifacts/private/
+.private/
