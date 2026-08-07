@@ -62,7 +62,7 @@ function request(
     scope,
     requestKind: "command",
     requestId: id("cmd", character),
-    requestDigest: `sha256:${character.repeat(64)}` as ArtifactDigest,
+    requestDigest: digest({ character, scope }),
   };
 }
 
@@ -79,7 +79,8 @@ async function raw(sql: string): Promise<string> {
   const session = await PsqlSession.open(databaseUrl);
   try {
     await session.execute(`SET search_path TO ${schema}, pg_catalog;`);
-    return await session.execute(sql);
+    const statement = sql.trim();
+    return await session.execute(statement.endsWith(";") ? statement : `${statement};`);
   } finally {
     await session.close();
   }

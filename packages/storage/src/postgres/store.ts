@@ -674,7 +674,7 @@ export class DeliveryRepository {
     const result = await this.#session.queryJson<{ changed: number }>(
       `WITH changed AS (
         UPDATE deliveries SET status = ${sqlLiteral(input.to)},
-          ${column[input.to]} = ${sqlLiteral(occurredAt)}
+          ${column[input.to]} = ${sqlLiteral(occurredAt)}::timestamptz
         WHERE delivery_id = ${sqlLiteral(input.deliveryId)}
           AND status = ${sqlLiteral(delivery.status ?? "")} RETURNING 1
       ) SELECT json_build_object('changed', count(*)) FROM changed;`,
@@ -805,7 +805,7 @@ export class ReceiptRepository {
         ${sqlLiteral(columns.leaseEpoch)}, ${sqlLiteral(columns.fenceToken)},
         ${sqlLiteral(columns.launchId)}, ${sqlLiteral(columns.stateInstanceId)},
         ${sqlLiteral(columns.turnId)}, ${sqlLiteral(columns.sessionId)},
-        ${sqlLiteral(columns.artifactDigest)}, ${sqlLiteral(receipt.occurredAt)},
+        ${sqlLiteral(columns.artifactDigest)}, ${sqlLiteral(receipt.occurredAt)}::timestamptz,
         ${sqlLiteral(canonicalJson(receipt))}::jsonb, ${sqlLiteral(receiptDigest)}
       );`,
     );
