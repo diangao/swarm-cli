@@ -1,0 +1,55 @@
+[
+  {
+    "name": "protocol-self-import",
+    "package": "protocol",
+    "source": "import type { DeliveryEnvelope } from \"@swarm/protocol\";"
+  },
+  {
+    "name": "protocol-safe-builtin",
+    "package": "protocol",
+    "source": "import { createHash } from \"node:crypto\";"
+  },
+  {
+    "name": "storage-protocol-import",
+    "package": "storage",
+    "source": "import type { DeliveryId } from \"@swarm/protocol\";",
+    "packageJson": {
+      "dependencies": {
+        "@swarm/protocol": "workspace:*"
+      }
+    }
+  },
+  {
+    "name": "storage-declared-external",
+    "package": "storage",
+    "source": "import postgres from \"pg\";",
+    "packageJson": {
+      "dependencies": {
+        "pg": "0.0.0-fixture"
+      }
+    }
+  },
+  {
+    "name": "testkit-security-and-protocol",
+    "package": "testkit",
+    "source": "import type { DeliveryId } from \"@swarm/protocol\"; import { conditionIds } from \"@swarm/security\";",
+    "packageJson": {
+      "dependencies": {
+        "@swarm/protocol": "workspace:*",
+        "@swarm/security": "workspace:*"
+      }
+    }
+  },
+  {
+    "name": "verifier-inward-imports",
+    "package": "verifiers",
+    "source": "import type { DeliveryId } from \"@swarm/protocol\"; import { conditionIds } from \"@swarm/security\"; import { FakeClock } from \"@swarm/testkit\";",
+    "packageJson": {
+      "dependencies": {
+        "@swarm/protocol": "workspace:*",
+        "@swarm/security": "workspace:*",
+        "@swarm/testkit": "workspace:*"
+      }
+    }
+  }
+]
