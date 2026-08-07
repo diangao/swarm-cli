@@ -76,6 +76,8 @@ jobs:
           test "$pnpm_version" = "10.15.1"
       - name: Install TypeScript workspace
         run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify frozen install leaves lockfile unchanged
+        run: git diff --exit-code -- pnpm-lock.yaml
       - name: Typecheck TypeScript workspace
         run: pnpm typecheck
       - name: Test TypeScript workspace
