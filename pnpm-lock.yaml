@@ -19,6 +19,12 @@ importers:
 
   packages/security: {}
 
+  packages/storage:
+    dependencies:
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+
 packages:
 
   '@types/node@24.13.3':
