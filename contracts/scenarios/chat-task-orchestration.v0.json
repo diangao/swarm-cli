@@ -1,0 +1,88 @@
+{
+  "schema_version": 0,
+  "scenario_id": "chat-task-orchestration",
+  "conditions": [
+    {
+      "id": "decomposed_by_runtime",
+      "evidence_kinds": ["decomposition_fact"],
+      "status": "asserted"
+    },
+    {
+      "id": "routed_by_capability",
+      "evidence_kinds": ["route_fact", "decomposition_fact"],
+      "status": "asserted"
+    },
+    {
+      "id": "single_owner_no_duplicate",
+      "evidence_kinds": ["claim_attempt_fact", "execution_fact"],
+      "status": "asserted"
+    },
+    {
+      "id": "restart_no_reexecution",
+      "evidence_kinds": ["execution_fact", "thread_status_fact"],
+      "status": "asserted"
+    },
+    {
+      "id": "steer_honored_precommit",
+      "evidence_kinds": ["steer_fact"],
+      "status": "asserted"
+    },
+    {
+      "id": "wake_starts_turn",
+      "evidence_kinds": ["wake_provenance_fact"],
+      "status": "asserted"
+    },
+    {
+      "id": "notice_first_body_withheld",
+      "evidence_kinds": ["body_durability_fact", "delivery_observation_fact", "claim_attempt_fact"],
+      "status": "asserted"
+    },
+    {
+      "id": "owner_only_body_read",
+      "evidence_kinds": ["delivery_observation_fact", "claim_attempt_fact", "wake_provenance_fact"],
+      "status": "asserted"
+    },
+    {
+      "id": "thread_owner_status_receipt",
+      "evidence_kinds": ["thread_status_fact", "server_accepted"],
+      "status": "placeholder",
+      "entry_condition": "binds when Wave-1 daemon delivery lands the server-receipt thread surface (owner + status + durable server receipt per subtask)"
+    },
+    {
+      "id": "lifecycle_and_illegal_transition",
+      "evidence_kinds": ["thread_status_fact", "claim_attempt_fact"],
+      "status": "placeholder",
+      "entry_condition": "binds when the canonical lifecycle + assignee-only transition guard lands"
+    },
+    {
+      "id": "task_status_freshness_hold",
+      "evidence_kinds": ["thread_status_fact", "steer_fact"],
+      "status": "placeholder",
+      "entry_condition": "binds when the task-status freshness/hold path lands"
+    },
+    {
+      "id": "delivery_reply_trailer",
+      "evidence_kinds": ["thread_status_fact"],
+      "status": "placeholder",
+      "entry_condition": "binds when the canonical delivery reply-trailer lands"
+    },
+    {
+      "id": "coordination_slos",
+      "evidence_kinds": ["claim_attempt_fact", "thread_status_fact", "execution_fact"],
+      "status": "placeholder",
+      "entry_condition": "binds when trace timestamps expose the coordination SLO windows"
+    },
+    {
+      "id": "channel_navigation_exact_target",
+      "evidence_kinds": ["claim_attempt_fact", "thread_status_fact"],
+      "status": "placeholder",
+      "entry_condition": "binds when Wave-1 worker channel-navigation surface lands"
+    },
+    {
+      "id": "lane_role_fidelity",
+      "evidence_kinds": ["execution_fact", "thread_status_fact"],
+      "status": "placeholder",
+      "entry_condition": "binds when Wave-1 coordination artifact-reference field (owner artifact path+hash) lands (seed M2)"
+    }
+  ]
+}
