@@ -25,6 +25,24 @@ importers:
         specifier: workspace:*
         version: link:../protocol
 
+  packages/testkit:
+    dependencies:
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+
+  packages/verifiers:
+    dependencies:
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@swarm/security':
+        specifier: workspace:*
+        version: link:../security
+      '@swarm/testkit':
+        specifier: workspace:*
+        version: link:../testkit
+
 packages:
 
   '@types/node@24.13.3':
