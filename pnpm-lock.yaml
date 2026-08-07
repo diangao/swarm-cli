@@ -17,6 +17,8 @@ importers:
 
   packages/protocol: {}
 
+  packages/security: {}
+
 packages:
 
   '@types/node@24.13.3':

@@ -1,0 +1,22 @@
+{
+  "name": "@swarm/security",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./s17": {
+      "types": "./src/s17.ts",
+      "default": "./dist/s17.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm build && tsc -p tsconfig.test.json && node --test ../../build/security-test/test/*.test.js"
+  }
+}
