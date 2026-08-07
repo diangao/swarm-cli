@@ -82,6 +82,8 @@ jobs:
         run: pnpm typecheck
       - name: Test TypeScript workspace
         run: pnpm test
+      - name: Test storage with PostgreSQL 16
+        run: pnpm --filter @swarm/storage test:postgres
       - name: Check package boundaries
         run: pnpm check:boundaries
       - name: Prove package-boundary seeded negative
