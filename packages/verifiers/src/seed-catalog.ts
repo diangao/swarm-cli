@@ -7,8 +7,10 @@ import { S17_CONDITION_ID } from "@swarm/security";
 //
 // A seed is `implemented` (a real control test drives the seeded defect and the
 // verifier detects it) or `placeholder` (a named Wave-1 entry condition; never
-// affects advisory). The 7 placeholders are EXACTLY {S8, S12, M2, M3, M5, M7,
-// M8}; the other 18 are implemented.
+// affects advisory). After the Wave-1 §9 step-5 binding, S8/S12/M3/M5/M7/M8 are
+// bound to the promoted Lane A/B seams and are now implemented; the ONE
+// remaining placeholder is EXACTLY {M2} (lane-role fidelity, held to Wave 3);
+// the other 24 are implemented.
 
 export type SeedStatus = "implemented" | "placeholder";
 
@@ -25,16 +27,11 @@ export type SeedCatalogEntry = {
   readonly entry: string;
 };
 
-/** The exactly-seven placeholder ids, frozen by accounting. */
-export const PLACEHOLDER_SEED_IDS: readonly string[] = [
-  "S8",
-  "S12",
-  "M2",
-  "M3",
-  "M5",
-  "M7",
-  "M8",
-];
+/**
+ * The remaining placeholder ids, frozen by accounting. After the Wave-1 step-5
+ * binding this is EXACTLY {M2}: lane-role fidelity stays held to Wave 3.
+ */
+export const PLACEHOLDER_SEED_IDS: readonly string[] = ["M2"];
 
 export const SEED_CATALOG: readonly SeedCatalogEntry[] = [
   // --- WAVE-0-IMPLEMENTED (18) ---
@@ -57,14 +54,16 @@ export const SEED_CATALOG: readonly SeedCatalogEntry[] = [
   { id: "M4", status: "implemented", defect: "wrong-turn / unsafe-boundary steer", entry: "steer_safety: checkSteerSafety FAILs" },
   { id: "M6", status: "implemented", defect: "two concurrent wakes cause a double spawn", entry: "single_owner_no_duplicate (chat) FAILs" },
 
-  // --- PLACEHOLDER (7) ---
-  { id: "S8", status: "placeholder", defect: "late old-attempt finalize after takeover", entry: "binds when fence/attempt fields land in the storage skeleton" },
-  { id: "S12", status: "placeholder", defect: "whole-row registry write clobbers presence/capabilities", entry: "binds when the registry table lands with a field-scoped write path (Wave 1)" },
-  { id: "M2", status: "placeholder", defect: "verify/receipt lane re-creates the owner artifact instead of referencing path+hash", entry: "binds when the execute-owner artifact path+hash field lands in the task/receipt row (Wave 1)" },
-  { id: "M3", status: "placeholder", defect: "native-first ingress ordering violated", entry: "binds when task-creation vs native-reply ordering is observable in the ledger (Wave 1 daemon delivery)" },
-  { id: "M5", status: "placeholder", defect: "failed native write still advances the visible boundary / replay re-renders", entry: "binds when write-result + boundary-advance events land in the storage skeleton" },
-  { id: "M7", status: "placeholder", defect: "body/full context injected at a pre-turn seam despite notice-first", entry: "binds when the context-compiler seam name lands (Wave 1)" },
-  { id: "M8", status: "placeholder", defect: "manifest mutated after freeze before the turn consumes it", entry: "binds when the manifest freeze/hash from the prompt composer lands (Wave 1)" },
+  // --- WAVE-1-IMPLEMENTED (6, bound at §9 step 5 to the promoted seams) ---
+  { id: "S8", status: "implemented", defect: "late old-attempt finalize after takeover", entry: "stale_attempt_fence: checkStaleAttemptFence FAILs (G1.8 STALE_FENCE)" },
+  { id: "S12", status: "implemented", defect: "whole-row registry write clobbers presence/capabilities", entry: "field_scoped_registry_write: checkFieldScopedRegistryWrite FAILs (G1.7 UNDECLARED_FIELD_WRITE)" },
+  { id: "M3", status: "implemented", defect: "native-first ingress ordering violated", entry: "native_ingress_ordering: checkNativeIngressOrdering FAILs (G1.3/G1.4 UNEXPECTED_COORDINATION_EFFECT / MODEL_VISIBLE_PREDECESSOR_REQUIRED)" },
+  { id: "M5", status: "implemented", defect: "failed native write still advances the visible boundary / replay re-renders", entry: "generation_fence_boundary: checkGenerationFenceBoundary FAILs (G1.5 eight-row generation semantics)" },
+  { id: "M7", status: "implemented", defect: "body/full context injected at a pre-turn seam despite notice-first", entry: "pre_turn_context_injection: checkPreTurnContextInjection FAILs (G1.2 audience suppression + G1.6 pre-turn privacy / current-body exactly-once)" },
+  { id: "M8", status: "implemented", defect: "manifest mutated after freeze before the turn consumes it", entry: "manifest_freeze_integrity: checkManifestFreezeIntegrity FAILs (G1.6 MANIFEST_DIGEST_MISMATCH)" },
+
+  // --- PLACEHOLDER (1, held to Wave 3) ---
+  { id: "M2", status: "placeholder", defect: "verify/receipt lane re-creates the owner artifact instead of referencing path+hash", entry: "binds in Wave 3 when the execute-owner artifact path+hash field lands in the task/receipt row (lane-role fidelity)" },
 ];
 
 /** All implemented seed ids. */
