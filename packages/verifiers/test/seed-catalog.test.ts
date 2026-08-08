@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   DeterministicFaults,
@@ -20,17 +22,24 @@ import {
   chatTaskOrchestrationScenario,
   checkBudgetHold,
   checkCheckpointPrivacy,
+  checkFieldScopedRegistryWrite,
   checkFreezeWindow,
+  checkGenerationFenceBoundary,
   checkGraphReplayIdempotency,
   checkLeaseRenewal,
+  checkManifestFreezeIntegrity,
+  checkNativeIngressOrdering,
   checkNoEmptyBody,
   checkPhaseGating,
   checkPlanAcceptanceArray,
   checkPlanAcceptanceNotObject,
+  checkPreTurnContextInjection,
   checkResumeProvenance,
+  checkStaleAttemptFence,
   checkStartupReconciliation,
   checkSteerSafety,
   checkTypedVerdict,
+  M5_CORE_G15_ROW_IDS,
   runScenario,
   seedEntry,
 } from "../src/index.js";
@@ -61,22 +70,30 @@ import {
 // ===========================================================================
 // CATALOG ACCOUNTING
 // ===========================================================================
-test("catalog has exactly 18 implemented + 7 placeholder = 25 seeds", () => {
+test("catalog has exactly 24 implemented + 1 placeholder = 25 seeds", () => {
   assert.equal(SEED_CATALOG.length, 25);
-  assert.equal(IMPLEMENTED_SEED_IDS.length, 18);
-  assert.equal(PLACEHOLDER_SEED_IDS.length, 7);
+  assert.equal(IMPLEMENTED_SEED_IDS.length, 24);
+  assert.equal(PLACEHOLDER_SEED_IDS.length, 1);
   const implemented = SEED_CATALOG.filter((s) => s.status === "implemented");
   const placeholder = SEED_CATALOG.filter((s) => s.status === "placeholder");
-  assert.equal(implemented.length, 18);
-  assert.equal(placeholder.length, 7);
+  assert.equal(implemented.length, 24);
+  assert.equal(placeholder.length, 1);
 });
 
-test("the 7 placeholder ids are exactly {S8,S12,M2,M3,M5,M7,M8}", () => {
+test("the 1 remaining placeholder id is exactly {M2}", () => {
   const actual = new Set(
     SEED_CATALOG.filter((s) => s.status === "placeholder").map((s) => s.id),
   );
-  const expected = new Set(["S8", "S12", "M2", "M3", "M5", "M7", "M8"]);
+  const expected = new Set(["M2"]);
   assert.deepEqual(actual, expected);
+});
+
+test("the Wave-1 step-5 bound seeds {S8,S12,M3,M5,M7,M8} are now implemented", () => {
+  for (const id of ["S8", "S12", "M3", "M5", "M7", "M8"]) {
+    const entry = seedEntry(id);
+    assert.ok(entry, `${id} must be in the catalog`);
+    assert.equal(entry.status, "implemented", `${id} should be implemented`);
+  }
 });
 
 test("every seed id is unique and every entry has a named entry condition", () => {
@@ -534,13 +551,238 @@ test("M4 healthy: matching-turn safe steer PASSES", () => {
 });
 
 // ===========================================================================
+// WAVE-1 STEP-5 CONTROLS (S8, S12, M3, M5, M7, M8) — each constructs the seeded
+// defect against the promoted-seam outcome and asserts the verifier DETECTS it,
+// plus a healthy PASS so the control is non-vacuous. M5 consumes the EXACT eight
+// core G1.5 rows loaded from the frozen Gate 1 fixture.
+// ===========================================================================
+
+// --- S8: late old-attempt finalize after takeover (G1.8) ---
+test("S8 control: late old-attempt finalize after takeover is detected", () => {
+  const v = checkStaleAttemptFence([
+    { attemptRef: "attempt-1", lateFinalizeRejected: false, fenceError: "STALE_FENCE", siblingsUnchanged: true },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "S8");
+});
+test("S8 control: a rejected stale finalize that mutated siblings is detected", () => {
+  const v = checkStaleAttemptFence([
+    { attemptRef: "attempt-1", lateFinalizeRejected: true, fenceError: "STALE_FENCE", siblingsUnchanged: false },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "S8");
+});
+test("S8 healthy: fenced stale attempt with zero sibling effect PASSES", () => {
+  const v = checkStaleAttemptFence([
+    { attemptRef: "attempt-1", lateFinalizeRejected: true, fenceError: "STALE_INVOCATION_GENERATION", siblingsUnchanged: true },
+  ]);
+  assert.equal(v.status, "pass");
+  assert.equal(v.seedId, "S8");
+});
+
+// --- S12: whole-row registry write clobbers presence/capabilities (G1.7) ---
+test("S12 control: presence clobbered by a whole-row write is detected", () => {
+  const v = checkFieldScopedRegistryWrite([
+    { writeRef: "write-1", presencePreserved: false, capabilitiesPreserved: true, wholeRowWriteRejected: true },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "S12");
+});
+test("S12 control: an unfenced undeclared-field write is detected", () => {
+  const v = checkFieldScopedRegistryWrite([
+    { writeRef: "write-1", presencePreserved: true, capabilitiesPreserved: true, wholeRowWriteRejected: false },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "S12");
+});
+test("S12 healthy: field-scoped write preserving presence/capabilities PASSES", () => {
+  const v = checkFieldScopedRegistryWrite([
+    { writeRef: "write-1", presencePreserved: true, capabilitiesPreserved: true, wholeRowWriteRejected: true },
+  ]);
+  assert.equal(v.status, "pass");
+  assert.equal(v.seedId, "S12");
+});
+
+// --- M3: native-first ingress ordering (G1.3 / G1.4) ---
+test("M3 control: a pure question that creates a task is detected", () => {
+  const v = checkNativeIngressOrdering([
+    { turnRef: "turn-1", pureQuestion: true, coordinationEffectCount: 1, replyBeforeCoordination: true, modelVisiblePredecessorCommitted: true, secondCoordinationAttempted: false, secondCoordinationRejected: false },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M3");
+});
+test("M3 control: task creation without a committed reply predecessor is detected", () => {
+  const v = checkNativeIngressOrdering([
+    { turnRef: "turn-1", pureQuestion: false, coordinationEffectCount: 1, replyBeforeCoordination: true, modelVisiblePredecessorCommitted: false, secondCoordinationAttempted: false, secondCoordinationRejected: false },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M3");
+});
+test("M3 control: an unfenced second coordination call is detected", () => {
+  const v = checkNativeIngressOrdering([
+    { turnRef: "turn-1", pureQuestion: false, coordinationEffectCount: 1, replyBeforeCoordination: true, modelVisiblePredecessorCommitted: true, secondCoordinationAttempted: true, secondCoordinationRejected: false },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M3");
+});
+test("M3 healthy: pure-question zero-task and reply-before-coordination PASS", () => {
+  const v = checkNativeIngressOrdering([
+    { turnRef: "turn-q", pureQuestion: true, coordinationEffectCount: 0, replyBeforeCoordination: false, modelVisiblePredecessorCommitted: false, secondCoordinationAttempted: false, secondCoordinationRejected: false },
+    { turnRef: "turn-c", pureQuestion: false, coordinationEffectCount: 1, replyBeforeCoordination: true, modelVisiblePredecessorCommitted: true, secondCoordinationAttempted: true, secondCoordinationRejected: true },
+  ]);
+  assert.equal(v.status, "pass");
+  assert.equal(v.seedId, "M3");
+});
+
+// --- M5: G1.5 generation-fence boundary, consuming the exact frozen fixture ---
+type G15FixtureRow = {
+  readonly id: string;
+  readonly clause: string;
+  readonly expectedError?: string;
+  readonly expectedState?: string;
+  readonly siblings: readonly string[];
+};
+// Resolved from the BUILT test location (build/test/) up to the repo root, so
+// M5 consumes the exact frozen Gate 1 fixture rather than a copy.
+const G15_FIXTURE = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL("../../../../contracts/gate1/seeded-controls.json", import.meta.url)),
+    "utf8",
+  ),
+) as readonly G15FixtureRow[];
+
+function coreG15Rows(): readonly G15FixtureRow[] {
+  const byId = new Map(G15_FIXTURE.map((r) => [r.id, r]));
+  return M5_CORE_G15_ROW_IDS.map((rowId) => {
+    const row = byId.get(rowId);
+    assert.ok(row, `core G1.5 fixture row ${rowId} present in the frozen fixture`);
+    return row;
+  });
+}
+function fixtureOutcome(row: G15FixtureRow): { error: string } | { state: string } {
+  if (row.expectedError !== undefined) return { error: row.expectedError };
+  assert.ok(row.expectedState !== undefined, `${row.id} has an expectedError or expectedState`);
+  return { state: row.expectedState };
+}
+
+test("M5 control: a conflated 5b outcome (stale-resume -> terminal-conflict) is detected", () => {
+  const observations = coreG15Rows().map((row) => {
+    const expected = fixtureOutcome(row);
+    // Inject the 5b conflation defect: the stale-resume row is made to produce
+    // the terminal-conflict error instead of STALE_INVOCATION_GENERATION.
+    const observed =
+      row.id === "g1.5-post-generation-two-stale-resume"
+        ? { error: "INVOCATION_STATE_CONFLICT" }
+        : expected;
+    return { fixtureRowId: row.id, expected, observed, siblingsUnchanged: true };
+  });
+  const v = checkGenerationFenceBoundary(observations);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M5");
+});
+test("M5 control: a failed write that advances the boundary is detected", () => {
+  const observations = coreG15Rows().map((row) => {
+    const expected = fixtureOutcome(row);
+    return {
+      fixtureRowId: row.id,
+      expected,
+      observed: expected,
+      // Inject the M5 defect on the not-written row: the failed write advanced
+      // the visible boundary (a sibling table changed).
+      siblingsUnchanged: row.id !== "g1.5-not-written-generation-two",
+    };
+  });
+  const v = checkGenerationFenceBoundary(observations);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M5");
+});
+test("M5 control: an incomplete generation-fence set is detected", () => {
+  const rows = coreG15Rows().slice(1); // drop one core row
+  const observations = rows.map((row) => {
+    const expected = fixtureOutcome(row);
+    return { fixtureRowId: row.id, expected, observed: expected, siblingsUnchanged: true };
+  });
+  const v = checkGenerationFenceBoundary(observations);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M5");
+});
+test("M5 healthy: the eight exact G1.5 rows with their fixture outcomes PASS", () => {
+  const observations = coreG15Rows().map((row) => {
+    const expected = fixtureOutcome(row);
+    return { fixtureRowId: row.id, expected, observed: expected, siblingsUnchanged: true };
+  });
+  // The 5b split is distinct in the frozen fixture: stale-resume -> STALE, and
+  // terminal-conflict -> INVOCATION_STATE_CONFLICT (never "either").
+  const stale = coreG15Rows().find((r) => r.id === "g1.5-post-generation-two-stale-resume");
+  const conflict = coreG15Rows().find((r) => r.id === "g1.5-post-generation-two-terminal-conflict");
+  assert.equal(stale?.expectedError, "STALE_INVOCATION_GENERATION");
+  assert.equal(conflict?.expectedError, "INVOCATION_STATE_CONFLICT");
+  const v = checkGenerationFenceBoundary(observations);
+  assert.equal(v.status, "pass");
+  assert.equal(v.seedId, "M5");
+});
+
+// --- M7: body/context injected at a pre-turn seam despite notice-first (G1.2) ---
+test("M7 control: attention notice carrying body at the pre-turn seam is detected", () => {
+  const v = checkPreTurnContextInjection([
+    { turnRef: "turn-1", attentionCarriesBody: true, bodyOnlyAtAuthorizedSeam: true, bodyInjectionCount: 1 },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M7");
+});
+test("M7 control: body injected outside the authorized seam is detected", () => {
+  const v = checkPreTurnContextInjection([
+    { turnRef: "turn-1", attentionCarriesBody: false, bodyOnlyAtAuthorizedSeam: false, bodyInjectionCount: 2 },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M7");
+});
+test("M7 healthy: metadata-only attention, one authorized body injection PASSES", () => {
+  const v = checkPreTurnContextInjection([
+    { turnRef: "turn-1", attentionCarriesBody: false, bodyOnlyAtAuthorizedSeam: true, bodyInjectionCount: 1 },
+  ]);
+  assert.equal(v.status, "pass");
+  assert.equal(v.seedId, "M7");
+});
+
+// --- M8: manifest mutated after freeze before turn consumes it (G1.6) ---
+const DIGEST_A = `sha256:${"a1b2c3d4e5f60718293a4b5c6d7e8f90".repeat(2)}`;
+const DIGEST_B = `sha256:${"0f1e2d3c4b5a69788796a5b4c3d2e1f0".repeat(2)}`;
+test("M8 control: a post-freeze manifest mutation (digest mismatch) is detected", () => {
+  const v = checkManifestFreezeIntegrity([
+    { manifestRef: "manifest-1", frozen: true, frozenDigest: DIGEST_A, consumedDigest: DIGEST_B },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M8");
+});
+test("M8 control: a non-frozen manifest is detected", () => {
+  const v = checkManifestFreezeIntegrity([
+    { manifestRef: "manifest-1", frozen: false, frozenDigest: DIGEST_A, consumedDigest: DIGEST_A },
+  ]);
+  assert.equal(v.status, "fail");
+  assert.equal(v.seedId, "M8");
+});
+test("M8 healthy: deep-frozen manifest with a stable digest PASSES", () => {
+  const v = checkManifestFreezeIntegrity([
+    { manifestRef: "manifest-1", frozen: true, frozenDigest: DIGEST_A, consumedDigest: DIGEST_A },
+  ]);
+  assert.equal(v.status, "pass");
+  assert.equal(v.seedId, "M8");
+});
+
+// ===========================================================================
 // Every implemented seed has a control (self-audit against the catalog).
 // ===========================================================================
 test("every implemented seed id has an explicit control in this file", () => {
   // The controls above are named per seed; assert the catalog's implemented set
-  // matches the frozen 18 so no seed silently disappears.
+  // matches the frozen 24 (the original 18 + the six Wave-1 step-5 bindings
+  // S8/S12/M3/M5/M7/M8) so no seed silently disappears.
   assert.deepEqual(
     [...IMPLEMENTED_SEED_IDS].sort(),
-    ["M1", "M4", "M6", "S1", "S10", "S11", "S13", "S14", "S15", "S16", "S17", "S2", "S3", "S4", "S5", "S6", "S7", "S9"].sort(),
+    [
+      "M1", "M3", "M4", "M5", "M6", "M7", "M8",
+      "S1", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17",
+      "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    ].sort(),
   );
 });
