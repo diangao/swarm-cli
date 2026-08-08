@@ -1,0 +1,25 @@
+{
+  "name": "@swarm/app-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test ./build-test/test/*.test.js"
+  },
+  "dependencies": {
+    "@swarm/protocol": "workspace:*",
+    "@swarm/storage": "workspace:*",
+    "@swarm/runtime-contract": "workspace:*",
+    "@swarm/drivers": "workspace:*",
+    "@swarm/daemon-core": "workspace:*"
+  }
+}

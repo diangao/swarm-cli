@@ -15,7 +15,52 @@ importers:
         specifier: 5.9.3
         version: 5.9.3
 
+  apps/daemon:
+    dependencies:
+      '@swarm/daemon-core':
+        specifier: workspace:*
+        version: link:../../packages/daemon-core
+      '@swarm/drivers':
+        specifier: workspace:*
+        version: link:../../packages/drivers
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@swarm/runtime-contract':
+        specifier: workspace:*
+        version: link:../../packages/runtime-contract
+      '@swarm/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
+
+  packages/daemon-core:
+    dependencies:
+      '@swarm/drivers':
+        specifier: workspace:*
+        version: link:../drivers
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@swarm/runtime-contract':
+        specifier: workspace:*
+        version: link:../runtime-contract
+
+  packages/drivers:
+    dependencies:
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@swarm/runtime-contract':
+        specifier: workspace:*
+        version: link:../runtime-contract
+
   packages/protocol: {}
+
+  packages/runtime-contract:
+    dependencies:
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../protocol
 
   packages/security: {}
 

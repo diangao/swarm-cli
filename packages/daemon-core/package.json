@@ -1,0 +1,23 @@
+{
+  "name": "@swarm/daemon-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @swarm/protocol build && pnpm --filter @swarm/runtime-contract build && pnpm --filter @swarm/drivers build && pnpm build && tsc -p tsconfig.test.json && node --test ./build-test/test/*.test.js"
+  },
+  "dependencies": {
+    "@swarm/protocol": "workspace:*",
+    "@swarm/runtime-contract": "workspace:*",
+    "@swarm/drivers": "workspace:*"
+  }
+}
