@@ -3,7 +3,10 @@ import {
   readMigrations,
   type MigrationReceipt,
 } from "../migrations.js";
-import { assertPostgresMigrationContract } from "../contracts.js";
+import {
+  assertPostgresMigrationContract,
+  assertPostgresNativeIngressMigrationContract,
+} from "../contracts.js";
 import { storageFail } from "../errors.js";
 import { parseSingleJson, runPsql } from "./psql.js";
 import { PsqlSession, sqlLiteral } from "./session.js";
@@ -37,7 +40,17 @@ export class PostgresMigrator {
   async migrate(): Promise<MigrationReceipt[]> {
     await this.assertGate0Version();
     const migrations = await readMigrations(locateMigrationDirectory("postgres", import.meta.url));
-    migrations.forEach((migration) => assertPostgresMigrationContract(migration.sql));
+    migrations.forEach((migration) => {
+      if (migration.version === "0001") {
+        assertPostgresMigrationContract(migration.sql);
+        return;
+      }
+      if (migration.version === "0002") {
+        assertPostgresNativeIngressMigrationContract(migration.sql);
+        return;
+      }
+      storageFail("INVALID_MIGRATION", { version: migration.version, reason: "unsupported contract" });
+    });
     const session = await PsqlSession.open(this.#databaseUrl);
     const receipts: MigrationReceipt[] = [];
     try {

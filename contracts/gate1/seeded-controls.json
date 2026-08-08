@@ -1,0 +1,218 @@
+[
+  {
+    "id": "g1.1-empty-human",
+    "clause": "G1.1",
+    "expectedError": "EMPTY_MESSAGE",
+    "siblings": ["target_sequence", "messages", "receipts", "deliveries", "outbox_jobs", "tasks", "reminders"]
+  },
+  {
+    "id": "g1.1-empty-agent",
+    "clause": "G1.1",
+    "expectedError": "EMPTY_MESSAGE",
+    "siblings": ["target_sequence", "messages", "receipts", "deliveries", "outbox_jobs", "tasks", "reminders"]
+  },
+  {
+    "id": "g1.1-outbox-rollback",
+    "clause": "G1.1",
+    "expectedError": "SEEDED_OUTBOX_FAILURE",
+    "siblings": ["target_sequence", "messages", "receipts", "deliveries", "outbox_jobs", "tasks", "reminders"]
+  },
+  {
+    "id": "g1.2-nonmember-append",
+    "clause": "G1.2",
+    "expectedError": "MEMBERSHIP_REVOKED_BEFORE_CONSUME",
+    "siblings": ["messages", "message_audience", "deliveries", "outbox_jobs"]
+  },
+  {
+    "id": "g1.2-removed-before-consume",
+    "clause": "G1.2",
+    "expectedError": "MEMBERSHIP_REVOKED_BEFORE_CONSUME",
+    "siblings": ["consume_permit", "native_inputs", "runtime_writes", "delivery_boundary_receipts"]
+  },
+  {
+    "id": "g1.2-route-superseded",
+    "clause": "G1.2",
+    "expectedError": "ROUTE_SUPERSEDED_BEFORE_CONSUME",
+    "siblings": ["consume_permit", "delivery_attempts", "native_inputs", "runtime_writes"]
+  },
+  {
+    "id": "g1.2-revoked-gateway",
+    "clause": "G1.2",
+    "expectedError": "MEMBERSHIP_REVOKED_BEFORE_CONSUME",
+    "siblings": ["serialized_frames", "observation_cursors", "client_message_jobs"]
+  },
+  {
+    "id": "g1.2-attention-body-leak",
+    "clause": "G1.2",
+    "expectedError": "PRIVATE_BODY_EXPOSURE",
+    "siblings": ["attention_notices", "consume_permits", "native_inputs"]
+  },
+  {
+    "id": "g1.3-question-creates-task",
+    "clause": "G1.3",
+    "expectedError": "UNEXPECTED_COORDINATION_EFFECT",
+    "siblings": ["tasks", "task_commands", "claims", "task_graph_edges"]
+  },
+  {
+    "id": "g1.4-reply-before-terminal-ack",
+    "clause": "G1.4",
+    "expectedError": "MODEL_VISIBLE_PREDECESSOR_REQUIRED",
+    "siblings": ["reply_facts", "messages", "target_sequence", "message_audience", "outbox_jobs", "receipts", "tasks"]
+  },
+  {
+    "id": "g1.4-second-coordination",
+    "clause": "G1.4",
+    "expectedError": "SECOND_COORDINATION_CALL",
+    "siblings": ["task_commands", "tasks", "receipts", "outbox_jobs"]
+  },
+  {
+    "id": "g1.4-tool-before-reply",
+    "clause": "G1.4",
+    "expectedError": "MODEL_VISIBLE_PREDECESSOR_REQUIRED",
+    "siblings": ["task_commands", "tasks", "receipts"]
+  },
+  {
+    "id": "g1.5-fresh-generation-revoked-membership",
+    "clause": "G1.5",
+    "expectedError": "MEMBERSHIP_REVOKED_BEFORE_CONSUME",
+    "siblings": ["permit", "invocation", "receipt", "delivery", "job"]
+  },
+  {
+    "id": "g1.5-fresh-generation-superseded-route",
+    "clause": "G1.5",
+    "expectedError": "ROUTE_SUPERSEDED_BEFORE_CONSUME",
+    "siblings": ["permit", "invocation", "receipt", "delivery", "job"]
+  },
+  {
+    "id": "g1.5-stale-generation-current-authority",
+    "clause": "G1.5",
+    "expectedError": "STALE_INVOCATION_GENERATION",
+    "siblings": ["permit", "invocation", "receipt", "delivery", "job"]
+  },
+  {
+    "id": "g1.5-not-written-generation-two",
+    "clause": "G1.5",
+    "expectedState": "GENERATION_TWO_AUTHORIZED_FROM_NOT_WRITTEN",
+    "siblings": ["second_permit", "receipt", "body"]
+  },
+  {
+    "id": "g1.5-generation-one-proof-replay",
+    "clause": "G1.5",
+    "expectedState": "GENERATION_ONE_PROOF_REPLAYED_HISTORICALLY",
+    "siblings": ["permit", "invocation", "receipt", "delivery", "job", "body"]
+  },
+  {
+    "id": "g1.5-post-generation-two-stale-resume",
+    "clause": "G1.5",
+    "expectedError": "STALE_INVOCATION_GENERATION",
+    "siblings": ["permit", "invocation", "receipt", "delivery", "job", "body"]
+  },
+  {
+    "id": "g1.5-post-generation-two-terminal-conflict",
+    "clause": "G1.5",
+    "expectedError": "INVOCATION_STATE_CONFLICT",
+    "siblings": ["permit", "invocation", "receipt", "delivery", "job", "body"]
+  },
+  {
+    "id": "g1.5-second-crash-generation-two",
+    "clause": "G1.5",
+    "expectedState": "GENERATIONS_ONE_NOT_WRITTEN_TWO_AMBIGUOUS",
+    "siblings": ["generation_3", "permit", "body"]
+  },
+  {
+    "id": "g1.5-reconcile-wrong-fence",
+    "clause": "G1.5",
+    "expectedError": "PERMIT_MISMATCH",
+    "siblings": ["delivery_reconciliation_commands", "delivery_invocations", "deliveries", "outbox_jobs", "receipts", "delivery_boundary_ack_results"]
+  },
+  {
+    "id": "g1.5-broken-journal",
+    "clause": "G1.5",
+    "expectedError": "INVALID_JOURNAL_CHAIN",
+    "siblings": ["delivery_reconciliation_commands", "delivery_invocations", "deliveries", "outbox_jobs", "receipts", "delivery_boundary_ack_results"]
+  },
+  {
+    "id": "g1.5-real-negative-proof",
+    "clause": "G1.5",
+    "expectedError": "REAL_DRIVER_NEGATIVE_PROOF_FORBIDDEN",
+    "siblings": ["delivery_reconciliation_commands", "delivery_invocations", "deliveries", "outbox_jobs", "receipts"]
+  },
+  {
+    "id": "g1.5-model-visible-without-predecessor",
+    "clause": "G1.5",
+    "expectedError": "ACK_PREDECESSOR_REQUIRED",
+    "siblings": ["delivery_ack_commands", "delivery_invocations", "deliveries", "outbox_jobs", "receipts", "delivery_boundary_ack_results"]
+  },
+  {
+    "id": "g1.5-deferred-command-omission",
+    "clause": "G1.5",
+    "expectedError": "POSTGRES_FOREIGN_KEY_VIOLATION",
+    "siblings": ["delivery_ack_commands", "receipts", "delivery_boundary_ack_results"]
+  },
+  {
+    "id": "g1.5-deferred-receipt-omission",
+    "clause": "G1.5",
+    "expectedError": "POSTGRES_FOREIGN_KEY_VIOLATION",
+    "siblings": ["delivery_ack_commands", "receipts", "delivery_boundary_ack_results"]
+  },
+  {
+    "id": "g1.5-deferred-projection-omission",
+    "clause": "G1.5",
+    "expectedError": "POSTGRES_FOREIGN_KEY_VIOLATION",
+    "siblings": ["delivery_ack_commands", "receipts", "delivery_boundary_ack_results"]
+  },
+  {
+    "id": "g1.5-partial-boundary-tuple",
+    "clause": "G1.5",
+    "expectedError": "POSTGRES_CHECK_VIOLATION",
+    "siblings": ["receipts", "delivery_boundary_ack_results"]
+  },
+  {
+    "id": "g1.5-duplicate-boundary",
+    "clause": "G1.5",
+    "expectedError": "POSTGRES_UNIQUE_VIOLATION",
+    "siblings": ["receipts", "delivery_boundary_ack_results", "delivery_ack_commands"]
+  },
+  {
+    "id": "g1.6-manifest-mutation",
+    "clause": "G1.6",
+    "expectedError": "MANIFEST_DIGEST_MISMATCH",
+    "siblings": ["standing_manifest_bytes", "native_inputs", "receipts", "logs"]
+  },
+  {
+    "id": "g1.7-stale-route-config",
+    "clause": "G1.7",
+    "expectedError": "STALE_FENCE",
+    "siblings": ["agent_configuration", "agent_liveness", "target_owner_routes"]
+  },
+  {
+    "id": "g1.7-whole-row-write",
+    "clause": "G1.7",
+    "expectedError": "UNDECLARED_FIELD_WRITE",
+    "siblings": ["agent_configuration", "agent_liveness", "target_owner_routes"]
+  },
+  {
+    "id": "g1.8-old-lease-finalize",
+    "clause": "G1.8",
+    "expectedError": "STALE_FENCE",
+    "siblings": ["artifacts", "review_receipts", "task_terminal_state"]
+  },
+  {
+    "id": "g1.9-stale-reminder-generation",
+    "clause": "G1.9",
+    "expectedError": "STALE_REMINDER_GENERATION",
+    "siblings": ["reminder_fires", "outbox_jobs", "receipts", "reminder_heads"]
+  },
+  {
+    "id": "g1.10-package-edge",
+    "clause": "G1.10",
+    "expectedError": "FORBIDDEN_PACKAGE_EDGE",
+    "siblings": ["package_boundary_verdicts"]
+  },
+  {
+    "id": "g1.10-publication-provenance",
+    "clause": "G1.10",
+    "expectedError": "PRIVATE_PROVENANCE_MARKER",
+    "siblings": ["publication_findings"]
+  }
+]

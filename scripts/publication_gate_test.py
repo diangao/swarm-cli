@@ -53,6 +53,24 @@ def main() -> int:
             f"short non-credential prefix was blocked: {safe_prefix}",
         )
 
+    restricted_fields = (
+        "_".join(("hidden", "prompt")),
+        "_".join(("canonical", "contract", "prose")),
+        "_".join(("evidence", "only", "copy")),
+    )
+    for field in restricted_fields:
+        fixture = "{\"" + field + "\":\"seed\"}"
+        require(
+            "restricted-provenance-field" in kinds(publication_gate.scan_text("restricted", fixture, set())),
+            f"restricted provenance field was not blocked: {field}",
+        )
+    require(
+        "restricted-provenance-field" not in kinds(
+            publication_gate.scan_text("reviewed", '{"contractDigest":"sha256:reviewed"}', set())
+        ),
+        "reviewed digest field was blocked",
+    )
+
     require(publication_gate.path_is_blocked("state.sqlite3"), "database path was not blocked")
     require(publication_gate.path_is_blocked("state.sqlite3-wal"), "database sidecar was not blocked")
     require(publication_gate.path_is_blocked("logs/runtime.txt"), "log directory was not blocked")
