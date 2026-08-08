@@ -40,6 +40,7 @@ import {
   PsqlSession,
   SharedStore,
   StorageError,
+  appendHumanMessageDigest,
   sqlLiteral,
   type IdempotentRequest,
   type IdempotencyScope,
@@ -96,6 +97,30 @@ function channelTarget(character = "a", thread?: string): Target {
   };
   if (thread !== undefined) value.threadRootMessageId = thread as MessageId;
   return value;
+}
+
+function humanAppend(
+  messageCharacter: string,
+  target: Target,
+  body: string,
+  producerCharacter: string,
+) {
+  const base = {
+    protocolVersion: 1 as const,
+    messageId: id("msg", messageCharacter),
+    target,
+    humanId: id("hum", "c"),
+    body,
+    producerFactId: id("fac", producerCharacter),
+    serverId: id("srv", "a"),
+  };
+  return {
+    ...base,
+    requestDigest: appendHumanMessageDigest(base),
+    receiptId: variantId("rcp", messageCharacter, "s"),
+    deliveryId: variantId("dlv", messageCharacter, "s"),
+    occurredAt: "2026-08-08T00:00:00.000Z",
+  };
 }
 
 async function raw(sql: string): Promise<string> {
@@ -582,12 +607,37 @@ before(async () => {
     INSERT INTO servers(server_id, display_name) VALUES ('${id("srv", "a")}', 'Gate 0');
     INSERT INTO machines(machine_id, server_id) VALUES ('${id("mch", "a")}', '${id("srv", "a")}');
     INSERT INTO machines(machine_id, server_id) VALUES ('${id("mch", "b")}', '${id("srv", "a")}');
+    INSERT INTO machines(machine_id, server_id) VALUES ('${id("mch", "c")}', '${id("srv", "a")}');
     INSERT INTO agents(agent_id, server_id) VALUES ('${id("agt", "a")}', '${id("srv", "a")}');
     INSERT INTO agents(agent_id, server_id) VALUES ('${id("agt", "b")}', '${id("srv", "a")}');
+    INSERT INTO agents(agent_id, server_id) VALUES ('${id("agt", "c")}', '${id("srv", "a")}');
+    INSERT INTO humans(human_id, server_id, display_name)
+      VALUES ('${id("hum", "c")}', '${id("srv", "a")}', 'Gate human');
     INSERT INTO channels(channel_id, server_id, visibility, name)
       VALUES ('${id("chn", "a")}', '${id("srv", "a")}', 'private', 'gate0-a');
     INSERT INTO channels(channel_id, server_id, visibility, name)
       VALUES ('${id("chn", "b")}', '${id("srv", "a")}', 'private', 'gate0-b');
+    INSERT INTO memberships(channel_id, actor_kind, actor_id, state, membership_epoch, row_version)
+      VALUES
+        ('${id("chn", "a")}', 'human', '${id("hum", "c")}', 'active', 1, 1),
+        ('${id("chn", "a")}', 'agent', '${id("agt", "c")}', 'active', 1, 1),
+        ('${id("chn", "b")}', 'human', '${id("hum", "c")}', 'active', 1, 1),
+        ('${id("chn", "b")}', 'agent', '${id("agt", "c")}', 'active', 1, 1);
+    INSERT INTO agent_launches(
+      launch_id, machine_id, agent_id, runtime_kind, workspace_generation,
+      routing_generation, state, activated_at
+    ) VALUES (
+      '${id("lnc", "c")}', '${id("mch", "c")}', '${id("agt", "c")}',
+      'codex', 1, 1, 'activated', clock_timestamp()
+    );
+    INSERT INTO target_owner_routes(
+      target_kind, target_id, agent_id, machine_id, expected_launch_id,
+      membership_epoch, routing_generation, route_version, row_version
+    ) VALUES
+      ('channel', '${id("chn", "a")}', '${id("agt", "c")}', '${id("mch", "c")}',
+        '${id("lnc", "c")}', 1, 1, 1, 1),
+      ('channel', '${id("chn", "b")}', '${id("agt", "c")}', '${id("mch", "c")}',
+        '${id("lnc", "c")}', 1, 1, 1, 1);
   `);
 });
 
@@ -657,25 +707,11 @@ test("corrupted PostgreSQL migration checksum fails closed", async () => {
 test("concurrent first appenders allocate sequence 1 and 2 exactly once", async () => {
   const values = await Promise.all([
     store.transaction(request("b"), async (transaction) => {
-      const result = await transaction.messages.append({
-        messageId: id("msg", "a"),
-        target: channelTarget("b"),
-        author: { serverId: id("srv", "a") as ServerId },
-        body: "first",
-        producerFactId: id("fac", "a"),
-        payloadDigest: `sha256:${"a".repeat(64)}` as ArtifactDigest,
-      });
+      const result = await transaction.messages.append(humanAppend("a", channelTarget("b"), "first", "a"));
       return { protocolVersion: 1, sequence: result.targetSeq };
     }),
     store.transaction(request("c"), async (transaction) => {
-      const result = await transaction.messages.append({
-        messageId: id("msg", "b"),
-        target: channelTarget("b"),
-        author: { serverId: id("srv", "a") as ServerId },
-        body: "second",
-        producerFactId: id("fac", "b"),
-        payloadDigest: `sha256:${"b".repeat(64)}` as ArtifactDigest,
-      });
+      const result = await transaction.messages.append(humanAppend("b", channelTarget("b"), "second", "b"));
       return { protocolVersion: 1, sequence: result.targetSeq };
     }),
   ]);
@@ -685,14 +721,7 @@ test("concurrent first appenders allocate sequence 1 and 2 exactly once", async 
 test("same request and digest returns one committed canonical result", async () => {
   const same = request("d");
   const execute = () => store.transaction(same, async (transaction) => {
-    const result = await transaction.messages.append({
-      messageId: id("msg", "c"),
-      target: channelTarget("a"),
-      author: { serverId: id("srv", "a") as ServerId },
-      body: "once",
-      producerFactId: id("fac", "c"),
-      payloadDigest: `sha256:${"c".repeat(64)}` as ArtifactDigest,
-    });
+    const result = await transaction.messages.append(humanAppend("c", channelTarget("a"), "once", "c"));
     return { protocolVersion: 1, messageId: result.messageId, sequence: result.targetSeq };
   });
   const [left, right] = await Promise.all([execute(), execute()]);
@@ -852,14 +881,7 @@ test("concurrent claim acquisitions serialize to one open fence", async () => {
 
 test("legacy delivery replay and daemon acceptance preserve immutable lineage", async () => {
   const prepared = await store.transaction(request("y", "delivery.mutate.v1"), async (transaction) => {
-    const message = await transaction.messages.append({
-      messageId: id("msg", "f"),
-      target: channelTarget("a"),
-      author: { serverId: id("srv", "a") as ServerId },
-      body: "delivery fact",
-      producerFactId: id("fac", "g"),
-      payloadDigest: `sha256:${"7".repeat(64)}` as ArtifactDigest,
-    });
+    const message = await transaction.messages.append(humanAppend("f", channelTarget("a"), "delivery fact", "g"));
     await transaction.launches.create({
       launchId: id("lnc", "a"),
       machineId: id("mch", "a"),
@@ -985,10 +1007,12 @@ test("legacy delivery replay and daemon acceptance preserve immutable lineage", 
     protocolVersion: 1,
     delivery: await transaction.deliveries.create(canonicalProtocolJson(replay)),
   }));
-  assert.equal(await raw(`SELECT count(*) FROM deliveries WHERE producer_fact_id = '${id("fac", "g")}'`), "2");
+  assert.equal(await raw(`SELECT count(*) FROM deliveries WHERE producer_fact_id = '${id("fac", "g")}'`), "3");
 });
 
 test("route repository binds an active membership epoch to an activated launch", async () => {
+  await raw(`DELETE FROM target_owner_routes WHERE target_kind = 'channel'
+    AND target_id = '${id("chn", "a")}' AND agent_id = '${id("agt", "c")}'`);
   await store.transaction(request("0", "launch.mutate.v1"), async (transaction) => {
     await transaction.launches.transition({ launchId: id("lnc", "a"), from: "requested", to: "ready" });
     await transaction.launches.transition({ launchId: id("lnc", "a"), from: "ready", to: "activated" });
@@ -1055,24 +1079,43 @@ test("task command locks its exact source, replays stored result, and rejects a 
   };
   const created = await store.transaction(request("z", "task.create.v1"), async (transaction) => ({
     protocolVersion: 1,
-    recorded: await transaction.taskCommands.record(commandInput),
+    recorded: await transaction.messages.createTask({
+      ...commandInput,
+      receiptId: variantId("rcp", "z", "t"),
+      machineId: id("mch", "a"), agentId: id("agt", "a"), launchId: id("lnc", "a"),
+      stateInstanceId: id("sti", "p"), sessionId: id("ses", "p"),
+      leaseEpoch: 1, fenceToken: id("fnc", "z"),
+      occurredAt: "2026-08-08T00:00:00.000Z",
+    }),
   }));
   assert.equal(created.result.recorded.replayed, false);
   const replay = await store.transaction(request("y", "task.create.v1"), async (transaction) => ({
     protocolVersion: 1,
-    recorded: await transaction.taskCommands.record(commandInput),
+    recorded: await transaction.messages.createTask({
+      ...commandInput,
+      receiptId: variantId("rcp", "z", "t"),
+      machineId: id("mch", "a"), agentId: id("agt", "a"), launchId: id("lnc", "a"),
+      stateInstanceId: id("sti", "p"), sessionId: id("ses", "p"),
+      leaseEpoch: 1, fenceToken: id("fnc", "z"),
+      occurredAt: "2026-08-08T00:00:00.000Z",
+    }),
   }));
   assert.equal(replay.result.recorded.replayed, true);
   assert.deepEqual(replay.result.recorded.result, commandInput.result);
   await assert.rejects(
     store.transaction(request("x", "task.create.v1"), async (transaction) => ({
       protocolVersion: 1,
-      recorded: await transaction.taskCommands.record({
+      recorded: await transaction.messages.createTask({
         ...commandInput,
         commandId: id("cmd", "x"),
         taskId: id("tsk", "x"),
         taskNumber: 100,
         result: { protocolVersion: 1, taskId: id("tsk", "x") },
+        receiptId: variantId("rcp", "x", "t"),
+        machineId: id("mch", "a"), agentId: id("agt", "a"), launchId: id("lnc", "a"),
+        stateInstanceId: id("sti", "p"), sessionId: id("ses", "p"),
+        leaseEpoch: 1, fenceToken: id("fnc", "x"),
+        occurredAt: "2026-08-08T00:00:00.000Z",
       }),
     })),
     (error: unknown) => error instanceof StorageError && error.code === "SECOND_COORDINATION_CALL",
