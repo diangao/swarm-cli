@@ -18,10 +18,8 @@ export {
   DeliveryRepository,
   IDEMPOTENCY_SCOPES,
   LaunchRepository,
-  MessageRepository,
   OutboxRepository,
   ReceiptRepository,
-  ReminderRepository,
   SharedStore,
   SharedTransaction,
   TargetSequenceRepository,
@@ -31,15 +29,29 @@ export {
   type IdempotencyScope,
   type VersionedResult,
 } from "./postgres/store.js";
+export {
+  ServerMessageRepository,
+  appendHumanMessageDigest,
+  type AppendHumanMessageInput,
+  type CreateTaskInput,
+} from "./postgres/server-messages.js";
+export {
+  ServerDeliveryRepository,
+  type PermitMutationInput,
+  type PermitBodyResult,
+} from "./postgres/server-delivery.js";
+export {
+  ServerReminderRepository,
+  reminderFireDigest,
+  type ReminderMutationInput,
+} from "./postgres/server-reminders.js";
 export { PsqlSession, sqlLiteral } from "./postgres/session.js";
 export {
   AgentRegistryRepository,
   MembershipRepository,
   NativeIngressRepository,
   ObservationCursorRepository,
-  ReminderHeadRepository,
   RouteRepository,
-  TaskCommandRepository,
 } from "./postgres/wave1.js";
 export {
   DaemonJournal,

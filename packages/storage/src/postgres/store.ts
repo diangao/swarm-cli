@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import {
   canonicalProtocolJson,
-  messageBodyHasContent,
   type ArtifactDigest,
   type DeliveryEnvelope,
   type ReceiptActor,
@@ -22,15 +21,16 @@ import {
   targetColumns,
 } from "../protocol.js";
 import { PostgresMigrator } from "./migrate.js";
+import { ServerDeliveryRepository } from "./server-delivery.js";
+import { ServerMessageRepository } from "./server-messages.js";
+import { ServerReminderRepository } from "./server-reminders.js";
 import { PsqlSession, sqlLiteral } from "./session.js";
 import {
   AgentRegistryRepository,
   MembershipRepository,
   NativeIngressRepository,
   ObservationCursorRepository,
-  ReminderHeadRepository,
   RouteRepository,
-  TaskCommandRepository,
 } from "./wave1.js";
 
 const SCHEMA = /^[a-z][a-z0-9_]{0,62}$/u;
@@ -71,16 +71,6 @@ export type IdempotentResult<T extends VersionedResult> = {
   result: T;
   resultDigest: ArtifactDigest;
   replayed: boolean;
-};
-
-type MessageAppendInput = {
-  messageId: string;
-  target: Target;
-  author: ReceiptActor | { humanId: HumanId };
-  body: string;
-  parentMessageId?: string;
-  producerFactId: string;
-  payloadDigest: ArtifactDigest;
 };
 
 type OutboxEvent = {
@@ -153,101 +143,6 @@ function validateRequest(request: IdempotentRequest): ActorColumns {
 
 function asTaskLease(value: TaskLease): TaskLease {
   return parseFrozenTaskLease(canonicalProtocolJson(value));
-}
-
-export class MessageRepository {
-  readonly #session: PsqlSession;
-
-  constructor(session: PsqlSession) {
-    this.#session = session;
-  }
-
-  async append(input: MessageAppendInput): Promise<{ messageId: string; targetSeq: number; replayed: boolean }> {
-    assertProtocolId(input.messageId, "msg");
-    assertProtocolId(input.producerFactId, "fac");
-    if (input.parentMessageId !== undefined) assertProtocolId(input.parentMessageId, "msg");
-    assertArtifactDigest(input.payloadDigest);
-    if (!messageBodyHasContent(input.body)) storageFail("EMPTY_MESSAGE", "empty message body");
-    const target = targetColumns(input.target);
-    const author = actorColumns(input.author);
-    await this.#session.execute(
-      `SELECT pg_advisory_xact_lock(hashtextextended(
-        'producer_fact:' || ${sqlLiteral(input.producerFactId)}, 0
-      ));`,
-    );
-    const existing = await this.#session.queryJson<{
-      found: boolean;
-      messageId?: string;
-      targetSeq?: number;
-      payloadDigest?: string;
-      targetKind?: string;
-      targetId?: string;
-      threadRootMessageId?: string | null;
-      authorKind?: string;
-      authorId?: string;
-      body?: string;
-      parentMessageId?: string | null;
-    }>(
-      `SELECT coalesce(
-        (SELECT json_build_object(
-          'found', true, 'messageId', message_id, 'targetSeq', target_seq,
-          'payloadDigest', payload_digest, 'targetKind', target_kind,
-          'targetId', target_id, 'threadRootMessageId', thread_root_message_id,
-          'authorKind', author_kind, 'authorId', author_id, 'body', body,
-          'parentMessageId', parent_message_id
-        ) FROM messages WHERE producer_fact_id = ${sqlLiteral(input.producerFactId)}),
-        json_build_object('found', false)
-      );`,
-    );
-    if (existing.found) {
-      if (
-        existing.payloadDigest !== input.payloadDigest ||
-        existing.targetKind !== target.kind ||
-        existing.targetId !== target.ownerId ||
-        (existing.threadRootMessageId ?? null) !== target.threadRootMessageId ||
-        existing.authorKind !== author.kind ||
-        existing.authorId !== author.id ||
-        existing.body !== input.body ||
-        (existing.parentMessageId ?? null) !== (input.parentMessageId ?? null)
-      ) {
-        storageFail("IDEMPOTENCY_CONFLICT", input.producerFactId);
-      }
-      return {
-        messageId: existing.messageId ?? storageFail("IDEMPOTENCY_CONFLICT"),
-        targetSeq: existing.targetSeq ?? storageFail("IDEMPOTENCY_CONFLICT"),
-        replayed: true,
-      };
-    }
-    const allocated = await this.#session.queryJson<{ targetSeq: number }>(
-      `WITH allocated AS (
-        INSERT INTO target_sequences (
-          target_kind, target_id, thread_root_message_id, next_seq
-        ) VALUES (
-          ${sqlLiteral(target.kind)}, ${sqlLiteral(target.ownerId)},
-          ${sqlLiteral(target.threadRootMessageId)}, 2
-        )
-        ON CONFLICT (target_kind, target_id, thread_root_message_id)
-        DO UPDATE SET next_seq = target_sequences.next_seq + 1
-        RETURNING next_seq - 1 AS target_seq
-      )
-      SELECT json_build_object('targetSeq', target_seq) FROM allocated;`,
-    );
-    await this.#session.execute(
-      `INSERT INTO messages (
-        message_id, target_kind, target_id, thread_root_message_id,
-        author_kind, author_id, target_seq, body, parent_message_id,
-        producer_fact_id, payload_digest
-      ) VALUES (
-        ${sqlLiteral(input.messageId)}, ${sqlLiteral(target.kind)},
-        ${sqlLiteral(target.ownerId)}, ${sqlLiteral(target.threadRootMessageId)},
-        ${sqlLiteral(author.kind)}, ${sqlLiteral(author.id)},
-        ${sqlLiteral(allocated.targetSeq)}, ${sqlLiteral(input.body)},
-        ${sqlLiteral(input.parentMessageId ?? null)},
-        ${sqlLiteral(input.producerFactId)}, ${sqlLiteral(input.payloadDigest)}
-      );`,
-    );
-    return { messageId: input.messageId, targetSeq: allocated.targetSeq, replayed: false };
-  }
 }
 
 export class ClaimFenceRepository {
@@ -834,118 +729,6 @@ export class ReceiptRepository {
   }
 }
 
-export class ReminderRepository {
-  readonly #session: PsqlSession;
-
-  constructor(session: PsqlSession) {
-    this.#session = session;
-  }
-
-  async advanceGeneration(input: {
-    reminderId: string;
-    owner: ReceiptActor;
-    anchor: Record<string, unknown>;
-    schedule: VersionedResult;
-    nextFireAt?: string;
-    expectedGeneration?: number;
-    expectedHeadRowVersion?: number;
-    fireProducerFactId?: string;
-    requestDigest?: ArtifactDigest;
-  }): Promise<number> {
-    assertProtocolId(input.reminderId, "cmd");
-    const owner = actorColumns(input.owner);
-    validateVersionedResult(input.schedule);
-    canonicalProtocolJson(input.anchor);
-    await this.#session.execute(
-      `SELECT pg_advisory_xact_lock(hashtextextended(
-        'reminder:' || ${sqlLiteral(input.reminderId)}, 0
-      ));`,
-    );
-    const current = await this.#session.queryJson<{ generation: number; rowVersion: number }>(
-      `SELECT json_build_object(
-        'generation', coalesce((SELECT current_generation FROM reminder_heads
-          WHERE reminder_id = ${sqlLiteral(input.reminderId)} FOR UPDATE), 0),
-        'rowVersion', coalesce((SELECT row_version FROM reminder_heads
-          WHERE reminder_id = ${sqlLiteral(input.reminderId)}), 0)
-      );`,
-    );
-    if (
-      input.expectedGeneration !== undefined &&
-      Number(current.generation) !== input.expectedGeneration
-    ) {
-      storageFail("STALE_FENCE", input.reminderId);
-    }
-    if (
-      input.expectedHeadRowVersion !== undefined
-      && Number(current.rowVersion) !== input.expectedHeadRowVersion
-    ) {
-      storageFail("STALE_FENCE", input.reminderId);
-    }
-    const generation = Number(current.generation) + 1;
-    const fireProducerFactId = input.fireProducerFactId ?? `fac_${createHash("sha256")
-      .update(`${input.reminderId}:${generation}`)
-      .digest("hex")
-      .slice(0, 26)}`;
-    assertProtocolId(fireProducerFactId, "fac");
-    const requestDigest = assertArtifactDigest(input.requestDigest ?? digestCanonical({
-      reminderId: input.reminderId,
-      generation,
-      anchor: input.anchor,
-      schedule: input.schedule,
-      nextFireAt: input.nextFireAt ?? null,
-    }));
-    await this.#session.execute(
-      `INSERT INTO reminders (
-        reminder_id, owner_kind, owner_id, anchor_json, schedule_json,
-        generation, next_fire_at, fire_producer_fact_id, request_digest
-      ) VALUES (
-        ${sqlLiteral(input.reminderId)}, ${sqlLiteral(owner.kind)}, ${sqlLiteral(owner.id)},
-        ${sqlLiteral(canonicalJson(input.anchor))}::jsonb,
-        ${sqlLiteral(canonicalJson(input.schedule))}::jsonb,
-        ${sqlLiteral(generation)}, ${sqlLiteral(input.nextFireAt ?? null)}::timestamptz,
-        ${sqlLiteral(fireProducerFactId)}, ${sqlLiteral(requestDigest)}
-      );
-      INSERT INTO reminder_heads(reminder_id, current_generation, row_version)
-      VALUES (${sqlLiteral(input.reminderId)}, ${sqlLiteral(generation)}, 0)
-      ON CONFLICT (reminder_id) DO UPDATE SET
-        current_generation = excluded.current_generation,
-        row_version = reminder_heads.row_version + 1
-      WHERE reminder_heads.current_generation = ${sqlLiteral(current.generation)}
-        AND reminder_heads.row_version = ${sqlLiteral(current.rowVersion)};`,
-    );
-    return generation;
-  }
-
-  async cancel(input: { reminderId: string; generation: number }): Promise<void> {
-    assertProtocolId(input.reminderId, "cmd");
-    await this.#session.execute(
-      `SELECT pg_advisory_xact_lock(hashtextextended(
-        'reminder:' || ${sqlLiteral(input.reminderId)}, 0
-      ));`,
-    );
-    const current = await this.#session.queryJson<{ generation: number | null }>(
-      `SELECT json_build_object('generation', (
-        SELECT generation FROM reminders
-        WHERE reminder_id = ${sqlLiteral(input.reminderId)}
-        ORDER BY generation DESC LIMIT 1 FOR UPDATE
-      ));`,
-    );
-    if (Number(current.generation) !== input.generation) {
-      storageFail("STALE_FENCE", input.reminderId);
-    }
-    const result = await this.#session.queryJson<{ changed: number }>(
-      `WITH changed AS (
-        UPDATE reminders SET canceled_at = clock_timestamp(), status = 'canceled', row_version = row_version + 1
-        WHERE reminder_id = ${sqlLiteral(input.reminderId)}
-          AND generation = ${sqlLiteral(input.generation)} AND canceled_at IS NULL
-          AND generation = (SELECT max(generation) FROM reminders WHERE reminder_id = ${sqlLiteral(input.reminderId)})
-        RETURNING 1
-      ) SELECT json_build_object('changed', count(*)) FROM changed;`,
-    );
-    if (Number(result.changed) !== 1) storageFail("STALE_FENCE", input.reminderId);
-  }
-}
-
 export class LaunchRepository {
   readonly #session: PsqlSession;
 
@@ -1293,10 +1076,10 @@ export class OutboxRepository {
 
 export class SharedTransaction {
   readonly sequences: TargetSequenceRepository;
-  readonly messages: MessageRepository;
+  readonly messages: ServerMessageRepository;
   readonly claims: ClaimFenceRepository;
   readonly taskGraph: TaskGraphRepository;
-  readonly reminders: ReminderRepository;
+  readonly reminders: ServerReminderRepository;
   readonly launches: LaunchRepository;
   readonly deliveries: DeliveryRepository;
   readonly receipts: ReceiptRepository;
@@ -1306,16 +1089,15 @@ export class SharedTransaction {
   readonly memberships: MembershipRepository;
   readonly routes: RouteRepository;
   readonly nativeIngress: NativeIngressRepository;
+  readonly serverDelivery: ServerDeliveryRepository;
   readonly observationCursors: ObservationCursorRepository;
-  readonly taskCommands: TaskCommandRepository;
-  readonly reminderHeads: ReminderHeadRepository;
 
   constructor(session: PsqlSession) {
     this.sequences = new TargetSequenceRepository(session);
-    this.messages = new MessageRepository(session);
+    this.messages = new ServerMessageRepository(session);
     this.claims = new ClaimFenceRepository(session);
     this.taskGraph = new TaskGraphRepository(session);
-    this.reminders = new ReminderRepository(session);
+    this.reminders = new ServerReminderRepository(session);
     this.launches = new LaunchRepository(session);
     this.deliveries = new DeliveryRepository(session);
     this.receipts = new ReceiptRepository(session);
@@ -1325,9 +1107,8 @@ export class SharedTransaction {
     this.memberships = new MembershipRepository(session);
     this.routes = new RouteRepository(session);
     this.nativeIngress = new NativeIngressRepository(session);
+    this.serverDelivery = new ServerDeliveryRepository(session);
     this.observationCursors = new ObservationCursorRepository(session);
-    this.taskCommands = new TaskCommandRepository(session);
-    this.reminderHeads = new ReminderHeadRepository(session);
   }
 }
 
