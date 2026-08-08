@@ -160,7 +160,8 @@ test("permit is the body linearization point and replay cannot return cached bod
   };
   const command = { ...commandBase, requestDigest: digest(commandBase) } as AcquireConsumePermit;
   const permitInput = {
-    command, commandKind: "acquire" as const, permitId: variant("cmd", "c", "q") as CommandId,
+    command, commandKind: "acquire" as const, workerLeaseId: id("lse", "c"),
+    permitId: variant("cmd", "c", "q") as CommandId,
     resultInvocationGeneration: 1, resultInvocationId: variant("cmd", "c", "1") as CommandId,
     resultWithoutBody: { protocolVersion: 1, permitId: variant("cmd", "c", "q") },
   };
@@ -219,7 +220,8 @@ test("membership revocation before permit terminally suppresses without revealin
   const suppressed = await store.transaction(request("m"), async (transaction) => ({
     protocolVersion: 1,
     value: await transaction.serverDelivery.acquireOrResume({
-      command, commandKind: "acquire", permitId: variant("cmd", "d", "q") as CommandId,
+      command, commandKind: "acquire", workerLeaseId: id("lse", "d"),
+      permitId: variant("cmd", "d", "q") as CommandId,
       resultInvocationGeneration: 1, resultInvocationId: variant("cmd", "d", "1") as CommandId,
       resultWithoutBody: { protocolVersion: 1 },
     }),
@@ -259,7 +261,8 @@ test("route supersession before permit terminally suppresses the frozen route", 
   const suppressed = await store.transaction(request("r"), async (transaction) => ({
     protocolVersion: 1,
     value: await transaction.serverDelivery.acquireOrResume({
-      command, commandKind: "acquire", permitId: variant("cmd", "e", "q") as CommandId,
+      command, commandKind: "acquire", workerLeaseId: id("lse", "e"),
+      permitId: variant("cmd", "e", "q") as CommandId,
       resultInvocationGeneration: 1, resultInvocationId: variant("cmd", "e", "1") as CommandId,
       resultWithoutBody: { protocolVersion: 1 },
     }),
@@ -287,7 +290,8 @@ test("an unleased logical job cannot acquire a consume permit through the public
     store.transaction(request("t"), async (transaction) => ({
       protocolVersion: 1,
       value: await transaction.serverDelivery.acquireOrResume({
-        command, commandKind: "acquire", permitId: variant("cmd", "f", "q") as CommandId,
+        command, commandKind: "acquire", workerLeaseId: id("lse", "f"),
+        permitId: variant("cmd", "f", "q") as CommandId,
         resultInvocationGeneration: 1, resultInvocationId: variant("cmd", "f", "1") as CommandId,
         resultWithoutBody: { protocolVersion: 1 },
       }),
@@ -317,4 +321,105 @@ test("a logical delivery job is not leasable before its immutable due time", asy
   );
   assert.equal(await raw(`SELECT status FROM outbox_jobs WHERE job_id = ${appended.result.value.outboxJobId}`), "pending");
   assert.equal(await raw(`SELECT status FROM deliveries WHERE delivery_id = '${id("dlv", "f")}'`), "pending");
+});
+
+test("only the exact unexpired worker lease can acquire, then expiry recovery preserves one logical job", async () => {
+  const appended = await store.transaction({ ...request("0"), scope: "message.append.v1" }, async (transaction) => ({
+    protocolVersion: 1, value: await transaction.messages.append(appendInput("g", "lease-private body")),
+  }));
+  const payloadBefore = await raw(
+    `SELECT payload_json::text FROM outbox_jobs WHERE job_id = ${appended.result.value.outboxJobId}`,
+  );
+  await store.transaction(request("1"), async (transaction) => ({
+    protocolVersion: 1,
+    lease: await transaction.serverDelivery.lease({
+      jobId: appended.result.value.outboxJobId,
+      workerLeaseId: id("lse", "g"),
+      leaseUntil: "2099-01-01T00:00:00.000Z",
+    }),
+  }));
+  const acquireBase = {
+    protocolVersion: 1,
+    deliveryId: id("dlv", "g"), attempt: 1, producerFactId: id("fac", "g"),
+    agentId: id("agt", "a"), machineId: id("mch", "a"), launchId: id("lnc", "a"),
+    membershipEpoch: 3, routingGeneration: 1, routeVersion: 3,
+    sessionId: id("ses", "g"), turnId: id("trn", "g"),
+    commandId: variant("cmd", "g", "p"), boundary: "daemon_accepted" as const,
+  };
+  const command = { ...acquireBase, requestDigest: digest(acquireBase) } as AcquireConsumePermit;
+  const acquire = (requestCharacter: string, workerLeaseId: string) => store.transaction(
+    request(requestCharacter),
+    async (transaction) => ({
+      protocolVersion: 1,
+      value: await transaction.serverDelivery.acquireOrResume({
+        command, commandKind: "acquire", workerLeaseId,
+        permitId: variant("cmd", "g", "q") as CommandId,
+        resultInvocationGeneration: 1,
+        resultInvocationId: variant("cmd", "g", "1") as CommandId,
+        resultWithoutBody: { protocolVersion: 1 },
+      }),
+    }),
+  );
+
+  await assert.rejects(
+    acquire("2", id("lse", "h")),
+    (error: unknown) => error instanceof StorageError && error.code === "STALE_DELIVERY_FENCE",
+  );
+  await raw(`UPDATE deliveries SET worker_lease_until = clock_timestamp() - interval '1 second'
+      WHERE delivery_id = '${id("dlv", "g")}' AND attempt = 1;
+    UPDATE outbox_jobs SET worker_lease_until = clock_timestamp() - interval '1 second'
+      WHERE job_id = ${appended.result.value.outboxJobId}`);
+  await assert.rejects(
+    acquire("3", id("lse", "g")),
+    (error: unknown) => error instanceof StorageError && error.code === "STALE_DELIVERY_FENCE",
+  );
+
+  assert.equal(await raw(`SELECT count(*) FROM delivery_permit_commands WHERE delivery_id = '${id("dlv", "g")}'`), "0");
+  assert.equal(await raw(`SELECT count(*) FROM delivery_invocations WHERE delivery_id = '${id("dlv", "g")}'`), "0");
+  assert.equal(await raw(`SELECT consume_permit_id IS NULL AND daemon_accepted_at IS NULL
+    AND status = 'leased' FROM deliveries WHERE delivery_id = '${id("dlv", "g")}' AND attempt = 1`), "t");
+  assert.equal(await raw(`SELECT status = 'leased' AND hold_reason IS NULL
+    FROM outbox_jobs WHERE job_id = ${appended.result.value.outboxJobId}`), "t");
+  assert.equal(await raw(`SELECT count(*) FROM command_requests WHERE request_id IN ('${id("cmd", "2")}', '${id("cmd", "3")}')`), "0");
+
+  const reconcileBase = {
+    protocolVersion: 1,
+    deliveryId: id("dlv", "g"), attempt: 1, producerFactId: id("fac", "g"),
+    agentId: id("agt", "a"), machineId: id("mch", "a"), launchId: id("lnc", "a"),
+    membershipEpoch: 3, routingGeneration: 1, routeVersion: 3,
+    sessionId: id("ses", "h"), turnId: id("trn", "h"),
+    commandId: variant("cmd", "h", "r"), permitId: null, invocation: null,
+    evidenceDigest: digest({ kind: "pre_permit_disconnect", disconnectId: variant("cmd", "h", "d") }),
+    evidence: { kind: "pre_permit_disconnect" as const, disconnectId: variant("cmd", "h", "d") },
+  };
+  const reconcile = { ...reconcileBase, requestDigest: digest(reconcileBase) } as ReconcileDeliveryAttempt;
+  const reconcileResult: ReconcileDeliveryResult = {
+    kind: "pre_permit_requeued", jobState: "pending", replayOfAttempt: 1, nextAttempt: 2,
+  };
+  await store.transaction(request("4"), async (transaction) => ({
+    protocolVersion: 1,
+    value: await transaction.serverDelivery.reconcilePrePermit(reconcile, reconcileResult),
+  }));
+  const lease2 = await store.transaction(request("5"), async (transaction) => ({
+    protocolVersion: 1,
+    lease: await transaction.serverDelivery.lease({
+      jobId: appended.result.value.outboxJobId,
+      workerLeaseId: id("lse", "j"),
+      leaseUntil: "2099-01-01T00:00:00.000Z",
+      nextDeliveryId: variant("dlv", "g", "2"),
+    }),
+  }));
+  assert.equal(lease2.result.lease.attempt, 2);
+  assert.equal(lease2.result.lease.replayOf, id("dlv", "g"));
+  assert.equal(lease2.result.lease.jobId, appended.result.value.outboxJobId);
+  assert.equal(
+    await raw(`SELECT string_agg(attempt || ':' || status || ':' || coalesce(replay_of, '-'), ',' ORDER BY attempt)
+      FROM deliveries WHERE outbox_job_id = ${appended.result.value.outboxJobId}`),
+    `1:canceled:-,2:leased:${id("dlv", "g")}`,
+  );
+  assert.equal(await raw(`SELECT count(*) FROM outbox_jobs WHERE producer_fact_id = '${id("fac", "g")}'`), "1");
+  assert.equal(
+    await raw(`SELECT payload_json::text FROM outbox_jobs WHERE job_id = ${appended.result.value.outboxJobId}`),
+    payloadBefore,
+  );
 });

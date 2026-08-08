@@ -298,7 +298,7 @@ test("terminal model-visible predecessor serializes reply before the sole task e
   const permit = await store.transaction({ ...request("m"), scope: "delivery.mutate.v1" }, async (transaction) => ({
     protocolVersion: 1,
     value: await transaction.serverDelivery.acquireOrResume({
-      command: acquire, commandKind: "acquire", permitId,
+      command: acquire, commandKind: "acquire", workerLeaseId: id("lse", "f"), permitId,
       resultInvocationGeneration: 1, resultInvocationId: invocation.invocationId,
       resultWithoutBody: { protocolVersion: 1, permitId },
     }),
@@ -380,4 +380,47 @@ test("terminal model-visible predecessor serializes reply before the sole task e
     ) ordered`),
     "t",
   );
+});
+
+test("revoked human membership blocks both append replay layers without changing the canonical append", async () => {
+  const input = appendInput("0", "immutable replay body");
+  const original = await store.transaction(request("y"), async (transaction) => ({
+    protocolVersion: 1,
+    value: await transaction.messages.append(input),
+  }));
+  assert.equal(original.result.value.replayed, false);
+  const canonicalSnapshot = () => raw(`SELECT json_build_object(
+    'message', (SELECT row_to_json(m) FROM messages m WHERE producer_fact_id = '${id("fac", "0")}'),
+    'receipt', (SELECT row_to_json(r) FROM receipts r WHERE producer_fact_id = '${id("fac", "0")}'),
+    'audience', (SELECT json_agg(row_to_json(a) ORDER BY actor_kind, actor_id)
+      FROM message_audience a WHERE message_id = '${id("msg", "0")}'),
+    'route', (SELECT row_to_json(mor) FROM message_owner_routes mor WHERE producer_fact_id = '${id("fac", "0")}'),
+    'delivery', (SELECT row_to_json(d) FROM deliveries d WHERE producer_fact_id = '${id("fac", "0")}'),
+    'outbox', (SELECT row_to_json(j) FROM outbox_jobs j WHERE producer_fact_id = '${id("fac", "0")}'),
+    'nextSeq', (SELECT next_seq FROM target_sequences
+      WHERE target_kind = 'channel' AND target_id = '${id("chn", "a")}' AND thread_root_message_id IS NULL),
+    'commandRequests', (SELECT count(*) FROM command_requests)
+  )::text`);
+  const before = await canonicalSnapshot();
+  await raw(`UPDATE memberships SET state = 'removed', membership_epoch = 2, row_version = 2
+    WHERE channel_id = '${id("chn", "a")}' AND actor_kind = 'human' AND actor_id = '${id("hum", "a")}'`);
+
+  await assert.rejects(
+    store.transaction(request("z"), async (transaction) => ({
+      protocolVersion: 1,
+      value: await transaction.messages.append(input),
+    })),
+    (error: unknown) => error instanceof StorageError && error.code === "MEMBERSHIP_REVOKED_BEFORE_CONSUME",
+  );
+  let outerReplayBodyReached = false;
+  await assert.rejects(
+    store.transaction(request("y"), async () => {
+      outerReplayBodyReached = true;
+      throw new Error("outer append replay must authorize from stored canonical facts");
+    }),
+    (error: unknown) => error instanceof StorageError && error.code === "MEMBERSHIP_REVOKED_BEFORE_CONSUME",
+  );
+  assert.equal(outerReplayBodyReached, false);
+  assert.equal(await canonicalSnapshot(), before);
+  assert.equal(await raw(`SELECT count(*) FROM command_requests WHERE request_id = '${id("cmd", "z")}'`), "0");
 });

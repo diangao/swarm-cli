@@ -1119,6 +1119,42 @@ type StoredRequest<T> = {
   resultDigest?: string;
 };
 
+type StoredAppendReplayFact = {
+  messageId: string;
+  targetSeq: number;
+  producerFactId: string;
+  deliveryId: string;
+  outboxJobId: number;
+};
+
+function storedAppendReplayFact(value: unknown): StoredAppendReplayFact | undefined {
+  // command_requests predates append-specific columns, so bind a cached outer
+  // replay back to the exact canonical append tuple stored in its result.
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const candidates = [record, ...Object.values(record)].filter(
+    (candidate): candidate is Record<string, unknown> =>
+      typeof candidate === "object" && candidate !== null && !Array.isArray(candidate),
+  ).filter((candidate) =>
+    typeof candidate.messageId === "string"
+    && Number.isSafeInteger(candidate.targetSeq) && Number(candidate.targetSeq) >= 1
+    && typeof candidate.producerFactId === "string"
+    && typeof candidate.deliveryId === "string"
+    && Number.isSafeInteger(candidate.outboxJobId) && Number(candidate.outboxJobId) >= 1
+    && typeof candidate.replayed === "boolean",
+  );
+  if (candidates.length === 0) return undefined;
+  if (candidates.length !== 1) storageFail("IDEMPOTENCY_CONFLICT", "ambiguous append replay result");
+  const candidate = candidates[0]!;
+  return {
+    messageId: String(candidate.messageId),
+    targetSeq: Number(candidate.targetSeq),
+    producerFactId: String(candidate.producerFactId),
+    deliveryId: String(candidate.deliveryId),
+    outboxJobId: Number(candidate.outboxJobId),
+  };
+}
+
 export class SharedStore {
   readonly #databaseUrl: string;
   readonly #schema: string;
@@ -1151,6 +1187,7 @@ export class SharedStore {
       );
       const existing = await this.#readRequest<T>(session, request, actor);
       if (existing.found) {
+        await this.#authorizeAppendReplay(session, request, existing.result);
         if (existing.requestDigest !== request.requestDigest) {
           storageFail("IDEMPOTENCY_CONFLICT", request.requestId);
         }
@@ -1203,6 +1240,56 @@ export class SharedStore {
     );
   }
 
+  async #authorizeAppendReplay(
+    session: PsqlSession,
+    request: IdempotentRequest,
+    result: VersionedResult | undefined,
+  ): Promise<void> {
+    if (request.scope !== "message.append.v1") return;
+    const fact = storedAppendReplayFact(result);
+    if (fact === undefined) return;
+    const canonical = await session.queryJson<{
+      found: boolean;
+      targetKind?: "channel" | "direct";
+      targetId?: string;
+      humanId?: string;
+    }>(
+      `SELECT coalesce((SELECT json_build_object(
+        'found', true, 'targetKind', m.target_kind, 'targetId', m.target_id,
+        'humanId', m.author_id
+      ) FROM messages m
+      JOIN humans h ON h.human_id = m.author_id
+      JOIN deliveries d ON d.message_id = m.message_id AND d.attempt = 1
+      JOIN outbox_jobs j ON j.job_id = d.outbox_job_id
+      JOIN receipts r ON r.producer_fact_id = m.producer_fact_id
+        AND r.kind = 'server_accepted' AND r.actor_server_id = h.server_id
+      WHERE m.message_id = ${sqlLiteral(fact.messageId)}
+        AND m.author_kind = 'human'
+        AND m.target_seq = ${sqlLiteral(fact.targetSeq)}
+        AND m.producer_fact_id = ${sqlLiteral(fact.producerFactId)}
+        AND d.delivery_id = ${sqlLiteral(fact.deliveryId)}
+        AND d.outbox_job_id = ${sqlLiteral(fact.outboxJobId)}
+      FOR UPDATE OF m, h, d, j, r), json_build_object('found', false));`,
+    );
+    if (
+      !canonical.found
+      || (canonical.targetKind !== "channel" && canonical.targetKind !== "direct")
+      || canonical.targetId === undefined
+      || canonical.humanId === undefined
+    ) storageFail("IDEMPOTENCY_CONFLICT", request.requestId);
+    const table = canonical.targetKind === "channel" ? "memberships" : "conversation_memberships";
+    const column = canonical.targetKind === "channel" ? "channel_id" : "conversation_id";
+    const membership = await session.queryJson<{ found: boolean; state?: string }>(
+      `SELECT coalesce((SELECT json_build_object('found', true, 'state', state)
+        FROM ${table} WHERE ${column} = ${sqlLiteral(canonical.targetId)}
+          AND actor_kind = 'human' AND actor_id = ${sqlLiteral(canonical.humanId)}
+        FOR UPDATE), json_build_object('found', false));`,
+    );
+    if (!membership.found || membership.state !== "active") {
+      storageFail("MEMBERSHIP_REVOKED_BEFORE_CONSUME", canonical.humanId);
+    }
+  }
+
   async #readWinner<T extends VersionedResult>(
     request: IdempotentRequest,
     actor: ActorColumns,
@@ -1217,6 +1304,7 @@ export class SharedStore {
       await reader.execute(`SET search_path TO ${this.#schema}, pg_catalog;`);
       const stored = await this.#readRequest<T>(reader, request, actor);
       if (!stored.found) return undefined;
+      await this.#authorizeAppendReplay(reader, request, stored.result);
       if (stored.requestDigest !== request.requestDigest) {
         storageFail("IDEMPOTENCY_CONFLICT", request.requestId);
       }

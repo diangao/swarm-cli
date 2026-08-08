@@ -19,15 +19,19 @@ import { NativeIngressRepository } from "./wave1.js";
 
 type PermitCommand = AcquireConsumePermit | ResumeConsumePermit;
 
-export type PermitMutationInput = {
+type PermitMutationBase = {
   command: PermitCommand;
-  commandKind: "acquire" | "resume_same" | "resume_next";
   permitId: CommandId;
   resultInvocationGeneration: number;
   resultInvocationId: CommandId;
   resultWithoutBody: Record<string, unknown>;
   createdFromProofDigest?: ArtifactDigest;
 };
+
+export type PermitMutationInput = PermitMutationBase & (
+  | { commandKind: "acquire"; workerLeaseId: string }
+  | { commandKind: "resume_same" | "resume_next"; workerLeaseId?: never }
+);
 
 type DeliveryAuthority = {
   found: boolean;
@@ -266,6 +270,7 @@ export class ServerDeliveryRepository {
   }
 
   async acquireOrResume(input: PermitMutationInput): Promise<PermitBodyResult> {
+    if (input.commandKind === "acquire") assertProtocolId(input.workerLeaseId, "lse");
     const command = "resumeMode" in input.command
       ? parseResumeConsumePermit(canonicalProtocolJson(input.command), 1 as ProtocolVersion)
       : parseAcquireConsumePermit(canonicalProtocolJson(input.command), 1 as ProtocolVersion);
@@ -275,7 +280,11 @@ export class ServerDeliveryRepository {
         SELECT 1 FROM delivery_permit_commands WHERE command_id = ${sqlLiteral(command.commandId)}
       ));`,
     );
-    const suppression = await this.#authorize(command, replayCandidate.found);
+    const suppression = await this.#authorize(
+      command,
+      replayCandidate.found,
+      input.commandKind === "acquire" ? input.workerLeaseId : undefined,
+    );
     if (suppression !== null) {
       await this.#suppress(command, suppression);
       return { kind: "suppressed", code: suppression };
@@ -306,7 +315,11 @@ export class ServerDeliveryRepository {
     };
   }
 
-  async #authorize(command: PermitCommand, replayCandidate: boolean): Promise<PermitSuppressionCode | null> {
+  async #authorize(
+    command: PermitCommand,
+    replayCandidate: boolean,
+    workerLeaseId?: string,
+  ): Promise<PermitSuppressionCode | null> {
     const delivery = await this.#session.queryJson<DeliveryAuthority>(
       `SELECT coalesce((SELECT json_build_object(
         'found', true, 'messageId', d.message_id, 'producerFactId', d.producer_fact_id,
@@ -364,9 +377,20 @@ export class ServerDeliveryRepository {
       ));`,
     );
     if (!audience.valid) return "MEMBERSHIP_REVOKED_BEFORE_CONSUME";
-    const locked = await this.#session.queryJson<{ valid: boolean; deliveryStatus?: string; jobStatus?: string }>(
+    const locked = await this.#session.queryJson<{
+      valid: boolean;
+      deliveryStatus?: string;
+      jobStatus?: string;
+      currentWorkerLease?: boolean;
+    }>(
       `SELECT coalesce((SELECT json_build_object(
-        'valid', true, 'deliveryStatus', d.status, 'jobStatus', j.status
+        'valid', true, 'deliveryStatus', d.status, 'jobStatus', j.status,
+        'currentWorkerLease',
+          d.worker_lease_id IS NOT NULL
+          AND d.worker_lease_id = j.worker_lease_id
+          AND d.worker_lease_id = ${sqlLiteral(workerLeaseId ?? null)}
+          AND d.worker_lease_until > clock_timestamp()
+          AND j.worker_lease_until > clock_timestamp()
       ) FROM deliveries d JOIN outbox_jobs j ON j.job_id = d.outbox_job_id
       WHERE d.delivery_id = ${sqlLiteral(command.deliveryId)} AND d.attempt = ${sqlLiteral(command.attempt)}
         AND d.producer_fact_id = ${sqlLiteral(command.producerFactId)}
@@ -380,7 +404,10 @@ export class ServerDeliveryRepository {
     if (!locked.valid) storageFail("STALE_DELIVERY_FENCE", command.deliveryId);
     if (
       !("resumeMode" in command) && !replayCandidate
-      && (locked.deliveryStatus !== "leased" || locked.jobStatus !== "leased")
+      && (
+        locked.deliveryStatus !== "leased" || locked.jobStatus !== "leased"
+        || locked.currentWorkerLease !== true
+      )
     ) storageFail("STALE_DELIVERY_FENCE", command.deliveryId);
     return null;
   }

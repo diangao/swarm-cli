@@ -114,6 +114,22 @@ export class ServerMessageRepository {
     const membershipTable = target.kind === "channel" ? "memberships" : "conversation_memberships";
     const membershipTargetColumn = target.kind === "channel" ? "channel_id" : "conversation_id";
 
+    const actor = await this.#session.queryJson<{ valid: boolean; epoch?: number }>(
+      `WITH human AS (
+        SELECT 1 FROM humans WHERE human_id = ${sqlLiteral(input.humanId)}
+          AND server_id = ${sqlLiteral(input.serverId)} FOR UPDATE
+      ), member AS (
+        SELECT membership_epoch FROM ${membershipTable}
+        WHERE ${membershipTargetColumn} = ${sqlLiteral(target.ownerId)}
+          AND actor_kind = 'human' AND actor_id = ${sqlLiteral(input.humanId)}
+          AND state = 'active' FOR UPDATE
+      ) SELECT json_build_object(
+        'valid', EXISTS (SELECT 1 FROM human) AND EXISTS (SELECT 1 FROM member),
+        'epoch', (SELECT membership_epoch FROM member)
+      );`,
+    );
+    if (!actor.valid) storageFail("MEMBERSHIP_REVOKED_BEFORE_CONSUME", input.humanId);
+
     await this.#session.execute(
       `SELECT pg_advisory_xact_lock(hashtextextended(
         'producer_fact:' || ${sqlLiteral(input.producerFactId)}, 0
@@ -152,22 +168,6 @@ export class ServerMessageRepository {
         replayed: true,
       };
     }
-
-    const actor = await this.#session.queryJson<{ valid: boolean; epoch?: number }>(
-      `WITH human AS (
-        SELECT 1 FROM humans WHERE human_id = ${sqlLiteral(input.humanId)}
-          AND server_id = ${sqlLiteral(input.serverId)} FOR UPDATE
-      ), member AS (
-        SELECT membership_epoch FROM ${membershipTable}
-        WHERE ${membershipTargetColumn} = ${sqlLiteral(target.ownerId)}
-          AND actor_kind = 'human' AND actor_id = ${sqlLiteral(input.humanId)}
-          AND state = 'active' FOR UPDATE
-      ) SELECT json_build_object(
-        'valid', EXISTS (SELECT 1 FROM human) AND EXISTS (SELECT 1 FROM member),
-        'epoch', (SELECT membership_epoch FROM member)
-      );`,
-    );
-    if (!actor.valid) storageFail("MEMBERSHIP_REVOKED_BEFORE_CONSUME", input.humanId);
     await this.#session.execute(
       `SELECT actor_kind, actor_id FROM ${membershipTable}
        WHERE ${membershipTargetColumn} = ${sqlLiteral(target.ownerId)} AND state = 'active'
