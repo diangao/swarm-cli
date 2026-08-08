@@ -19,6 +19,33 @@ const SQLITE_CONTROLS = [
   "state NOT IN ('server_confirmed', 'canceled')",
 ] as const;
 
+const POSTGRES_NATIVE_INGRESS_CONTROLS = [
+  "CREATE DOMAIN human_id_text",
+  "CREATE FUNCTION message_body_has_content",
+  "CREATE TABLE message_audience",
+  "CREATE TABLE target_owner_routes",
+  "CREATE CONSTRAINT TRIGGER target_owner_routes_authority_match",
+  "CREATE TABLE message_owner_routes",
+  "CREATE TABLE delivery_invocations",
+  "CREATE TABLE delivery_permit_commands",
+  "CREATE TABLE delivery_reconciliation_commands",
+  "CREATE TABLE delivery_ack_commands",
+  "CREATE TABLE delivery_boundary_ack_results",
+  "UNIQUE (delivery_id, attempt, permit_id, invocation_generation, invocation_id)",
+  "UNIQUE (receipt_id, delivery_id, attempt, permit_id, invocation_generation, invocation_id, boundary)",
+  "MATCH SIMPLE DEFERRABLE INITIALLY DEFERRED",
+  "CREATE CONSTRAINT TRIGGER receipts_boundary_creator_match",
+  "c.result_json->'repaired' ? NEW.boundary",
+  "receipts_actor_shape_v1",
+  "CREATE TABLE task_commands",
+  "CREATE TABLE observation_cursors",
+  "CREATE TABLE reminder_heads",
+  "CREATE TABLE reminder_fires",
+  "reminders_fire_producer_once",
+  "CREATE TRIGGER outbox_immutable_fields",
+  "WHERE boundary = 'model_visible'",
+] as const;
+
 function requireControls(sql: string, controls: readonly string[], dialect: string): void {
   for (const control of controls) {
     if (!sql.includes(control)) storageFail("INVALID_MIGRATION", { dialect, control });
@@ -31,4 +58,8 @@ export function assertPostgresMigrationContract(sql: string): void {
 
 export function assertSqliteMigrationContract(sql: string): void {
   requireControls(sql, SQLITE_CONTROLS, "sqlite");
+}
+
+export function assertPostgresNativeIngressMigrationContract(sql: string): void {
+  requireControls(sql, POSTGRES_NATIVE_INGRESS_CONTROLS, "postgres-native-ingress");
 }

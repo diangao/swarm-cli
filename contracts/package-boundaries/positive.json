@@ -51,5 +51,29 @@
         "@swarm/testkit": "workspace:*"
       }
     }
+  },
+  {
+    "name": "runtime-contract-protocol",
+    "package": "runtime-contract",
+    "source": "import type { NativeTurnInput } from \"@swarm/protocol\";",
+    "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*" } }
+  },
+  {
+    "name": "drivers-inward-interfaces",
+    "package": "drivers",
+    "source": "import type { NativeRuntimeEvent } from \"@swarm/protocol\"; import type { ManifestComposer } from \"@swarm/runtime-contract\";",
+    "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*", "@swarm/runtime-contract": "workspace:*" } }
+  },
+  {
+    "name": "daemon-core-ports-only",
+    "package": "daemon-core",
+    "source": "import type { DeliveryAck } from \"@swarm/protocol\"; import type { ManifestComposer } from \"@swarm/runtime-contract\"; import type { NativeRuntimePort } from \"@swarm/drivers\";",
+    "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*", "@swarm/runtime-contract": "workspace:*", "@swarm/drivers": "workspace:*" } }
+  },
+  {
+    "name": "daemon-app-composition",
+    "app": "daemon",
+    "source": "import type { DeliveryAck } from \"@swarm/protocol\"; import { SharedStore } from \"@swarm/storage\"; import { DaemonCore } from \"@swarm/daemon-core\"; import { ScriptedDriver } from \"@swarm/drivers\";",
+    "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*", "@swarm/storage": "workspace:*", "@swarm/daemon-core": "workspace:*", "@swarm/drivers": "workspace:*" } }
   }
 ]

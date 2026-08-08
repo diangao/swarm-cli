@@ -16,6 +16,7 @@ const ID_PREFIXES = [
   "srv",
   "mch",
   "agt",
+  "hum",
   "chn",
   "cvs",
   "msg",
@@ -34,7 +35,7 @@ const ID_PREFIXES = [
 
 export type ProtocolIdPrefix = (typeof ID_PREFIXES)[number];
 
-const ID_PATTERN = /^(srv|mch|agt|chn|cvs|msg|dlv|fac|tsk|clm|lse|lnc|cmd|rcp|sti|trn|ses)_[0-9a-hjkmnp-tv-z]{26}$/u;
+const ID_PATTERN = /^(srv|mch|agt|hum|chn|cvs|msg|dlv|fac|tsk|clm|lse|lnc|cmd|rcp|sti|trn|ses)_[0-9a-hjkmnp-tv-z]{26}$/u;
 const FENCE_PATTERN = /^fnc_[0-9a-hjkmnp-tv-z]{26}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const SYNTHETIC = "00000000000000000000000000";

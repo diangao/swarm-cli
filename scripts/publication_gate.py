@@ -36,6 +36,21 @@ SECRET_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 )
 
+# Fail closed on structured fields that attempt to publish private source
+# material instead of the reviewed product contract or its public digest.
+# The fragments are intentionally assembled so the scanner source does not
+# contain a self-triggering field assignment.
+RESTRICTED_PROVENANCE_FIELD = re.compile(
+    r"[\"']?(?:"
+    + "hidden" + r"[_-]?" + "prompt"
+    + r"|"
+    + "canonical" + r"[_-]?" + "contract" + r"[_-]?" + "prose"
+    + r"|"
+    + "evidence" + r"[_-]?" + "only" + r"[_-]?" + "copy"
+    + r")[\"']?\s*[:=]",
+    re.IGNORECASE,
+)
+
 BLOCKED_SUFFIXES = (
     ".db",
     ".log",
@@ -221,6 +236,8 @@ def scan_text(label: str, text: str, denylist: set[str]) -> set[Finding]:
         findings.add(Finding("credential-shape", marker))
     if has_local_home_path(text):
         findings.add(Finding("machine-local-path", marker))
+    if RESTRICTED_PROVENANCE_FIELD.search(text):
+        findings.add(Finding("restricted-provenance-field", marker))
     return findings
 
 

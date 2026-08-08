@@ -12,6 +12,7 @@ import process from "node:process";
 
 const root = new URL("../", import.meta.url);
 const packagesRoot = new URL("../packages/", import.meta.url);
+const appsRoot = new URL("../apps/", import.meta.url);
 const positiveFixture = new URL(
   "../contracts/protocol/boundary-positive.ts",
   import.meta.url,
@@ -54,6 +55,28 @@ const policies = new Map([
     },
   ],
   [
+    "runtime-contract",
+    {
+      workspace: new Set(["protocol"]),
+      forbiddenBuiltins: highAuthorityBuiltins,
+    },
+  ],
+  [
+    "drivers",
+    {
+      workspace: new Set(["protocol", "runtime-contract"]),
+      forbiddenBuiltins: highAuthorityBuiltins,
+    },
+  ],
+  [
+    "daemon-core",
+    {
+      workspace: new Set(["protocol", "runtime-contract", "drivers"]),
+      forbiddenBuiltins: highAuthorityBuiltins,
+      forbiddenWorkspaceSubpaths: new Set(["drivers"]),
+    },
+  ],
+  [
     "security",
     {
       workspace: new Set(["protocol"]),
@@ -72,6 +95,13 @@ const policies = new Map([
     {
       workspace: new Set(["protocol", "security", "testkit"]),
       forbiddenBuiltins: new Set(["child_process", "cluster", "net", "worker_threads"]),
+    },
+  ],
+  [
+    "app:daemon",
+    {
+      workspace: new Set(["protocol", "storage", "runtime-contract", "drivers", "daemon-core"]),
+      forbiddenBuiltins: new Set(["cluster", "worker_threads"]),
     },
   ],
 ]);
@@ -170,6 +200,8 @@ function violationsForSource({
     if (target !== undefined) {
       if (target !== packageName && !policy.workspace.has(target)) {
         found.push(violation("forbidden-workspace-import", path, specifier));
+      } else if (policy.forbiddenWorkspaceSubpaths?.has(target) && specifier !== `@swarm/${target}`) {
+        found.push(violation("forbidden-concrete-driver-import", path, specifier));
       } else if (target !== packageName && !declared.has(`@swarm/${target}`)) {
         found.push(violation("undeclared-workspace-import", path, specifier));
       }
@@ -192,15 +224,73 @@ async function readVectors(url) {
 }
 
 function evaluateVector(vector) {
-  const packageRoot = join(root.pathname, "packages", vector.package);
+  const isApp = typeof vector.app === "string";
+  const packageName = isApp ? `app:${vector.app}` : vector.package;
+  const packageRoot = isApp
+    ? join(root.pathname, "apps", vector.app)
+    : join(root.pathname, "packages", vector.package);
   const path = join(packageRoot, "src", `${vector.name}.ts`);
   return violationsForSource({
-    packageName: vector.package,
+    packageName,
     packageRoot,
     path,
     source: vector.source,
     dependencies: vector.packageJson ?? {},
   });
+}
+
+async function scanApps() {
+  let entries;
+  try {
+    entries = await readdir(appsRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return { appCount: 0, fileCount: 0 };
+    throw error;
+  }
+  const found = [];
+  let appCount = 0;
+  let fileCount = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    appCount += 1;
+    const appRoot = join(appsRoot.pathname, entry.name);
+    const policyName = `app:${entry.name}`;
+    if (!policies.has(policyName)) {
+      found.push(violation("unknown-app", join(appRoot, "package.json"), entry.name));
+      continue;
+    }
+    const metadataPath = join(appRoot, "package.json");
+    let metadata;
+    try {
+      metadata = JSON.parse(await readFile(metadataPath, "utf8"));
+    } catch {
+      found.push(violation("invalid-app-metadata", metadataPath, entry.name));
+      continue;
+    }
+    if (metadata.name !== `@swarm/app-${entry.name}`) {
+      found.push(violation("app-name-mismatch", metadataPath, String(metadata.name)));
+    }
+    const sourceRoot = join(appRoot, "src");
+    let files;
+    try {
+      files = await sourceFiles(sourceRoot);
+    } catch {
+      found.push(violation("missing-app-source", sourceRoot, entry.name));
+      continue;
+    }
+    fileCount += files.length;
+    for (const path of files) {
+      found.push(...violationsForSource({
+        packageName: policyName,
+        packageRoot: appRoot,
+        path,
+        source: await readFile(path, "utf8"),
+        dependencies: metadata,
+      }));
+    }
+  }
+  if (found.length > 0) throw new Error(found.map(({ message }) => message).join("\n"));
+  return { appCount, fileCount };
 }
 
 async function proveSeededNegatives() {
@@ -312,4 +402,6 @@ if (process.argv.includes("--seeded-negative")) {
 } else {
   await provePositiveVectors();
   await scanPackages();
+  const apps = await scanApps();
+  process.stdout.write(`app boundaries clean (${apps.appCount} apps, ${apps.fileCount} source files)\n`);
 }

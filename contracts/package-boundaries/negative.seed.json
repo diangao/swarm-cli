@@ -64,5 +64,42 @@
     "package": "security",
     "source": "import value from \"/tmp/value.js\";",
     "expectedKind": "absolute-import"
+  },
+  {
+    "name": "runtime-contract-storage",
+    "package": "runtime-contract",
+    "source": "import { SharedStore } from \"@swarm/storage\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "drivers-storage",
+    "package": "drivers",
+    "source": "import { SharedStore } from \"@swarm/storage\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "daemon-core-storage",
+    "package": "daemon-core",
+    "source": "import { SharedStore } from \"@swarm/storage\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "daemon-core-concrete-driver",
+    "package": "daemon-core",
+    "source": "import { NativeProcessDriver } from \"@swarm/drivers/native-process\";",
+    "packageJson": { "dependencies": { "@swarm/drivers": "workspace:*" } },
+    "expectedKind": "forbidden-concrete-driver-import"
+  },
+  {
+    "name": "daemon-app-task-policy",
+    "app": "daemon",
+    "source": "import { TaskPlanner } from \"@swarm/server-core\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "daemon-app-undeclared-storage",
+    "app": "daemon",
+    "source": "import { SharedStore } from \"@swarm/storage\";",
+    "expectedKind": "undeclared-workspace-import"
   }
 ]

@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import {
   canonicalProtocolJson,
+  messageBodyHasContent,
   type ArtifactDigest,
   type DeliveryEnvelope,
   type ReceiptActor,
   type Target,
   type TaskLease,
   type TransitionReceipt,
+  type HumanId,
 } from "@swarm/protocol";
 import { storageFail } from "../errors.js";
 import type { MigrationReceipt } from "../migrations.js";
@@ -21,11 +23,21 @@ import {
 } from "../protocol.js";
 import { PostgresMigrator } from "./migrate.js";
 import { PsqlSession, sqlLiteral } from "./session.js";
+import {
+  AgentRegistryRepository,
+  MembershipRepository,
+  NativeIngressRepository,
+  ObservationCursorRepository,
+  ReminderHeadRepository,
+  RouteRepository,
+  TaskCommandRepository,
+} from "./wave1.js";
 
 const SCHEMA = /^[a-z][a-z0-9_]{0,62}$/u;
 
 export const IDEMPOTENCY_SCOPES = [
   "message.append.v1",
+  "message.reply.v1",
   "claim.mutate.v1",
   "task_graph.mutate.v1",
   "reminder.mutate.v1",
@@ -34,13 +46,19 @@ export const IDEMPOTENCY_SCOPES = [
   "receipt.record.v1",
   "artifact.mutate.v1",
   "outbox.mutate.v1",
+  "task.create.v1",
+  "registry.config.v1",
+  "registry.liveness.v1",
+  "membership.mutate.v1",
+  "route.mutate.v1",
+  "cursor.ack.v1",
 ] as const;
 
 export type IdempotencyScope = (typeof IDEMPOTENCY_SCOPES)[number];
 const IDEMPOTENCY_SCOPE_SET: ReadonlySet<string> = new Set(IDEMPOTENCY_SCOPES);
 
 export type IdempotentRequest = {
-  actor: ReceiptActor;
+  actor: ReceiptActor | { humanId: HumanId };
   scope: IdempotencyScope;
   requestKind: "command" | "producer_fact";
   requestId: string;
@@ -58,7 +76,7 @@ export type IdempotentResult<T extends VersionedResult> = {
 type MessageAppendInput = {
   messageId: string;
   target: Target;
-  author: ReceiptActor;
+  author: ReceiptActor | { humanId: HumanId };
   body: string;
   parentMessageId?: string;
   producerFactId: string;
@@ -82,9 +100,12 @@ type OutboxJob = {
   attempt: number;
 };
 
-type ActorColumns = { kind: "server" | "agent"; id: string };
+type ActorColumns = { kind: "server" | "agent" | "human"; id: string };
 
-function actorColumns(actor: ReceiptActor): ActorColumns {
+function actorColumns(actor: ReceiptActor | { humanId: HumanId }): ActorColumns {
+  if ("humanId" in actor) {
+    return { kind: "human", id: assertProtocolId(actor.humanId, "hum") };
+  }
   if ("agentId" in actor) {
     return { kind: "agent", id: assertProtocolId(actor.agentId, "agt") };
   }
@@ -146,7 +167,7 @@ export class MessageRepository {
     assertProtocolId(input.producerFactId, "fac");
     if (input.parentMessageId !== undefined) assertProtocolId(input.parentMessageId, "msg");
     assertArtifactDigest(input.payloadDigest);
-    if (input.body.trim().length === 0) storageFail("INVALID_IDENTIFIER", "empty message body");
+    if (!messageBodyHasContent(input.body)) storageFail("EMPTY_MESSAGE", "empty message body");
     const target = targetColumns(input.target);
     const author = actorColumns(input.author);
     await this.#session.execute(
@@ -827,6 +848,9 @@ export class ReminderRepository {
     schedule: VersionedResult;
     nextFireAt?: string;
     expectedGeneration?: number;
+    expectedHeadRowVersion?: number;
+    fireProducerFactId?: string;
+    requestDigest?: ArtifactDigest;
   }): Promise<number> {
     assertProtocolId(input.reminderId, "cmd");
     const owner = actorColumns(input.owner);
@@ -837,12 +861,13 @@ export class ReminderRepository {
         'reminder:' || ${sqlLiteral(input.reminderId)}, 0
       ));`,
     );
-    const current = await this.#session.queryJson<{ generation: number }>(
-      `SELECT json_build_object('generation', coalesce((
-        SELECT generation FROM reminders
-        WHERE reminder_id = ${sqlLiteral(input.reminderId)}
-        ORDER BY generation DESC LIMIT 1 FOR UPDATE
-      ), 0));`,
+    const current = await this.#session.queryJson<{ generation: number; rowVersion: number }>(
+      `SELECT json_build_object(
+        'generation', coalesce((SELECT current_generation FROM reminder_heads
+          WHERE reminder_id = ${sqlLiteral(input.reminderId)} FOR UPDATE), 0),
+        'rowVersion', coalesce((SELECT row_version FROM reminder_heads
+          WHERE reminder_id = ${sqlLiteral(input.reminderId)}), 0)
+      );`,
     );
     if (
       input.expectedGeneration !== undefined &&
@@ -850,17 +875,43 @@ export class ReminderRepository {
     ) {
       storageFail("STALE_FENCE", input.reminderId);
     }
+    if (
+      input.expectedHeadRowVersion !== undefined
+      && Number(current.rowVersion) !== input.expectedHeadRowVersion
+    ) {
+      storageFail("STALE_FENCE", input.reminderId);
+    }
     const generation = Number(current.generation) + 1;
+    const fireProducerFactId = input.fireProducerFactId ?? `fac_${createHash("sha256")
+      .update(`${input.reminderId}:${generation}`)
+      .digest("hex")
+      .slice(0, 26)}`;
+    assertProtocolId(fireProducerFactId, "fac");
+    const requestDigest = assertArtifactDigest(input.requestDigest ?? digestCanonical({
+      reminderId: input.reminderId,
+      generation,
+      anchor: input.anchor,
+      schedule: input.schedule,
+      nextFireAt: input.nextFireAt ?? null,
+    }));
     await this.#session.execute(
       `INSERT INTO reminders (
         reminder_id, owner_kind, owner_id, anchor_json, schedule_json,
-        generation, next_fire_at
+        generation, next_fire_at, fire_producer_fact_id, request_digest
       ) VALUES (
         ${sqlLiteral(input.reminderId)}, ${sqlLiteral(owner.kind)}, ${sqlLiteral(owner.id)},
         ${sqlLiteral(canonicalJson(input.anchor))}::jsonb,
         ${sqlLiteral(canonicalJson(input.schedule))}::jsonb,
-        ${sqlLiteral(generation)}, ${sqlLiteral(input.nextFireAt ?? null)}::timestamptz
-      );`,
+        ${sqlLiteral(generation)}, ${sqlLiteral(input.nextFireAt ?? null)}::timestamptz,
+        ${sqlLiteral(fireProducerFactId)}, ${sqlLiteral(requestDigest)}
+      );
+      INSERT INTO reminder_heads(reminder_id, current_generation, row_version)
+      VALUES (${sqlLiteral(input.reminderId)}, ${sqlLiteral(generation)}, 0)
+      ON CONFLICT (reminder_id) DO UPDATE SET
+        current_generation = excluded.current_generation,
+        row_version = reminder_heads.row_version + 1
+      WHERE reminder_heads.current_generation = ${sqlLiteral(current.generation)}
+        AND reminder_heads.row_version = ${sqlLiteral(current.rowVersion)};`,
     );
     return generation;
   }
@@ -884,7 +935,7 @@ export class ReminderRepository {
     }
     const result = await this.#session.queryJson<{ changed: number }>(
       `WITH changed AS (
-        UPDATE reminders SET canceled_at = clock_timestamp()
+        UPDATE reminders SET canceled_at = clock_timestamp(), status = 'canceled', row_version = row_version + 1
         WHERE reminder_id = ${sqlLiteral(input.reminderId)}
           AND generation = ${sqlLiteral(input.generation)} AND canceled_at IS NULL
           AND generation = (SELECT max(generation) FROM reminders WHERE reminder_id = ${sqlLiteral(input.reminderId)})
@@ -1251,6 +1302,13 @@ export class SharedTransaction {
   readonly receipts: ReceiptRepository;
   readonly artifacts: ArtifactRepository;
   readonly outbox: OutboxRepository;
+  readonly registry: AgentRegistryRepository;
+  readonly memberships: MembershipRepository;
+  readonly routes: RouteRepository;
+  readonly nativeIngress: NativeIngressRepository;
+  readonly observationCursors: ObservationCursorRepository;
+  readonly taskCommands: TaskCommandRepository;
+  readonly reminderHeads: ReminderHeadRepository;
 
   constructor(session: PsqlSession) {
     this.sequences = new TargetSequenceRepository(session);
@@ -1263,6 +1321,13 @@ export class SharedTransaction {
     this.receipts = new ReceiptRepository(session);
     this.artifacts = new ArtifactRepository(session, this.claims);
     this.outbox = new OutboxRepository(session);
+    this.registry = new AgentRegistryRepository(session);
+    this.memberships = new MembershipRepository(session);
+    this.routes = new RouteRepository(session);
+    this.nativeIngress = new NativeIngressRepository(session);
+    this.observationCursors = new ObservationCursorRepository(session);
+    this.taskCommands = new TaskCommandRepository(session);
+    this.reminderHeads = new ReminderHeadRepository(session);
   }
 }
 

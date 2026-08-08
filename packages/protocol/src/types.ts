@@ -8,6 +8,7 @@ export type ProtocolVersion = Brand<number, "ProtocolVersion">;
 export type ServerId = Brand<string, "ServerId">;
 export type MachineId = Brand<string, "MachineId">;
 export type AgentId = Brand<string, "AgentId">;
+export type HumanId = Brand<string, "HumanId">;
 export type ChannelId = Brand<string, "ChannelId">;
 export type ConversationId = Brand<string, "ConversationId">;
 export type MessageId = Brand<string, "MessageId">;
@@ -161,3 +162,260 @@ export type TransitionReceipt =
   | (ReceiptBase<"review_verdict", DaemonActor, LeaseTurnFence> & {
       artifactDigest: ArtifactDigest;
     });
+
+export type AttentionNotice = {
+  protocolVersion: ProtocolVersion;
+  target: Target;
+  pendingCount: number;
+  firstMessageId: MessageId;
+  latestMessageId: MessageId;
+  firstServerSeq: number;
+  latestServerSeq: number;
+};
+
+export type StandingManifest = {
+  protocolVersion: ProtocolVersion;
+  agentId: AgentId;
+  runtime: RuntimeKind;
+  workspaceGeneration: number;
+  identityDigest: ArtifactDigest;
+  memoryDigest: ArtifactDigest;
+  cliContractDigest: ArtifactDigest;
+  capabilityDigest: ArtifactDigest;
+};
+
+export type FrozenStandingManifest = {
+  manifest: StandingManifest;
+  manifestDigest: ArtifactDigest;
+};
+
+export type NativeDeliveryEnvelope = DeliveryEnvelope & {
+  expectedLaunchId: LaunchId;
+  membershipEpoch: number;
+  routingGeneration: number;
+  routeVersion: number;
+};
+
+export type CurrentMessageInput = {
+  delivery: NativeDeliveryEnvelope;
+  body: string;
+};
+
+export type NativeTurnInput = {
+  protocolVersion: ProtocolVersion;
+  manifestDigest: ArtifactDigest;
+  current: CurrentMessageInput;
+  attention: readonly AttentionNotice[];
+};
+
+export type SimpleTaskCommand = {
+  protocolVersion: ProtocolVersion;
+  title: string;
+  sourceMessageId: MessageId;
+};
+
+export type NativeRuntimeEvent =
+  | { kind: "assistant_reply"; text: string }
+  | { kind: "coordination_call"; commandId: CommandId; command: SimpleTaskCommand }
+  | { kind: "turn_complete" };
+
+export type DeliveryFence = {
+  protocolVersion: ProtocolVersion;
+  deliveryId: DeliveryId;
+  attempt: number;
+  producerFactId: ProducerFactId;
+  agentId: AgentId;
+  machineId: MachineId;
+  launchId: LaunchId;
+  membershipEpoch: number;
+  routingGeneration: number;
+  routeVersion: number;
+  sessionId: SessionId;
+  turnId: TurnId;
+};
+
+export type NativeInvocationFence = {
+  invocationGeneration: number;
+  invocationId: CommandId;
+};
+
+export type AcquireConsumePermit = DeliveryFence & {
+  commandId: CommandId;
+  requestDigest: ArtifactDigest;
+  boundary: "daemon_accepted";
+};
+
+export type ConsumePermit = DeliveryFence & NativeInvocationFence & {
+  permitId: CommandId;
+  body: string;
+};
+
+export type ResumeConsumePermit = DeliveryFence & {
+  commandId: CommandId;
+  requestDigest: ArtifactDigest;
+  permitId: CommandId;
+  expectedActiveInvocationGeneration: number;
+  resumeMode: "same_invocation_before_begin" | "next_after_not_written";
+  boundary: "daemon_accepted";
+};
+
+export type BeginNativeWrite = DeliveryFence & NativeInvocationFence & {
+  commandId: CommandId;
+  requestDigest: ArtifactDigest;
+  permitId: CommandId;
+  boundary: "write_started";
+  inputDigest: ArtifactDigest;
+  writeStartedEntryId: CommandId;
+  writeStartedEntryDigest: ArtifactDigest;
+};
+
+export type DeliveryAck = DeliveryFence & NativeInvocationFence & {
+  commandId: CommandId;
+  requestDigest: ArtifactDigest;
+  permitId: CommandId;
+  boundary: "input_written" | "model_visible";
+};
+
+export type DeliveryAckResult =
+  | {
+      boundary: "input_written";
+      receiptId: ReceiptId;
+      invocation: NativeInvocationFence;
+      jobState: "held/INPUT_WRITTEN";
+    }
+  | {
+      boundary: "model_visible";
+      receiptId: ReceiptId;
+      invocation: NativeInvocationFence;
+      jobState: "acked/MODEL_VISIBLE";
+    };
+
+export type LocalJournalEntry<K extends string> = {
+  journalId: CommandId;
+  entryId: CommandId;
+  sequence: number;
+  kind: K;
+  previousEntryDigest: ArtifactDigest | null;
+  entryDigest: ArtifactDigest;
+};
+
+export type InvocationJournalEntry<K extends string> = LocalJournalEntry<K> &
+  DeliveryFence &
+  NativeInvocationFence & {
+    permitId: CommandId;
+  };
+
+export type WriteStartedJournalEntry = InvocationJournalEntry<"write_started"> & {
+  inputDigest: ArtifactDigest;
+};
+
+export type InputWrittenJournalEntry = InvocationJournalEntry<"input_written"> & {
+  runtimeWriteId: CommandId;
+};
+
+export type ModelVisibleJournalEntry = InvocationJournalEntry<"model_visible"> & {
+  runtimeWriteId: CommandId;
+  visibilityEventId: CommandId;
+};
+
+export type ScriptedNotWrittenProof = {
+  driverKind: "scripted_fake";
+  fixtureId: CommandId;
+  scriptDigest: ArtifactDigest;
+  invocationId: CommandId;
+  invocationGeneration: number;
+  writeStartedEntryId: CommandId;
+  writeStartedEntryDigest: ArtifactDigest;
+  outcomeOrdinal: number;
+  outcome: "not_written";
+  proofDigest: ArtifactDigest;
+};
+
+export type ReconcileEvidence =
+  | { kind: "pre_permit_disconnect"; disconnectId: CommandId }
+  | {
+      kind: "permit_recorded_write_not_started";
+      permitRecorded: InvocationJournalEntry<"permit_recorded">;
+    }
+  | {
+      kind: "scripted_not_written";
+      permitRecorded: InvocationJournalEntry<"permit_recorded">;
+      writeStarted: WriteStartedJournalEntry;
+      proof: ScriptedNotWrittenProof;
+    }
+  | {
+      kind: "write_started_ambiguous";
+      permitRecorded: InvocationJournalEntry<"permit_recorded">;
+      writeStarted: WriteStartedJournalEntry;
+      driverKind: "native_process" | "scripted_fake";
+    }
+  | {
+      kind: "input_written";
+      permitRecorded: InvocationJournalEntry<"permit_recorded">;
+      writeStarted: WriteStartedJournalEntry;
+      inputWritten: InputWrittenJournalEntry;
+    }
+  | {
+      kind: "model_visibility_ambiguous";
+      permitRecorded: InvocationJournalEntry<"permit_recorded">;
+      writeStarted: WriteStartedJournalEntry;
+      inputWritten: InputWrittenJournalEntry;
+      driverKind: "native_process" | "scripted_fake";
+    }
+  | {
+      kind: "model_visible";
+      permitRecorded: InvocationJournalEntry<"permit_recorded">;
+      writeStarted: WriteStartedJournalEntry;
+      inputWritten: InputWrittenJournalEntry;
+      modelVisible: ModelVisibleJournalEntry;
+    };
+
+export type ReconcileDeliveryAttempt = DeliveryFence & {
+  commandId: CommandId;
+  requestDigest: ArtifactDigest;
+  permitId: CommandId | null;
+  invocation: NativeInvocationFence | null;
+  evidenceDigest: ArtifactDigest;
+  evidence: ReconcileEvidence;
+};
+
+export type ReconcileDeliveryResult =
+  | {
+      kind: "pre_permit_requeued";
+      jobState: "pending";
+      replayOfAttempt: number;
+      nextAttempt: number;
+    }
+  | {
+      kind: "same_attempt_resumable";
+      jobState: "held/CONSUME_PERMITTED";
+      attempt: number;
+      permitId: CommandId;
+      resumeMode: "same_invocation_before_begin" | "next_after_not_written";
+      expectedActiveInvocationGeneration: number;
+      nextInvocationGeneration: number;
+    }
+  | {
+      kind: "boundary_repaired";
+      repaired: readonly ["input_written"] | readonly ["input_written", "model_visible"];
+      jobState: "held/INPUT_WRITTEN" | "acked/MODEL_VISIBLE";
+      attempt: number;
+      permitId: CommandId;
+      invocation: NativeInvocationFence;
+    }
+  | {
+      kind: "held_ambiguous";
+      jobState: "held/AMBIGUOUS_NATIVE_WRITE";
+      attempt: number;
+      permitId: CommandId;
+      invocation: NativeInvocationFence;
+    };
+
+export type ObservationCursorAck = {
+  protocolVersion: ProtocolVersion;
+  actorId: HumanId | AgentId;
+  stream: "client_message" | "agent_attention";
+  target: Target;
+  membershipEpoch: number;
+  serverSeq: number;
+};
