@@ -58,3 +58,17 @@ export {
   JournalTransaction,
   type RecoveryEvidence,
 } from "./sqlite/journal.js";
+export {
+  RuntimeJournalTransaction,
+  type AdvanceTurnInput,
+  type AppendNativeInvocationEntryInput,
+  type BindNativeAttemptInput,
+  type CommitDriverEventInput,
+  type CommitNoticeVisibilityInput,
+  type CommitVisibleMessageInput,
+  type DriverEventReaderClaim,
+  type LocalTurnState,
+  type ObservedModelVisibleAck,
+  type PrepareTurnInput,
+  type ReserveLaunchInput,
+} from "./sqlite/runtime-journal.js";

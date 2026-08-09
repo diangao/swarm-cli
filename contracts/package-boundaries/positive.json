@@ -65,6 +65,18 @@
     "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*", "@swarm/runtime-contract": "workspace:*" } }
   },
   {
+    "name": "drivers-codex-process-boundary",
+    "path": "codex/process.ts",
+    "package": "drivers",
+    "source": "import { spawn } from \"node:child_process\"; export const launch = spawn;"
+  },
+  {
+    "name": "drivers-claude-transport-boundary",
+    "path": "claude/transport.ts",
+    "package": "drivers",
+    "source": "import { connect } from \"node:net\"; export const attach = connect;"
+  },
+  {
     "name": "daemon-core-ports-only",
     "package": "daemon-core",
     "source": "import type { DeliveryAck } from \"@swarm/protocol\"; import type { ManifestComposer } from \"@swarm/runtime-contract\"; import type { NativeRuntimePort } from \"@swarm/drivers\";",

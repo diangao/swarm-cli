@@ -19,6 +19,10 @@ const sqlitePath = new URL(
   "../../migrations/sqlite/0001_journal.up.sql",
   import.meta.url,
 );
+const sqliteV2Path = new URL(
+  "../../migrations/sqlite/0002_daemon_kernel.up.sql",
+  import.meta.url,
+);
 const postgresNativeIngressPath = new URL(
   "../../migrations/postgres/0002_native_ingress.up.sql",
   import.meta.url,
@@ -26,6 +30,7 @@ const postgresNativeIngressPath = new URL(
 const postgres = readFileSync(postgresPath, "utf8");
 const postgresNativeIngress = readFileSync(postgresNativeIngressPath, "utf8");
 const sqlite = readFileSync(sqlitePath, "utf8");
+const sqliteV2 = readFileSync(sqliteV2Path, "utf8");
 
 const gate1Root = new URL("../../../../contracts/gate1/", import.meta.url);
 const gate1ScenarioBytes = readFileSync(new URL("wave1.v1.json", gate1Root));
@@ -47,6 +52,25 @@ const gate1Controls = JSON.parse(gate1ControlsBytes.toString("utf8")) as Array<{
   expectedState?: string;
   siblings: string[];
 }>;
+const gate2Root = new URL("../../../../contracts/gate2/", import.meta.url);
+const gate2ScenarioBytes = readFileSync(new URL("wave2.v2.json", gate2Root));
+const gate2WireBytes = readFileSync(new URL(
+  "wire/codex-app-server-0.145.0-v2-experimental.canonical.json",
+  gate2Root,
+));
+const gate2Scenario = JSON.parse(gate2ScenarioBytes.toString("utf8")) as {
+  status: string;
+  scenarios: Array<{
+    id: string;
+    negativeSeeds: Array<{
+      id: string;
+      unchanged: string[];
+      expectError?: string;
+      expectErrors?: string[];
+      verifierMustObserve?: string;
+    }>;
+  }>;
+};
 
 test("frozen PostgreSQL invariant controls are present", () => {
   assert.doesNotThrow(() => assertPostgresMigrationContract(postgres));
@@ -54,6 +78,7 @@ test("frozen PostgreSQL invariant controls are present", () => {
 
 test("frozen SQLite invariant controls are present", () => {
   assert.doesNotThrow(() => assertSqliteMigrationContract(sqlite));
+  assert.doesNotThrow(() => assertSqliteMigrationContract(sqliteV2, "0002"));
 });
 
 test("frozen PostgreSQL native-ingress controls are present", () => {
@@ -100,6 +125,22 @@ test("seeded SQLite target and visibility controls fail when removed", () => {
   ]) {
     assert.throws(
       () => assertSqliteMigrationContract(sqlite.replaceAll(seed, "SEEDED_DEFECT")),
+      (error: unknown) => error instanceof StorageError && error.code === "INVALID_MIGRATION",
+    );
+  }
+});
+
+test("seeded SQLite v2 controls fail when removed", () => {
+  for (const seed of [
+    "CREATE TABLE local_agent_slots",
+    "PRIMARY KEY (session_id, target_key, membership_epoch)",
+    "CREATE TABLE driver_event_records",
+    "UNIQUE (delivery_id, attempt, sequence)",
+    "CREATE UNIQUE INDEX local_turns_one_active_per_session",
+    "UNIQUE (state_instance_id)",
+  ]) {
+    assert.throws(
+      () => assertSqliteMigrationContract(sqliteV2.replace(seed, "SEEDED_DEFECT"), "0002"),
       (error: unknown) => error instanceof StorageError && error.code === "INVALID_MIGRATION",
     );
   }
@@ -208,6 +249,45 @@ test("Gate 1 fixture digests match the reviewed checksum manifest", () => {
   );
   assert.equal(createHash("sha256").update(gate1ScenarioBytes).digest("hex"), manifest.get("wave1.v1.json"));
   assert.equal(createHash("sha256").update(gate1ControlsBytes).digest("hex"), manifest.get("seeded-controls.json"));
+});
+
+test("Gate 2 has one reviewed scenario and seed SSOT with exact wire bindings", () => {
+  assert.equal(gate2Scenario.status, "second_review_candidate");
+  assert.equal(gate2Scenario.scenarios.length, 12);
+  const controls = gate2Scenario.scenarios.flatMap((scenario) =>
+    scenario.negativeSeeds.map((seed) => ({ scenarioId: scenario.id, ...seed })),
+  );
+  assert.equal(controls.length, 59);
+  assert.equal(new Set(controls.map((control) => `${control.scenarioId}:${control.id}`)).size, 59);
+  for (const control of controls) {
+    assert.ok(control.unchanged.length > 0, `${control.scenarioId}:${control.id} has no unchanged siblings`);
+    assert.equal(new Set(control.unchanged).size, control.unchanged.length);
+    assert.equal(
+      Number(control.expectError !== undefined) +
+        Number(control.expectErrors !== undefined) +
+        Number(control.verifierMustObserve !== undefined),
+      1,
+      `${control.scenarioId}:${control.id} must have one expected outcome`,
+    );
+  }
+  const manifest = new Map(
+    readFileSync(new URL("SHA256SUMS", gate2Root), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => {
+        const [checksum, name] = line.split(/\s{2}/u);
+        return [name, checksum] as [string | undefined, string | undefined];
+      }),
+  );
+  assert.equal(
+    createHash("sha256").update(gate2ScenarioBytes).digest("hex"),
+    manifest.get("wave2.v2.json"),
+  );
+  assert.equal(gate2WireBytes.byteLength, 327_018);
+  assert.equal(
+    createHash("sha256").update(gate2WireBytes).digest("hex"),
+    manifest.get("wire/codex-app-server-0.145.0-v2-experimental.canonical.json"),
+  );
 });
 
 test("all seven condition placeholders remain fail-closed with corrected wave labels", () => {

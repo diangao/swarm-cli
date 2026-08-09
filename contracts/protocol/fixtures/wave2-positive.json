@@ -1,0 +1,137 @@
+{
+  "driverIdentity": {
+    "protocolVersion": 2,
+    "runtime": "codex",
+    "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "version": "0.145.0",
+    "wireProtocolDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "capability": {
+      "start": true,
+      "resume": true,
+      "steer": true,
+      "interrupt": true,
+      "reviewBoundary": true,
+      "compactionBoundary": true
+    }
+  },
+  "launchTransitions": {
+    "queued": {
+      "protocolVersion": 2,
+      "agentId": "agt_00000000000000000000000000",
+      "machineId": "mch_00000000000000000000000000",
+      "launchId": "lnc_00000000000000000000000000",
+      "routingGeneration": 0,
+      "workspaceGeneration": 1,
+      "stopEpoch": 7,
+      "kind": "start_queued"
+    },
+    "spawned": {
+      "protocolVersion": 2,
+      "agentId": "agt_00000000000000000000000000",
+      "machineId": "mch_00000000000000000000000000",
+      "launchId": "lnc_00000000000000000000000000",
+      "routingGeneration": 0,
+      "workspaceGeneration": 1,
+      "stopEpoch": 7,
+      "kind": "process_spawned",
+      "stateInstanceId": "sti_00000000000000000000000000",
+      "processHandleDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "driverIdentityDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "ready": {
+      "protocolVersion": 2,
+      "agentId": "agt_00000000000000000000000000",
+      "machineId": "mch_00000000000000000000000000",
+      "launchId": "lnc_00000000000000000000000000",
+      "routingGeneration": 0,
+      "workspaceGeneration": 1,
+      "stopEpoch": 7,
+      "kind": "runtime_ready",
+      "stateInstanceId": "sti_00000000000000000000000000",
+      "sessionId": "ses_00000000000000000000000000",
+      "runtimeSessionRefDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "manifestDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    "stopRequested": {
+      "protocolVersion": 2,
+      "agentId": "agt_00000000000000000000000000",
+      "machineId": "mch_00000000000000000000000000",
+      "launchId": "lnc_00000000000000000000000000",
+      "routingGeneration": 0,
+      "workspaceGeneration": 1,
+      "stopEpoch": 7,
+      "kind": "stop_requested",
+      "stateInstanceId": "sti_00000000000000000000000000",
+      "reason": "explicit_stop",
+      "invalidatedByStopEpoch": 8
+    }
+  },
+  "ordinaryBinding": {
+    "protocolTurnId": "trn_00000000000000000000000000",
+    "rootProducerFactId": "fac_00000000000000000000000000",
+    "inputOrdinal": 0,
+    "mode": { "kind": "ordinary" },
+    "driverTurnRefDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "delivery": {
+      "protocolVersion": 2,
+      "deliveryId": "dlv_00000000000000000000000000",
+      "attempt": 1,
+      "producerFactId": "fac_00000000000000000000000000",
+      "agentId": "agt_00000000000000000000000000",
+      "machineId": "mch_00000000000000000000000000",
+      "launchId": "lnc_00000000000000000000000000",
+      "membershipEpoch": 1,
+      "routingGeneration": 0,
+      "routeVersion": 1,
+      "sessionId": "ses_00000000000000000000000000",
+      "turnId": "trn_00000000000000000000000000"
+    },
+    "invocation": {
+      "invocationGeneration": 1,
+      "invocationId": "cmd_00000000000000000000000000"
+    },
+    "permitId": "cmd_11111111111111111111111111",
+    "inputDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "events": [
+    {
+      "kind": "runtime_ready",
+      "runtimeSessionRef": "local-thread-1",
+      "runtimeSessionRefDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "kind": "turn_started",
+      "turnId": "trn_00000000000000000000000000",
+      "driverTurnRefDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "kind": "input_written",
+      "turnId": "trn_00000000000000000000000000",
+      "runtimeWriteId": "cmd_22222222222222222222222222"
+    },
+    {
+      "kind": "model_visible",
+      "turnId": "trn_00000000000000000000000000",
+      "visibilityEventId": "cmd_33333333333333333333333333"
+    },
+    {
+      "kind": "turn_boundary",
+      "turnId": "trn_00000000000000000000000000",
+      "boundary": "tool",
+      "steerable": true
+    },
+    {
+      "kind": "assistant_reply",
+      "turnId": "trn_00000000000000000000000000",
+      "text": "Done."
+    },
+    {
+      "kind": "turn_completed",
+      "turnId": "trn_00000000000000000000000000"
+    },
+    {
+      "kind": "runtime_terminal",
+      "reason": "process_exited"
+    }
+  ]
+}

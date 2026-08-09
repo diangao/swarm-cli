@@ -11,12 +11,31 @@ const POSTGRES_CONTROLS = [
   "input_written_at IS NULL OR daemon_accepted_at IS NOT NULL",
 ] as const;
 
-const SQLITE_CONTROLS = [
+const SQLITE_V1_CONTROLS = [
   "target_key TEXT NOT NULL COLLATE BINARY",
   "UNIQUE (session_id, target_key)",
   "FOREIGN KEY (replay_of, agent_id, producer_fact_id)",
   "model_visible_at IS NULL OR input_written_at IS NOT NULL",
   "state NOT IN ('server_confirmed', 'canceled')",
+] as const;
+
+const SQLITE_V2_CONTROLS = [
+  "CREATE TABLE local_agent_slots",
+  "CREATE TABLE local_launches",
+  "CREATE UNIQUE INDEX local_launches_one_nonterminal_per_agent",
+  "CREATE TABLE IF NOT EXISTS native_attempts",
+  "CREATE TABLE IF NOT EXISTS native_invocation_entries",
+  "UNIQUE (delivery_id, attempt, sequence)",
+  "CREATE TABLE visible_message_ids",
+  "PRIMARY KEY (session_id, target_key, message_id)",
+  "UNIQUE (delivery_id, attempt)",
+  "CREATE TABLE notice_visibility",
+  "PRIMARY KEY (session_id, target_key, membership_epoch)",
+  "CREATE TABLE local_turns",
+  "CREATE UNIQUE INDEX local_turns_one_active_per_session",
+  "CREATE TABLE driver_event_cursor",
+  "UNIQUE (state_instance_id)",
+  "CREATE TABLE driver_event_records",
 ] as const;
 
 const POSTGRES_NATIVE_INGRESS_CONTROLS = [
@@ -56,8 +75,16 @@ export function assertPostgresMigrationContract(sql: string): void {
   requireControls(sql, POSTGRES_CONTROLS, "postgres");
 }
 
-export function assertSqliteMigrationContract(sql: string): void {
-  requireControls(sql, SQLITE_CONTROLS, "sqlite");
+export function assertSqliteMigrationContract(sql: string, version = "0001"): void {
+  if (version === "0001") {
+    requireControls(sql, SQLITE_V1_CONTROLS, "sqlite-0001");
+    return;
+  }
+  if (version === "0002") {
+    requireControls(sql, SQLITE_V2_CONTROLS, "sqlite-0002");
+    return;
+  }
+  storageFail("INVALID_MIGRATION", { dialect: "sqlite", version });
 }
 
 export function assertPostgresNativeIngressMigrationContract(sql: string): void {

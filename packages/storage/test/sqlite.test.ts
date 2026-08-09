@@ -17,6 +17,7 @@ import {
   type MessageId,
   type ProducerFactId,
   type ProtocolVersion,
+  type ReceiptId,
   type SessionId,
   type StateInstanceId,
   type Target,
@@ -94,9 +95,9 @@ const detailDigest = `sha256:${"a".repeat(64)}` as ArtifactDigest;
 
 test("migrations are checksum-stable and a second daemon cannot own the journal", () => {
   const { journal, path } = openJournal();
-  assert.deepEqual(journal.migrate().map((receipt) => receipt.applied), [false]);
+  assert.deepEqual(journal.migrate().map((receipt) => receipt.applied), [false, false]);
   assert.throws(() => DaemonJournal.open(path), (error: unknown) => {
-    return error instanceof StorageError && error.code === "JOURNAL_LOCKED";
+    return error instanceof StorageError && error.code === "MACHINE_JOURNAL_LOCKED";
   });
   journal.close();
 });
@@ -179,6 +180,19 @@ test("canonical target keys isolate parent and sibling thread checkpoints across
       });
       transaction.markInputWritten(id("dlv", character), `2026-08-06T15:01:0${index}.000Z`, detailDigest);
       transaction.markModelVisible(id("dlv", character), `2026-08-06T15:02:0${index}.000Z`, detailDigest);
+      transaction.commitVisibleMessage({
+        sessionId: binding.sessionId,
+        target: item,
+        messageId: id("msg", character) as MessageId,
+        deliveryId: id("dlv", character) as DeliveryId,
+        attempt: 1,
+        serverSeq: index + 1,
+        modelVisibleAck: {
+          observed: true,
+          receiptId: id("rcp", character) as ReceiptId,
+        },
+        visibleAt: `2026-08-06T15:03:0${index}.000Z`,
+      });
     });
   });
   journal.close();
@@ -333,7 +347,7 @@ test("test reset is guarded and rebuilds from forward migrations", () => {
   const prior = process.env.NODE_ENV;
   process.env.NODE_ENV = "test";
   try {
-    assert.deepEqual(journal.resetForTests().map((receipt) => receipt.applied), [true]);
+    assert.deepEqual(journal.resetForTests().map((receipt) => receipt.applied), [true, true]);
   } finally {
     if (prior === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = prior;

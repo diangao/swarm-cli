@@ -66,6 +66,12 @@ const policies = new Map([
     {
       workspace: new Set(["protocol", "runtime-contract"]),
       forbiddenBuiltins: highAuthorityBuiltins,
+      allowedBuiltinSubpaths: new Map([
+        ["child_process", new Set(["src/codex", "src/claude"])],
+        ["fs", new Set(["src/codex", "src/claude"])],
+        ["net", new Set(["src/codex", "src/claude"])],
+        ["process", new Set(["src/codex", "src/claude"])],
+      ]),
     },
   ],
   [
@@ -154,6 +160,12 @@ function violation(kind, path, specifier) {
   };
 }
 
+function builtinAllowedAtPath(policy, packageRoot, path, builtin) {
+  const subpaths = policy.allowedBuiltinSubpaths?.get(builtin);
+  if (subpaths === undefined) return false;
+  return [...subpaths].some((subpath) => isInside(join(packageRoot, subpath), path));
+}
+
 function violationsForSource({
   packageName,
   packageRoot,
@@ -190,7 +202,10 @@ function violationsForSource({
     const withoutNodePrefix = specifier.replace(/^node:/u, "");
     const builtin = withoutNodePrefix.split("/")[0];
     if (builtins.has(builtin)) {
-      if (policy.forbiddenBuiltins.has(builtin)) {
+      if (
+        policy.forbiddenBuiltins.has(builtin) &&
+        !builtinAllowedAtPath(policy, packageRoot, path, builtin)
+      ) {
         found.push(violation("forbidden-builtin", path, specifier));
       }
       continue;
@@ -229,7 +244,7 @@ function evaluateVector(vector) {
   const packageRoot = isApp
     ? join(root.pathname, "apps", vector.app)
     : join(root.pathname, "packages", vector.package);
-  const path = join(packageRoot, "src", `${vector.name}.ts`);
+  const path = join(packageRoot, "src", vector.path ?? `${vector.name}.ts`);
   return violationsForSource({
     packageName,
     packageRoot,

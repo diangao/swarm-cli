@@ -1,0 +1,683 @@
+{
+  "schemaVersion": 1,
+  "artifactKind": "wave2_gate2_scenario_plan",
+  "status": "second_review_candidate",
+  "baseCommit": "85a3278ee575a8190c31e0b5fbb7aae045380e2a",
+  "baseTree": "0b31c0c9b0c5c758a04b360012827cb2c93acc5d",
+  "planDigest": "378f27b8e2669dd59643325764b47960e620e72e110d628e21f3926e05bd3b88",
+  "wave1ContractDigest": "e98feeb9f432dd1ce903d3541bc4c5211c3064cceeb7bb8cc5226c22bdd06ec0",
+  "contractFile": "wave2-daemon-kernel-drivers-spec-v0.2.md",
+  "wireArtifacts": {
+    "codexAppServerV2ExperimentalCanonical": {
+      "file": "codex-app-server-0.145.0-v2-experimental.canonical.json",
+      "sha256": "33e163c58a7e9c276f18e109d7ac361f01f8c2394881fc8e3f3177efeaed7cf3",
+      "bytes": 327018,
+      "canonicalization": "UTF-8 parsed JSON; recursively lexicographic object keys; compact JSON; one final LF"
+    }
+  },
+  "clock": "deterministic_fake_clock",
+  "oraclePolicy": {
+    "canonicalJson": true,
+    "unknownKeysRejected": true,
+    "everyNegativeAssertsUnchangedSiblings": true,
+    "realProviderCallsRequired": false,
+    "existingWave0AndWave1GatesRequired": true,
+    "deferredScenarioDisposition": "unchanged_fail_closed"
+  },
+  "scenarios": [
+    {
+      "id": "g2_1_machine_lock_and_start_dedupe",
+      "fixture": {
+        "agentId": "agt_00000000000000000000000001",
+        "launchId": "lnc_00000000000000000000000001",
+        "wakeCounts": [2, 3, 5],
+        "serverCoalescesToOneLaunchCommand": true
+      },
+      "expectedLedgerKinds": [
+        "start_queued",
+        "start_begun",
+        "process_spawned",
+        "runtime_ready",
+        "activated"
+      ],
+      "assertions": [
+        "one_machine_lock_owner",
+        "one_launch_chain_per_wake_count",
+        "one_process_start_effect",
+        "one_server_activation",
+        "every_delivery_distinct_and_bodyless_before_permit"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "missing_machine_lock",
+          "defect": "allow_two_daemons_to_open_one_journal",
+          "expectError": "MACHINE_JOURNAL_LOCKED",
+          "unchanged": ["journal_schema", "recovery_effects", "process_effects"]
+        },
+        {
+          "id": "missing_starting_guard",
+          "defect": "remove_per_agent_start_cas",
+          "verifierMustObserve": "two_process_start_effects",
+          "unchanged": ["delivery_count", "delivery_body_columns"]
+        },
+        {
+          "id": "different_launch_collision",
+          "defect": "offer_second_launch_id_while_slot_occupied",
+          "expectError": "START_SLOT_CONFLICT",
+          "unchanged": ["current_launch_id", "process_start_count", "activation_count"]
+        }
+      ]
+    },
+    {
+      "id": "g2_2_bounded_starts_and_fairness",
+      "fixture": {
+        "capacity": 2,
+        "tokenBucketCapacity": 2,
+        "queueOrdinals": [1, 2, 3, 4],
+        "repeatedWakeAgent": "agt_00000000000000000000000001",
+        "olderWaitingAgent": "agt_00000000000000000000000002"
+      },
+      "expectedLedgerKinds": ["start_queued", "start_begun"],
+      "assertions": [
+        "at_most_two_start_effects_in_flight",
+        "fake_time_alone_refills_tokens",
+        "oldest_cross_agent_queue_ordinal_wins",
+        "repeated_wake_cannot_replace_older_queue_entry"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "capacity_bypass",
+          "defect": "start_without_capacity_token",
+          "expectError": "START_RATE_LIMITED",
+          "unchanged": ["queued_rows", "started_at", "process_effect_count"]
+        },
+        {
+          "id": "wall_clock_refill",
+          "defect": "refill_from_real_time",
+          "verifierMustObserve": "non_deterministic_start_order",
+          "unchanged": ["fake_clock_value"]
+        },
+        {
+          "id": "wake_starvation",
+          "defect": "new_wake_replaces_agent_queue_ordinal",
+          "verifierMustObserve": "older_agent_overtaken",
+          "unchanged": ["older_agent_original_queue_ordinal"]
+        }
+      ]
+    },
+    {
+      "id": "g2_3_stop_during_spawn",
+      "fixture": {
+        "agentId": "agt_00000000000000000000000001",
+        "launchId": "lnc_00000000000000000000000001",
+        "originalStopEpoch": 7,
+        "invalidatedByStopEpoch": 8,
+        "spawnResolvesAfterStop": true
+      },
+      "expectedLedgerKinds": [
+        "start_begun",
+        "stop_requested",
+        "terminal"
+      ],
+      "assertions": [
+        "stop_epoch_increments_before_external_kill",
+        "late_child_killed_before_terminal_cas",
+        "old_launch_terminal_with_invalidation_observation",
+        "agent_slot_nonresident_at_epoch_eight",
+        "later_launch_uses_new_id_and_epoch"
+      ],
+      "forbiddenFacts": [
+        "runtime_ready",
+        "activated",
+        "body_permit",
+        "native_input",
+        "visible_message_id",
+        "assistant_reply",
+        "task_created"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "late_spawn_activates",
+          "defect": "omit_post_spawn_epoch_recheck",
+          "expectError": "LATE_SPAWN_INVALIDATED",
+          "unchanged": ["ready_count", "activation_count", "body_permit_count"]
+        },
+        {
+          "id": "rewrite_old_launch_epoch",
+          "defect": "mutate_launch_fence_to_new_stop_epoch",
+          "expectError": "STALE_STOP_EPOCH",
+          "unchanged": ["original_launch_fence", "server_launch_identity"]
+        },
+        {
+          "id": "stale_callback_after_terminal",
+          "defect": "apply_ready_from_old_state_instance",
+          "expectError": "STALE_STATE_INSTANCE",
+          "unchanged": ["slot_state", "launch_terminal_reason", "route_state"]
+        }
+      ]
+    },
+    {
+      "id": "g2_4_readiness_and_activation_separation",
+      "fixture": {
+        "spawned": true,
+        "driverHandshake": true,
+        "serverReadyCommitted": true,
+        "serverActivationCommitted": true
+      },
+      "expectedLedgerKinds": ["process_spawned", "runtime_ready", "activated"],
+      "assertions": [
+        "spawn_without_handshake_never_ready",
+        "ready_without_server_activation_never_drains",
+        "activation_exact_launch_session_and_route_generation",
+        "activation_replay_aliases_stored_result",
+        "one_adapter_pump_per_state_instance",
+        "initialize_and_turn_waiters_registered_before_write",
+        "resume_cursor_reader_never_overlaps_old_pump"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "skip_ready_predecessor",
+          "defect": "activate_directly_from_spawned",
+          "expectError": "ACTIVATION_PREDECESSOR_REQUIRED",
+          "unchanged": ["server_launch_state", "local_slot_state", "delivery_state"]
+        },
+        {
+          "id": "changed_session_activation",
+          "defect": "activate_with_nonmatching_session",
+          "expectError": "STALE_SESSION_FENCE",
+          "unchanged": ["server_launch_state", "active_route", "body_permit_count"]
+        },
+        {
+          "id": "spawned_marked_ready",
+          "defect": "treat_process_spawn_as_protocol_readiness",
+          "expectError": "READINESS_PREDECESSOR_REQUIRED",
+          "unchanged": ["runtime_session_ref_digest", "server_ready_receipt"]
+        },
+        {
+          "id": "initialize_response_before_waiter",
+          "defect": "emit_immediate_initialize_response_before_waiter_registration",
+          "expectError": "DRIVER_WAITER_PREDECESSOR_REQUIRED",
+          "unchanged": ["driver_event_cursor", "runtime_ready_count", "server_ready_receipt"]
+        },
+        {
+          "id": "turn_started_before_waiter",
+          "defect": "emit_immediate_turn_started_before_write_waiter_registration",
+          "expectError": "DRIVER_WAITER_PREDECESSOR_REQUIRED",
+          "unchanged": ["driver_event_cursor", "input_written_count", "model_visible_count"]
+        },
+        {
+          "id": "second_process_pump",
+          "defect": "attach_competing_raw_event_reader_to_same_state_instance",
+          "expectError": "DRIVER_EVENT_READER_CONFLICT",
+          "unchanged": ["driver_event_cursor", "runtime_ready_count", "model_visible_count"]
+        },
+        {
+          "id": "resume_reader_overlap",
+          "defect": "resume_before_old_pump_releases_cursor_ownership",
+          "expectError": "DRIVER_RESUME_OVERLAP",
+          "unchanged": ["driver_event_cursor", "runtime_ready_count", "visibility_ledger"]
+        }
+      ]
+    },
+    {
+      "id": "g2_5_delivery_visible_once_after_launch",
+      "fixture": {
+        "deliveryCount": 3,
+        "acceptedState": "starting",
+        "targets": ["channel_parent", "channel_thread", "direct_conversation"],
+        "drainAfter": "local_and_server_activation_agree"
+      },
+      "expectedLedgerKinds": [
+        "daemon_accepted",
+        "input_written",
+        "model_visible",
+        "reply_committed"
+      ],
+      "assertions": [
+        "pending_rows_bodyless_before_permit",
+        "deterministic_target_order",
+        "one_driver_write_per_unambiguous_delivery",
+        "terminal_server_ack_observed_before_visible_message_insert",
+        "exact_message_id_ledger_before_high_water",
+        "duplicate_and_replay_create_no_second_reply_or_task",
+        "target_keys_do_not_interfere"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "body_read_while_starting",
+          "defect": "compile_before_activation",
+          "expectError": "ACTIVATION_PREDECESSOR_REQUIRED",
+          "unchanged": ["body_read_count", "native_write_count", "visibility_count"]
+        },
+        {
+          "id": "high_water_only_suppression",
+          "defect": "suppress_gap_without_exact_message_id",
+          "verifierMustObserve": "missing_message_was_suppressed",
+          "unchanged": ["visible_message_ids"]
+        },
+        {
+          "id": "ledger_before_server_ack_observed",
+          "defect": "insert_visibility_after_ack_request_only",
+          "expectError": "MODEL_VISIBLE_PREDECESSOR_REQUIRED",
+          "unchanged": ["visible_message_ids", "reply_count", "consumed_count"]
+        }
+      ]
+    },
+    {
+      "id": "g2_6_failed_ambiguous_and_lost_ack_writes",
+      "fixture": {
+        "preflightFailure": true,
+        "scriptedNotWritten": true,
+        "realDisconnectAfterBegin": true,
+        "lostServerAckResponse": true
+      },
+      "expectedLedgerKinds": ["write_started", "input_written", "model_visible"],
+      "assertions": [
+        "preflight_failure_zero_boundaries",
+        "scripted_not_written_uses_next_generation",
+        "real_disconnect_holds_ambiguous_without_retry",
+        "lost_ack_reconciles_same_server_boundary_without_driver_write",
+        "stale_generation_and_state_conflict_remain_distinct"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "retry_ambiguous_real_write",
+          "defect": "lease_new_attempt_after_ambiguous",
+          "verifierMustObserve": "second_driver_call",
+          "unchanged": ["logical_message_count", "producer_fact_count"]
+        },
+        {
+          "id": "collapse_generation_errors",
+          "defect": "map_all_conflicts_to_one_code",
+          "expectErrors": ["STALE_INVOCATION_GENERATION", "INVOCATION_STATE_CONFLICT"],
+          "unchanged": ["active_invocation", "job_state", "receipt_count"]
+        },
+        {
+          "id": "lost_ack_rewrites_runtime",
+          "defect": "call_driver_instead_of_reconcile",
+          "verifierMustObserve": "second_driver_call",
+          "unchanged": ["delivery_attempt", "invocation_generation", "server_projection"]
+        }
+      ]
+    },
+    {
+      "id": "g2_7_notice_dedupe_and_visibility_ledger",
+      "fixture": {
+        "noticeRange": [101, 104],
+        "currentInputMessage": 105,
+        "failedFirstWrite": true,
+        "successfulRetry": true,
+        "membershipEpochChange": true,
+        "sessionChange": true
+      },
+      "expectedLedgerKinds": ["input_written", "notice_visibility", "model_visible"],
+      "assertions": [
+        "notice_metadata_contains_no_body_or_author",
+        "notice_commits_after_exact_input_written",
+        "failed_write_keeps_notice_eligible",
+        "exact_notice_replay_aliases",
+        "changed_notice_range_conflicts",
+        "membership_and_session_epochs_do_not_cross"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "notice_commit_before_write",
+          "defect": "dedupe_notice_on_compile",
+          "expectError": "NOTICE_DEDUPE_PREDECESSOR_REQUIRED",
+          "unchanged": ["notice_visibility", "input_written_count", "model_visible_count"]
+        },
+        {
+          "id": "notice_contains_body",
+          "defect": "persist_notice_excerpt_or_author",
+          "verifierMustObserve": "privacy_poison",
+          "unchanged": ["permitted_current_body"]
+        },
+        {
+          "id": "visibility_key_conflict",
+          "defect": "reuse_message_key_for_changed_delivery",
+          "expectError": "VISIBILITY_LEDGER_CONFLICT",
+          "unchanged": ["existing_visibility_row", "high_water", "reply_count"]
+        },
+        {
+          "id": "notice_range_compare_removed",
+          "defect": "insert_changed_notice_range_without_epoch_key_compare",
+          "verifierMustObserve": "two_notice_rows_for_one_session_target_membership_epoch",
+          "unchanged": ["input_written_count", "model_visible_count", "permitted_current_body"]
+        }
+      ]
+    },
+    {
+      "id": "g2_8_turn_state_and_steer_fences",
+      "fixture": {
+        "rootProducerFactId": "fac_00000000000000000000000001",
+        "activeTurnId": "trn_00000000000000000000000001",
+        "steerInputOrdinal": 1,
+        "steerCapable": true,
+        "noSteerAdapterIncluded": true
+      },
+      "expectedLedgerKinds": [
+        "turn_started",
+        "input_written",
+        "model_visible",
+        "turn_boundary",
+        "turn_completed"
+      ],
+      "assertions": [
+        "idle_input_creates_one_ordinary_turn",
+        "exact_active_steer_keeps_turn_and_root_fact",
+        "steer_has_own_delivery_invocation_and_visibility_receipts",
+        "steer_creates_no_second_assistant_reply",
+        "wrong_or_completed_turn_has_zero_effect",
+        "review_and_compaction_queue",
+        "no_steer_adapter_uses_next_ordinary_turn",
+        "external_pending_input_precedes_continuation",
+        "interrupt_does_not_fabricate_unseen_or_terminal",
+        "codex_steer_and_interrupt_use_stored_runtime_turn",
+        "claude_second_uuid_blocked_before_replay",
+        "claude_second_uuid_blocked_after_replay_before_result",
+        "claude_interrupt_request_and_receipt_exactly_correlated"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "wrong_expected_turn",
+          "defect": "steer_without_exact_turn_compare",
+          "expectError": "ACTIVE_TURN_CONFLICT",
+          "unchanged": ["input_ordinal", "driver_write_count", "visibility_count"]
+        },
+        {
+          "id": "steer_review_boundary",
+          "defect": "treat_review_as_steerable",
+          "expectError": "ACTIVE_TURN_NOT_STEERABLE",
+          "unchanged": ["driver_write_count", "delivery_state", "notice_visibility"]
+        },
+        {
+          "id": "continuation_starves_human",
+          "defect": "schedule_continuation_before_pending_external_input",
+          "verifierMustObserve": "external_input_overtaken",
+          "unchanged": ["external_delivery_receive_ordinal"]
+        },
+        {
+          "id": "codex_runtime_turn_mapping_bypassed",
+          "defect": "emit_steer_or_interrupt_with_unmapped_runtime_turn",
+          "expectError": "DRIVER_EVENT_FENCE_MISMATCH",
+          "unchanged": ["driver_write_count", "control_request_count", "server_projection"]
+        },
+        {
+          "id": "claude_second_uuid_before_replay",
+          "defect": "write_second_distinct_uuid_before_first_replay",
+          "expectError": "TURN_INPUT_ALREADY_IN_FLIGHT",
+          "unchanged": ["stdin_write_count", "model_input_count", "server_projection"]
+        },
+        {
+          "id": "claude_second_uuid_after_replay_before_result",
+          "defect": "close_active_window_at_replay_and_write_second_uuid_before_result",
+          "expectError": "TURN_INPUT_ALREADY_IN_FLIGHT",
+          "unchanged": ["stdin_write_count", "model_input_count", "server_projection"]
+        },
+        {
+          "id": "claude_old_turn_interrupt",
+          "defect": "emit_process_global_interrupt_for_old_or_completed_turn",
+          "expectError": "ACTIVE_TURN_CONFLICT",
+          "unchanged": ["control_request_count", "active_turn_state", "server_projection"]
+        },
+        {
+          "id": "claude_interrupt_receipt_uncorrelated",
+          "defect": "accept_interrupt_control_response_with_wrong_request_id_or_nonempty_queued_uuid_set",
+          "expectError": "DRIVER_EVENT_FENCE_MISMATCH",
+          "unchanged": ["active_turn_state", "visibility_count", "server_projection"]
+        }
+      ]
+    },
+    {
+      "id": "g2_9_adapter_invariance",
+      "fixture": {
+        "drivers": ["scripted_fake", "codex_fixture", "claude_fixture"],
+        "scenario": "one_ordinary_input_one_reply_no_coordination"
+      },
+      "expectedServerProjection": [
+        "one_message_fact",
+        "one_delivery_attempt",
+        "one_input_written_receipt",
+        "one_model_visible_receipt",
+        "one_reply_fact",
+        "zero_task_facts"
+      ],
+      "assertions": [
+        "all_driver_server_projections_byte_equal",
+        "allowed_local_lifecycle_differences_declared",
+        "daemon_core_imports_no_concrete_driver",
+        "coordination_imports_no_concrete_driver",
+        "codex_model_visible_requires_exact_thread_turn_and_client_id",
+        "claude_model_visible_requires_exact_uuid_session_and_content_replay",
+        "exact_driver_event_and_replay_duplicates_alias",
+        "real_adapter_reply_and_coordination_ordering_matches_wave1"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "unknown_vendor_event",
+          "defect": "accept_unknown_variant",
+          "expectError": "DRIVER_PROTOCOL_UNSUPPORTED",
+          "unchanged": ["server_projection", "driver_cursor", "reply_count"]
+        },
+        {
+          "id": "reordered_driver_boundary",
+          "defect": "model_visible_before_input_written",
+          "expectError": "DRIVER_EVENT_ORDER_INVALID",
+          "unchanged": ["server_receipts", "visibility_ledger", "reply_count"]
+        },
+        {
+          "id": "driver_mutates_server_truth",
+          "defect": "concrete_adapter_imports_server_repository",
+          "verifierMustObserve": "package_boundary_violation",
+          "unchanged": ["allowed_dependency_graph"]
+        },
+        {
+          "id": "codex_model_visible_clientid_mismatch",
+          "defect": "accept_turn_started_with_wrong_missing_or_null_client_id",
+          "expectError": "DRIVER_EVENT_FENCE_MISMATCH",
+          "unchanged": ["visibility_ledger", "reply_count", "server_receipts"]
+        },
+        {
+          "id": "codex_returned_thread_or_turn_mismatch",
+          "defect": "accept_turn_started_from_wrong_thread_or_runtime_turn",
+          "expectError": "DRIVER_EVENT_FENCE_MISMATCH",
+          "unchanged": ["visibility_ledger", "reply_count", "server_receipts"]
+        },
+        {
+          "id": "codex_completion_before_visibility",
+          "defect": "accept_turn_completed_before_model_visible",
+          "expectError": "DRIVER_EVENT_ORDER_INVALID",
+          "unchanged": ["visibility_ledger", "reply_count", "server_receipts"]
+        },
+        {
+          "id": "driver_event_identity_changed_on_replay",
+          "defect": "reuse_event_ordinal_or_identity_with_changed_bytes",
+          "expectError": "DRIVER_EVENT_FENCE_MISMATCH",
+          "unchanged": ["driver_cursor", "visibility_ledger", "server_projection"]
+        },
+        {
+          "id": "claude_replay_uuid_missing_or_wrong",
+          "defect": "accept_replay_with_missing_or_wrong_uuid_as_model_visible",
+          "expectError": "DRIVER_EVENT_FENCE_MISMATCH",
+          "unchanged": ["logical_message_count", "model_visible_count", "server_projection"]
+        },
+        {
+          "id": "claude_replay_session_or_content_mismatch",
+          "defect": "accept_wrong_session_or_changed_content_under_same_uuid",
+          "expectError": "DRIVER_EVENT_FENCE_MISMATCH",
+          "unchanged": ["logical_message_count", "model_visible_count", "server_projection"]
+        },
+        {
+          "id": "claude_replay_before_input_written",
+          "defect": "accept_replay_before_successful_stdin_write",
+          "expectError": "DRIVER_EVENT_ORDER_INVALID",
+          "unchanged": ["server_receipts", "model_visible_count", "server_projection"]
+        },
+        {
+          "id": "claude_duplicate_replay_not_aliased",
+          "defect": "treat_exact_duplicate_replay_as_second_model_input",
+          "verifierMustObserve": "second_model_input_or_visibility_boundary",
+          "unchanged": ["logical_message_count", "reply_count", "task_count"]
+        },
+        {
+          "id": "real_adapter_coordination_before_reply",
+          "defect": "accept_coordination_call_before_nonempty_root_reply",
+          "verifierMustObserve": "task_effect_before_reply_or_without_reply",
+          "unchanged": ["logical_message_count", "delivery_attempt", "visibility_ledger"]
+        },
+        {
+          "id": "real_adapter_empty_or_double_reply",
+          "defect": "accept_empty_reply_or_second_distinct_reply_for_root_turn",
+          "verifierMustObserve": "empty_or_second_reply_fact",
+          "unchanged": ["task_count", "model_visible_count", "delivery_attempt"]
+        },
+        {
+          "id": "driver_event_after_completion",
+          "defect": "accept_normalized_driver_event_after_terminal_completion",
+          "expectError": "DRIVER_EVENT_ORDER_INVALID",
+          "unchanged": ["driver_cursor", "reply_count", "server_projection"]
+        }
+      ]
+    },
+    {
+      "id": "g2_10_manifest_and_driver_protocol_identity",
+      "fixture": {
+        "sameWakeVariants": 2,
+        "codexCanonicalWireSha256": "33e163c58a7e9c276f18e109d7ac361f01f8c2394881fc8e3f3177efeaed7cf3",
+        "codexCanonicalWireBytes": 327018,
+        "identityMutations": [
+          "runtime_kind",
+          "driver_wire_digest",
+          "cli_contract",
+          "identity_digest",
+          "memory_digest",
+          "capability_digest",
+          "workspace_generation"
+        ]
+      },
+      "assertions": [
+        "wake_change_keeps_manifest_digest",
+        "each_identity_mutation_changes_manifest_digest",
+        "executable_wire_and_capabilities_frozen_per_launch",
+        "version_or_schema_mismatch_fails_before_spawn",
+        "codex_generator_recipe_reproduces_canonical_wire_digest",
+        "raw_json_object_key_order_does_not_change_canonical_digest"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "wake_in_manifest",
+          "defect": "include_current_wake_in_standing_prompt_hash",
+          "verifierMustObserve": "manifest_digest_changed_for_wake_only",
+          "unchanged": ["runtime_identity_digest"]
+        },
+        {
+          "id": "wire_change_not_bound",
+          "defect": "change_canonical_wire_bytes_or_omit_wire_protocol_digest",
+          "expectError": "DRIVER_PROTOCOL_UNSUPPORTED",
+          "unchanged": ["launch_state", "process_effect_count"]
+        },
+        {
+          "id": "capability_changes_mid_launch",
+          "defect": "reprobe_and_replace_capabilities",
+          "expectError": "DRIVER_CAPABILITY_MISMATCH",
+          "unchanged": ["frozen_driver_identity", "active_turn_state"]
+        },
+        {
+          "id": "codex_schema_recipe_flag_changed",
+          "defect": "generate_schema_without_exact_experimental_flag_or_from_nonempty_config_home",
+          "expectError": "DRIVER_PROTOCOL_UNSUPPORTED",
+          "unchanged": ["frozen_driver_identity", "launch_state", "process_effect_count"]
+        },
+        {
+          "id": "codex_raw_generator_bytes_hashed",
+          "defect": "hash_nondeterministic_raw_json_instead_of_canonical_json",
+          "verifierMustObserve": "same_schema_semantics_produce_different_wire_digest",
+          "unchanged": ["canonical_wire_artifact", "cli_version"]
+        }
+      ]
+    },
+    {
+      "id": "g2_11_launch_environment",
+      "fixture": {
+        "concurrentLaunches": 2,
+        "credentialCapability": "inert_launch_bound",
+        "providerCall": false,
+        "platforms": ["posix", "windows_fixture"]
+      },
+      "assertions": [
+        "private_home_per_launch",
+        "xdg_and_tmp_under_private_home",
+        "minimal_fixed_path_and_locale",
+        "default_deny_environment",
+        "no_raw_secret_in_env_argv_transport_log_fixture_receipt",
+        "posix_0700_0600_or_windows_daemon_only_dacl",
+        "distinct_concurrent_homes_and_transports",
+        "launch_bound_capability_revocable",
+        "probe_is_secret_free_and_provider_free",
+        "normal_and_late_spawn_cleanup_idempotent",
+        "same_uid_gap_reported_known_unguarded_v0"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "inherited_host_secret",
+          "defect": "copy_full_host_environment",
+          "expectError": "SECURITY_LAUNCH_GATE_FAILED",
+          "unchanged": ["process_effect_count", "launch_capability_count"]
+        },
+        {
+          "id": "shared_launch_home",
+          "defect": "reuse_private_home_across_launches",
+          "expectError": "SECURITY_LAUNCH_GATE_FAILED",
+          "unchanged": ["transport_contents", "process_effect_count"]
+        },
+        {
+          "id": "raw_bearer_transport",
+          "defect": "write_reusable_credential_to_transport",
+          "expectError": "SECURITY_LAUNCH_GATE_FAILED",
+          "unchanged": ["transport_reference_rows", "process_effect_count"]
+        }
+      ]
+    },
+    {
+      "id": "g2_12_carry_gates",
+      "fixture": {
+        "node": "24.19.0",
+        "corepack": "0.35.0",
+        "pnpm": "10.15.1",
+        "postgresMajor": 16,
+        "deferredConditionCount": 7
+      },
+      "assertions": [
+        "frozen_install_lockfile_unchanged",
+        "all_package_typechecks_and_tests",
+        "postgresql_scenarios",
+        "generalized_package_app_boundaries",
+        "publication_self_test_and_history_scan",
+        "s17_single_source_binding",
+        "all_wave0_and_wave1_gates",
+        "serialized_python_behavior_recovery_evidence_suite",
+        "seven_deferred_conditions_unchanged_and_fail_closed"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "lockfile_drift",
+          "defect": "frozen_install_changes_lockfile",
+          "verifierMustObserve": "lockfile_changed",
+          "unchanged": ["declared_toolchain"]
+        },
+        {
+          "id": "deferred_condition_promoted",
+          "defect": "change_one_placeholder_to_asserted",
+          "verifierMustObserve": "dishonest_wave2_disposition",
+          "unchanged": ["other_six_deferred_conditions"]
+        },
+        {
+          "id": "seed_not_killed",
+          "defect": "disable_one_required_negative",
+          "verifierMustObserve": "mutation_survived",
+          "unchanged": ["positive_scenario_projection"]
+        }
+      ]
+    }
+  ]
+}

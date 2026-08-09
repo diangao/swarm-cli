@@ -78,6 +78,20 @@
     "expectedKind": "forbidden-workspace-import"
   },
   {
+    "name": "drivers-port-process-import",
+    "path": "port-process-leak.ts",
+    "package": "drivers",
+    "source": "import { spawn } from \"node:child_process\"; export const launch = spawn;",
+    "expectedKind": "forbidden-builtin"
+  },
+  {
+    "name": "drivers-unapproved-provider-directory",
+    "path": "providers/process.ts",
+    "package": "drivers",
+    "source": "import { connect } from \"node:net\"; export const attach = connect;",
+    "expectedKind": "forbidden-builtin"
+  },
+  {
     "name": "daemon-core-storage",
     "package": "daemon-core",
     "source": "import { SharedStore } from \"@swarm/storage\";",

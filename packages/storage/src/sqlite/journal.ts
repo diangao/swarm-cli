@@ -34,6 +34,7 @@ import {
   parseFrozenDelivery,
   targetColumns,
 } from "../protocol.js";
+import { RuntimeJournalTransaction } from "./runtime-journal.js";
 
 type DeliveryBinding = {
   launchId: LaunchId;
@@ -112,29 +113,29 @@ function acquireJournalLock(lockPath: string): number {
     } catch (error) {
       const failure = error as NodeJS.ErrnoException;
       if (failure.code !== "EEXIST" || attempt > 0) {
-        return storageFail("JOURNAL_LOCKED", error);
+        return storageFail("MACHINE_JOURNAL_LOCKED", error);
       }
       let ownerPid: number;
       try {
         ownerPid = Number(readFileSync(lockPath, "utf8").trim());
       } catch (readError) {
-        return storageFail("JOURNAL_LOCKED", readError);
+        return storageFail("MACHINE_JOURNAL_LOCKED", readError);
       }
       if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) {
-        return storageFail("JOURNAL_LOCKED", "invalid lock owner");
+        return storageFail("MACHINE_JOURNAL_LOCKED", "invalid lock owner");
       }
       try {
         process.kill(ownerPid, 0);
-        return storageFail("JOURNAL_LOCKED", { ownerPid });
+        return storageFail("MACHINE_JOURNAL_LOCKED", { ownerPid });
       } catch (probeError) {
         if ((probeError as NodeJS.ErrnoException).code !== "ESRCH") {
-          return storageFail("JOURNAL_LOCKED", probeError);
+          return storageFail("MACHINE_JOURNAL_LOCKED", probeError);
         }
       }
       rmSync(lockPath, { force: true });
     }
   }
-  return storageFail("JOURNAL_LOCKED");
+  return storageFail("MACHINE_JOURNAL_LOCKED");
 }
 
 function openJournalDatabase(path: string): DatabaseSync {
@@ -144,10 +145,11 @@ function openJournalDatabase(path: string): DatabaseSync {
   return new DatabaseSync(path);
 }
 
-export class JournalTransaction {
+export class JournalTransaction extends RuntimeJournalTransaction {
   readonly #database: DatabaseSync;
 
   constructor(database: DatabaseSync) {
+    super(database);
     this.#database = database;
   }
 
@@ -283,52 +285,11 @@ export class JournalTransaction {
       [occurredAt, deliveryId],
     );
     if (changes(result) !== 1) storageFail("INVALID_STATE_TRANSITION", deliveryId);
-    const receiptId = this.#appendDeliveryReceipt(
+    this.#appendDeliveryReceipt(
       deliveryId,
       "model_visible",
       occurredAt,
       detailDigest,
-    );
-    const delivery = one<{
-      session_id: string;
-      target_key: string;
-      target_kind: string;
-      target_id: string;
-      thread_root_message_id: string | null;
-      server_seq: number;
-      message_id: string;
-    }>(
-      this.#database,
-      `SELECT session_id, target_key, target_kind, target_id,
-              thread_root_message_id, server_seq, message_id
-       FROM pending_deliveries WHERE delivery_id = ?`,
-      [deliveryId],
-    );
-    if (delivery === undefined) storageFail("INVALID_STATE_TRANSITION", deliveryId);
-    run(
-      this.#database,
-      `INSERT INTO visibility_checkpoints (
-        session_id, target_key, target_kind, target_id, thread_root_message_id,
-        highest_model_visible_server_seq, last_message_id, last_delivery_id,
-        last_local_receipt_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(session_id, target_key) DO UPDATE SET
-        highest_model_visible_server_seq = excluded.highest_model_visible_server_seq,
-        last_message_id = excluded.last_message_id,
-        last_delivery_id = excluded.last_delivery_id,
-        last_local_receipt_id = excluded.last_local_receipt_id
-      WHERE excluded.highest_model_visible_server_seq > visibility_checkpoints.highest_model_visible_server_seq`,
-      [
-        delivery.session_id,
-        delivery.target_key,
-        delivery.target_kind,
-        delivery.target_id,
-        delivery.thread_root_message_id,
-        delivery.server_seq,
-        delivery.message_id,
-        deliveryId,
-        receiptId,
-      ],
     );
   }
 
@@ -490,7 +451,7 @@ export class DaemonJournal {
     for (const name of names) {
       const version = name.slice(0, 4);
       const sql = readFileSync(new URL(name, directory), "utf8");
-      assertSqliteMigrationContract(sql);
+      assertSqliteMigrationContract(sql, version);
       const checksum = checksumMigration(sql);
       const existing = one<{ checksum: string }>(
         this.#database,
