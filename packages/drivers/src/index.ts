@@ -10,6 +10,10 @@ export {
   type NativeEventErrorCode,
   type NormalizedNativeAction,
 } from "./normalizer.js";
+export { ClaudeNativeProcessDriver } from "./claude/adapter.js";
+export type { ClaudeRuntimeHost } from "./claude/types.js";
+export { CodexNativeProcessDriver } from "./codex/adapter.js";
+export type { CodexRuntimeHost } from "./codex/types.js";
 export type {
   DriverEventPump,
   DriverEventPumpLease,
