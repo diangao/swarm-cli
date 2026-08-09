@@ -1,0 +1,34 @@
+[
+  {
+    "seed": "driver-capability-start-false",
+    "expected": "DRIVER_CAPABILITY_MISMATCH"
+  },
+  {
+    "seed": "driver-identity-unknown-field",
+    "expected": "UNKNOWN_FIELD"
+  },
+  {
+    "seed": "launch-invalidated-epoch-mismatch",
+    "expected": "STALE_STOP_EPOCH"
+  },
+  {
+    "seed": "ordinary-positive-input-ordinal",
+    "expected": "INVARIANT_VIOLATION"
+  },
+  {
+    "seed": "steer-turn-identity-mismatch",
+    "expected": "ACTIVE_TURN_CONFLICT"
+  },
+  {
+    "seed": "delivery-turn-binding-mismatch",
+    "expected": "DRIVER_EVENT_FENCE_MISMATCH"
+  },
+  {
+    "seed": "provider-still-queued-as-event",
+    "expected": "UNSUPPORTED_VARIANT"
+  },
+  {
+    "seed": "empty-driver-assistant-reply",
+    "expected": "EMPTY_MESSAGE"
+  }
+]

@@ -419,3 +419,128 @@ export type ObservationCursorAck = {
   membershipEpoch: number;
   serverSeq: number;
 };
+
+export type DriverCapability = {
+  start: true;
+  resume: boolean;
+  steer: boolean;
+  interrupt: boolean;
+  reviewBoundary: boolean;
+  compactionBoundary: boolean;
+};
+
+export type DriverIdentity = {
+  protocolVersion: ProtocolVersion;
+  runtime: RuntimeKind | "scripted_fake";
+  executableDigest: ArtifactDigest;
+  version: string;
+  wireProtocolDigest: ArtifactDigest;
+  capability: DriverCapability;
+};
+
+export type LocalLaunchFence = {
+  protocolVersion: ProtocolVersion;
+  agentId: AgentId;
+  machineId: MachineId;
+  launchId: LaunchId;
+  routingGeneration: number;
+  workspaceGeneration: number;
+  stopEpoch: number;
+};
+
+export type SpawnedLaunchFence = LocalLaunchFence & {
+  stateInstanceId: StateInstanceId;
+};
+
+export type ReadyLaunchFence = SpawnedLaunchFence & {
+  sessionId: SessionId;
+};
+
+export type StopReason =
+  | "explicit_stop"
+  | "nonresident_idle"
+  | "route_superseded"
+  | "daemon_shutdown"
+  | "driver_protocol_error";
+
+export type TerminalReason =
+  | StopReason
+  | "spawn_failed"
+  | "readiness_failed"
+  | "late_spawn_invalidated"
+  | "process_exited"
+  | "security_gate_failed";
+
+export type LaunchTransition =
+  | (LocalLaunchFence & { kind: "start_queued" })
+  | (LocalLaunchFence & { kind: "start_begun" })
+  | (SpawnedLaunchFence & {
+      kind: "process_spawned";
+      processHandleDigest: ArtifactDigest;
+      driverIdentityDigest: ArtifactDigest;
+    })
+  | (ReadyLaunchFence & {
+      kind: "runtime_ready";
+      runtimeSessionRefDigest: ArtifactDigest;
+      manifestDigest: ArtifactDigest;
+    })
+  | (ReadyLaunchFence & { kind: "activated" })
+  | (LocalLaunchFence & {
+      kind: "stop_requested";
+      stateInstanceId?: StateInstanceId;
+      reason: StopReason;
+      invalidatedByStopEpoch: number;
+    })
+  | (LocalLaunchFence & {
+      kind: "terminal";
+      stateInstanceId?: StateInstanceId;
+      reason: TerminalReason;
+      invalidatedByStopEpoch?: number;
+    });
+
+export type DriverSession = {
+  launch: ReadyLaunchFence;
+  driverIdentity: DriverIdentity;
+  runtimeSessionRef: string;
+};
+
+export type DriverInputMode =
+  | { kind: "ordinary" }
+  | { kind: "steer"; expectedTurnId: TurnId };
+
+export type DriverTurnBinding = {
+  protocolTurnId: TurnId;
+  rootProducerFactId: ProducerFactId;
+  inputOrdinal: number;
+  mode: DriverInputMode;
+  driverTurnRefDigest: ArtifactDigest;
+  delivery: DeliveryFence;
+  invocation: NativeInvocationFence;
+  permitId: CommandId;
+  inputDigest: ArtifactDigest;
+};
+
+export type NormalizedDriverEvent =
+  | {
+      kind: "runtime_ready";
+      runtimeSessionRef: string;
+      runtimeSessionRefDigest: ArtifactDigest;
+    }
+  | { kind: "turn_started"; turnId: TurnId; driverTurnRefDigest: ArtifactDigest }
+  | { kind: "input_written"; turnId: TurnId; runtimeWriteId: CommandId }
+  | { kind: "model_visible"; turnId: TurnId; visibilityEventId: CommandId }
+  | {
+      kind: "turn_boundary";
+      turnId: TurnId;
+      boundary: "tool" | "review" | "compaction" | "continuation";
+      steerable: boolean;
+    }
+  | { kind: "assistant_reply"; turnId: TurnId; text: string }
+  | {
+      kind: "coordination_call";
+      turnId: TurnId;
+      commandId: CommandId;
+      command: SimpleTaskCommand;
+    }
+  | { kind: "turn_completed"; turnId: TurnId }
+  | { kind: "runtime_terminal"; reason: TerminalReason };

@@ -29,6 +29,12 @@ export {
   parseSimpleTaskCommand,
   parseStandingManifest,
 } from "./wave1-validate.js";
+export {
+  parseDriverIdentity,
+  parseDriverTurnBinding,
+  parseLaunchTransition,
+  parseNormalizedDriverEvent,
+} from "./wave2-validate.js";
 export type {
   AgentId,
   AcquireConsumePermit,
@@ -86,5 +92,17 @@ export type {
   TransitionReceipt,
   TurnId,
   WriteStartedJournalEntry,
+  DriverCapability,
+  DriverIdentity,
+  DriverInputMode,
+  DriverSession,
+  DriverTurnBinding,
+  LaunchTransition,
+  LocalLaunchFence,
+  NormalizedDriverEvent,
+  ReadyLaunchFence,
+  SpawnedLaunchFence,
+  StopReason,
+  TerminalReason,
 } from "./types.js";
 export { fail, type ProtocolErrorCode } from "./errors.js";
