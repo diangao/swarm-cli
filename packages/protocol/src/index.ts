@@ -35,6 +35,21 @@ export {
   parseLaunchTransition,
   parseNormalizedDriverEvent,
 } from "./wave2-validate.js";
+export {
+  buildContributionBinding,
+  parseTurnCoordinationDisposition,
+  parseTurnReplyResult,
+  verifyContributionBinding,
+  verifyTurnCompletionEvidence,
+} from "./contribution-binding.js";
+export type {
+  ContributionBinding,
+  ContributionBindingInput,
+  TurnCompletionEvidence,
+  TurnCoordinationDisposition,
+  TurnReplyResult,
+  VerifyOptions,
+} from "./contribution-binding.js";
 export type {
   AgentId,
   AcquireConsumePermit,
