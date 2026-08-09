@@ -199,6 +199,67 @@ test("native delivery, attention, manifest, turn, and runtime unions round-trip"
   );
 });
 
+test("attention notice enforces the single-vs-range invariant", () => {
+  // count === 1: a single pending message carries identical first/latest id AND
+  // sequence.
+  const single = {
+    protocolVersion: 1,
+    target,
+    pendingCount: 1,
+    firstMessageId: id("msg", "b"),
+    latestMessageId: id("msg", "b"),
+    firstServerSeq: 101,
+    latestServerSeq: 101,
+  };
+  assert.deepEqual(parseAttentionNotice(bytes(single), v1), single);
+
+  // count > 1: a real multi-message range [101,104] with DISTINCT ids and STRICTLY
+  // increasing sequences round-trips. (Regression: the promoted predicate required
+  // firstServerSeq === latestServerSeq for count > 1, so every real range failed.)
+  const range = {
+    protocolVersion: 1,
+    target,
+    pendingCount: 4,
+    firstMessageId: id("msg", "b"),
+    latestMessageId: id("msg", "e"),
+    firstServerSeq: 101,
+    latestServerSeq: 104,
+  };
+  assert.deepEqual(parseAttentionNotice(bytes(range), v1), range);
+
+  // Killing negatives \u2014 each fails closed with INVARIANT_VIOLATION.
+  // count > 1 but a single message id (no range of distinct messages).
+  expectProtocolError(
+    () => parseAttentionNotice(bytes({ ...range, latestMessageId: id("msg", "b") }), v1),
+    "INVARIANT_VIOLATION",
+  );
+  // count > 1 but equal sequence (a single sequence cannot span multiple messages).
+  expectProtocolError(
+    () => parseAttentionNotice(bytes({ ...range, firstServerSeq: 104 }), v1),
+    "INVARIANT_VIOLATION",
+  );
+  // reversed sequence (first after latest).
+  expectProtocolError(
+    () => parseAttentionNotice(bytes({ ...range, firstServerSeq: 105 }), v1),
+    "INVARIANT_VIOLATION",
+  );
+  // count/range mismatch: count === 1 but a range of distinct sequences is present.
+  expectProtocolError(
+    () => parseAttentionNotice(bytes({ ...single, latestServerSeq: 104 }), v1),
+    "INVARIANT_VIOLATION",
+  );
+  // count/range mismatch: count === 1 but distinct message ids are present.
+  expectProtocolError(
+    () => parseAttentionNotice(bytes({ ...single, latestMessageId: id("msg", "c") }), v1),
+    "INVARIANT_VIOLATION",
+  );
+  // fail-closed parsing preserved: an unknown key is still rejected.
+  expectProtocolError(
+    () => parseAttentionNotice(bytes({ ...range, extra: 1 }), v1),
+    "UNKNOWN_FIELD",
+  );
+});
+
 test("permit, begin, ACK, result, and cursor decoders enforce exact bindings", () => {
   const acquire = signed({ ...fence, commandId: id("cmd", "c"), boundary: "daemon_accepted" });
   assert.deepEqual(parseAcquireConsumePermit(bytes(acquire), v1), acquire);

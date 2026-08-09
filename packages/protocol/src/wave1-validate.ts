@@ -277,9 +277,15 @@ export function parseAttentionNotice(input: Uint8Array, negotiated: ProtocolVers
   if (result.firstServerSeq > result.latestServerSeq) fail("INVARIANT_VIOLATION");
   const equalIds = result.firstMessageId === result.latestMessageId;
   const equalSequences = result.firstServerSeq === result.latestServerSeq;
-  if (result.pendingCount === 1 ? (!equalIds || !equalSequences) : (equalIds || !equalSequences)) {
-    fail("INVARIANT_VIOLATION");
-  }
+  // A single pending message (count === 1) must carry the SAME first/latest id and
+  // sequence. A real range (count > 1) must carry DISTINCT ids and STRICTLY
+  // increasing sequences (firstServerSeq < latestServerSeq); first > latest is
+  // already rejected above, so equal sequences here would be a non-range.
+  const invalid =
+    result.pendingCount === 1
+      ? !equalIds || !equalSequences
+      : equalIds || equalSequences;
+  if (invalid) fail("INVARIANT_VIOLATION");
   return result;
 }
 
