@@ -517,6 +517,8 @@ export type DriverTurnBinding = {
   delivery: DeliveryFence;
   invocation: NativeInvocationFence;
   permitId: CommandId;
+  runtimeWriteId: CommandId;
+  visibilityEventId: CommandId;
   inputDigest: ArtifactDigest;
 };
 
