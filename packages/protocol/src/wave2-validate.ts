@@ -362,6 +362,8 @@ export function parseDriverTurnBinding(
     "delivery",
     "invocation",
     "permitId",
+    "runtimeWriteId",
+    "visibilityEventId",
     "inputDigest",
   ]);
   const protocolTurnId = id<TurnId>(parsed.protocolTurnId, "trn");
@@ -375,6 +377,13 @@ export function parseDriverTurnBinding(
   const delivery = deliveryFence(parsed.delivery, negotiated);
   if (delivery.turnId !== protocolTurnId) fail("DRIVER_EVENT_FENCE_MISMATCH");
   const invocation = object(parsed.invocation, ["invocationGeneration", "invocationId"]);
+  const invocationId = id<CommandId>(invocation.invocationId, "cmd");
+  const permitId = id<CommandId>(parsed.permitId, "cmd");
+  const runtimeWriteId = id<CommandId>(parsed.runtimeWriteId, "cmd");
+  const visibilityEventId = id<CommandId>(parsed.visibilityEventId, "cmd");
+  if (new Set([invocationId, permitId, runtimeWriteId, visibilityEventId]).size !== 4) {
+    fail("INVARIANT_VIOLATION");
+  }
   return {
     protocolTurnId,
     rootProducerFactId: id(parsed.rootProducerFactId, "fac"),
@@ -384,9 +393,11 @@ export function parseDriverTurnBinding(
     delivery,
     invocation: {
       invocationGeneration: integer(invocation.invocationGeneration, 1),
-      invocationId: id(invocation.invocationId, "cmd"),
+      invocationId,
     },
-    permitId: id(parsed.permitId, "cmd"),
+    permitId,
+    runtimeWriteId,
+    visibilityEventId,
     inputDigest: digest(parsed.inputDigest),
   };
 }

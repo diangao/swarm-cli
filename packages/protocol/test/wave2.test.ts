@@ -73,6 +73,20 @@ test("launch transitions preserve immutable stop epochs and private-data exclusi
 test("turn bindings split active-turn identity from ordinal invariants", () => {
   const ordinary = positive.ordinaryBinding;
   assert.deepEqual(parseDriverTurnBinding(bytes(ordinary), v2), ordinary);
+  assert.deepEqual(
+    [
+      ordinary.invocation.invocationId,
+      ordinary.permitId,
+      ordinary.runtimeWriteId,
+      ordinary.visibilityEventId,
+    ],
+    [
+      "cmd_00000000000000000000000000",
+      "cmd_11111111111111111111111111",
+      "cmd_22222222222222222222222222",
+      "cmd_33333333333333333333333333",
+    ],
+  );
   assert.equal(error(() => parseDriverTurnBinding(bytes({
     ...ordinary,
     inputOrdinal: 1,
@@ -92,6 +106,33 @@ test("turn bindings split active-turn identity from ordinal invariants", () => {
     ...ordinary,
     delivery: { ...ordinary.delivery, turnId: "trn_11111111111111111111111111" },
   }), v2)), "DRIVER_EVENT_FENCE_MISMATCH");
+});
+
+test("turn binding causal ids are pairwise distinct and alias controls preserve siblings", () => {
+  const ordinary = structuredClone(positive.ordinaryBinding);
+  const snapshot = structuredClone(ordinary);
+  const fields = ["invocationId", "permitId", "runtimeWriteId", "visibilityEventId"] as const;
+  const value = (field: typeof fields[number]): string => field === "invocationId"
+    ? ordinary.invocation.invocationId
+    : ordinary[field];
+  const withValue = (field: typeof fields[number], replacement: string) => field === "invocationId"
+    ? { ...ordinary, invocation: { ...ordinary.invocation, invocationId: replacement } }
+    : { ...ordinary, [field]: replacement };
+
+  let controls = 0;
+  for (let left = 0; left < fields.length; left += 1) {
+    for (let right = left + 1; right < fields.length; right += 1) {
+      const candidate = withValue(fields[right]!, value(fields[left]!));
+      assert.equal(
+        error(() => parseDriverTurnBinding(bytes(candidate), v2)),
+        "INVARIANT_VIOLATION",
+        `${fields[right]} aliases ${fields[left]}`,
+      );
+      assert.deepEqual(ordinary, snapshot, "a rejected alias cannot mutate valid siblings");
+      controls += 1;
+    }
+  }
+  assert.equal(controls, 6, "all six pairwise aliases are killing controls");
 });
 
 test("normalized driver events reject absence and provider queue states", () => {
