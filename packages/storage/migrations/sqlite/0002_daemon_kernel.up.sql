@@ -148,6 +148,11 @@ CREATE TABLE local_turns (
   mode TEXT NOT NULL CHECK (mode IN ('ordinary', 'steer')),
   expected_turn_id TEXT CHECK (expected_turn_id IS NULL OR (length(expected_turn_id) = 30 AND substr(expected_turn_id, 1, 4) = 'trn_' AND substr(expected_turn_id, 5) NOT GLOB '*[^0-9a-hjkmnp-tv-z]*')),
   state TEXT NOT NULL CHECK (state IN ('queued', 'write_started', 'input_written', 'model_visible', 'completed', 'ambiguous', 'interrupted', 'terminal_error')),
+  binding_digest TEXT
+    CHECK (binding_digest IS NULL OR (length(binding_digest) = 71 AND substr(binding_digest, 1, 7) = 'sha256:' AND substr(binding_digest, 8) NOT GLOB '*[^0-9a-f]*')),
+  steerable INTEGER NOT NULL DEFAULT 0 CHECK (steerable IN (0, 1)),
+  operation_digest TEXT
+    CHECK (operation_digest IS NULL OR (length(operation_digest) = 71 AND substr(operation_digest, 1, 7) = 'sha256:' AND substr(operation_digest, 8) NOT GLOB '*[^0-9a-f]*')),
   queued_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   CHECK ((mode = 'ordinary' AND input_ordinal = 0 AND expected_turn_id IS NULL) OR (mode = 'steer' AND input_ordinal >= 1 AND expected_turn_id = protocol_turn_id))
@@ -178,9 +183,44 @@ CREATE TABLE driver_event_records (
     CHECK (length(event_digest) = 71 AND substr(event_digest, 1, 7) = 'sha256:' AND substr(event_digest, 8) NOT GLOB '*[^0-9a-f]*'),
   turn_id TEXT CHECK (turn_id IS NULL OR (length(turn_id) = 30 AND substr(turn_id, 1, 4) = 'trn_' AND substr(turn_id, 5) NOT GLOB '*[^0-9a-hjkmnp-tv-z]*')),
   binding_digest TEXT CHECK (binding_digest IS NULL OR (length(binding_digest) = 71 AND substr(binding_digest, 1, 7) = 'sha256:' AND substr(binding_digest, 8) NOT GLOB '*[^0-9a-f]*')),
+  operation_digest TEXT
+    CHECK (operation_digest IS NULL OR (length(operation_digest) = 71 AND substr(operation_digest, 1, 7) = 'sha256:' AND substr(operation_digest, 8) NOT GLOB '*[^0-9a-f]*')),
   recorded_at TEXT NOT NULL,
   PRIMARY KEY (state_instance_id, session_id, ordinal),
   FOREIGN KEY (state_instance_id, session_id) REFERENCES driver_event_cursor(state_instance_id, session_id)
+) STRICT;
+
+CREATE TABLE native_attempt_completions (
+  delivery_id TEXT NOT NULL
+    CHECK (length(delivery_id) = 30 AND substr(delivery_id, 1, 4) = 'dlv_' AND substr(delivery_id, 5) NOT GLOB '*[^0-9a-hjkmnp-tv-z]*'),
+  attempt INTEGER NOT NULL CHECK (attempt >= 1),
+  reply_receipt_id TEXT NOT NULL
+    CHECK (length(reply_receipt_id) = 30 AND substr(reply_receipt_id, 1, 4) = 'rcp_' AND substr(reply_receipt_id, 5) NOT GLOB '*[^0-9a-hjkmnp-tv-z]*'),
+  reply_result_digest TEXT NOT NULL
+    CHECK (length(reply_result_digest) = 71 AND substr(reply_result_digest, 1, 7) = 'sha256:' AND substr(reply_result_digest, 8) NOT GLOB '*[^0-9a-f]*'),
+  coordination_kind TEXT NOT NULL
+    CHECK (coordination_kind IN ('not_requested', 'committed', 'terminal_replay')),
+  coordination_terminal_turn_id TEXT
+    CHECK (coordination_terminal_turn_id IS NULL OR (length(coordination_terminal_turn_id) = 30 AND substr(coordination_terminal_turn_id, 1, 4) = 'trn_' AND substr(coordination_terminal_turn_id, 5) NOT GLOB '*[^0-9a-hjkmnp-tv-z]*')),
+  coordination_command_id TEXT
+    CHECK (coordination_command_id IS NULL OR (length(coordination_command_id) = 30 AND substr(coordination_command_id, 1, 4) = 'cmd_' AND substr(coordination_command_id, 5) NOT GLOB '*[^0-9a-hjkmnp-tv-z]*')),
+  coordination_receipt_id TEXT
+    CHECK (coordination_receipt_id IS NULL OR (length(coordination_receipt_id) = 30 AND substr(coordination_receipt_id, 1, 4) = 'rcp_' AND substr(coordination_receipt_id, 5) NOT GLOB '*[^0-9a-hjkmnp-tv-z]*')),
+  coordination_result_digest TEXT
+    CHECK (coordination_result_digest IS NULL OR (length(coordination_result_digest) = 71 AND substr(coordination_result_digest, 1, 7) = 'sha256:' AND substr(coordination_result_digest, 8) NOT GLOB '*[^0-9a-f]*')),
+  contribution_binding_digest TEXT NOT NULL
+    CHECK (length(contribution_binding_digest) = 71 AND substr(contribution_binding_digest, 1, 7) = 'sha256:' AND substr(contribution_binding_digest, 8) NOT GLOB '*[^0-9a-f]*'),
+  reply_command_id TEXT
+    CHECK (reply_command_id IS NULL OR (length(reply_command_id) = 30 AND substr(reply_command_id, 1, 4) = 'cmd_' AND substr(reply_command_id, 5) NOT GLOB '*[^0-9a-hjkmnp-tv-z]*')),
+  operation_digest TEXT
+    CHECK (operation_digest IS NULL OR (length(operation_digest) = 71 AND substr(operation_digest, 1, 7) = 'sha256:' AND substr(operation_digest, 8) NOT GLOB '*[^0-9a-f]*')),
+  recorded_at TEXT NOT NULL,
+  PRIMARY KEY (delivery_id, attempt),
+  FOREIGN KEY (delivery_id, attempt) REFERENCES native_attempts(delivery_id, attempt),
+  CHECK ((coordination_kind = 'not_requested') = (coordination_terminal_turn_id IS NOT NULL)),
+  CHECK ((coordination_kind IN ('committed', 'terminal_replay')) = (coordination_command_id IS NOT NULL)),
+  CHECK ((coordination_command_id IS NULL) = (coordination_receipt_id IS NULL)),
+  CHECK ((coordination_command_id IS NULL) = (coordination_result_digest IS NULL))
 ) STRICT;
 
 CREATE INDEX notice_visibility_input ON notice_visibility(input_delivery_id, input_attempt);
