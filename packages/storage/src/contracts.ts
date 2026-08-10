@@ -38,6 +38,25 @@ const SQLITE_V2_CONTROLS = [
   "CREATE TABLE driver_event_records",
 ] as const;
 
+const SQLITE_V3_CONTROLS = [
+  "ALTER TABLE driver_event_cursor ADD COLUMN reader_journal_instance_id TEXT CHECK (",
+  "substr(reader_journal_instance_id, 1, 4) = 'cmd_'",
+  "ALTER TABLE local_turns ADD COLUMN delivery_id TEXT CHECK (",
+  "substr(delivery_id, 1, 4) = 'dlv_'",
+  "ALTER TABLE local_turns ADD COLUMN attempt INTEGER CHECK (",
+  "attempt IS NULL OR (attempt >= 1 AND attempt <= 2147483647)",
+  "ALTER TABLE local_turns ADD COLUMN invocation_id TEXT CHECK (",
+  "substr(invocation_id, 1, 4) = 'cmd_'",
+  "ALTER TABLE local_turns ADD COLUMN invocation_generation INTEGER CHECK (",
+  "invocation_generation >= 1 AND invocation_generation <= 9007199254740991",
+  "ALTER TABLE local_turns ADD COLUMN permit_id TEXT CHECK (",
+  "substr(permit_id, 1, 4) = 'cmd_'",
+  "ALTER TABLE local_turns ADD COLUMN runtime_write_id TEXT CHECK (",
+  "substr(runtime_write_id, 1, 4) = 'cmd_'",
+  "ALTER TABLE local_turns ADD COLUMN visibility_event_id TEXT CHECK (",
+  "substr(visibility_event_id, 1, 4) = 'cmd_'",
+] as const;
+
 const POSTGRES_NATIVE_INGRESS_CONTROLS = [
   "CREATE DOMAIN human_id_text",
   "CREATE FUNCTION message_body_has_content",
@@ -82,6 +101,10 @@ export function assertSqliteMigrationContract(sql: string, version = "0001"): vo
   }
   if (version === "0002") {
     requireControls(sql, SQLITE_V2_CONTROLS, "sqlite-0002");
+    return;
+  }
+  if (version === "0003") {
+    requireControls(sql, SQLITE_V3_CONTROLS, "sqlite-0003");
     return;
   }
   storageFail("INVALID_MIGRATION", { dialect: "sqlite", version });

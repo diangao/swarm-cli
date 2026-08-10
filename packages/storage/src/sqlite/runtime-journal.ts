@@ -31,6 +31,7 @@ import {
   assertArtifactDigest,
   assertProtocolId,
   canonicalTargetKey,
+  parseFrozenDelivery,
   targetColumns,
 } from "../protocol.js";
 
@@ -64,6 +65,72 @@ function equalNullable(left: string | null, right: string | null): boolean {
 
 function digestCanonical(value: unknown): ArtifactDigest {
   return `sha256:${createHash("sha256").update(canonicalProtocolJson(value)).digest("hex")}` as ArtifactDigest;
+}
+
+function digestBytes(value: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+/**
+ * The ordered seven-member durable admission preimage. This is the ONE
+ * single-source set: admission appends exactly this projection to the
+ * beginTurnContribution operation-digest preimage, and recovery uses the same
+ * projection (deliveryId/attempt for fence selection; the five invocation
+ * members for the sole buildContributionBinding recomputation). No second
+ * mapping, subset, caller restamp, or chain-derived replacement exists.
+ */
+export type TurnAdmissionPreimage = {
+  deliveryId: DeliveryId;
+  attempt: number;
+  invocationId: CommandId;
+  invocationGeneration: number;
+  permitId: CommandId;
+  runtimeWriteId: CommandId;
+  visibilityEventId: CommandId;
+};
+
+function admissionPreimage(source: TurnAdmissionPreimage): TurnAdmissionPreimage {
+  return {
+    deliveryId: source.deliveryId,
+    attempt: source.attempt,
+    invocationId: source.invocationId,
+    invocationGeneration: source.invocationGeneration,
+    permitId: source.permitId,
+    runtimeWriteId: source.runtimeWriteId,
+    visibilityEventId: source.visibilityEventId,
+  };
+}
+
+function assertAdmissionPreimage(preimage: TurnAdmissionPreimage): void {
+  assertProtocolId(preimage.deliveryId, "dlv");
+  assertProtocolId(preimage.invocationId, "cmd");
+  assertProtocolId(preimage.permitId, "cmd");
+  assertProtocolId(preimage.runtimeWriteId, "cmd");
+  assertProtocolId(preimage.visibilityEventId, "cmd");
+  if (
+    !Number.isSafeInteger(preimage.attempt) ||
+    preimage.attempt < 1 ||
+    preimage.attempt > 2147483647
+  ) {
+    storageFail("INVALID_STATE_TRANSITION", preimage.deliveryId);
+  }
+  if (
+    !Number.isSafeInteger(preimage.invocationGeneration) ||
+    preimage.invocationGeneration < 1 ||
+    preimage.invocationGeneration > 9007199254740991
+  ) {
+    storageFail("INVALID_STATE_TRANSITION", preimage.deliveryId);
+  }
+  if (
+    new Set([
+      preimage.invocationId,
+      preimage.permitId,
+      preimage.runtimeWriteId,
+      preimage.visibilityEventId,
+    ]).size !== 4
+  ) {
+    storageFail("INVALID_STATE_TRANSITION", preimage.deliveryId);
+  }
 }
 
 const DELIVERY_FENCE_KEYS = [
@@ -177,11 +244,33 @@ export type AppendNativeInvocationEntryInput = {
   >;
 };
 
+export type DriverEventCursorSnapshot = {
+  nextOrdinal: number;
+  lastEventDigest: ArtifactDigest | null;
+};
+
+export type DriverEventReaderClaimResult = DriverEventCursorSnapshot & {
+  readerEpoch: number;
+};
+
+export type DriverEventReaderTakeoverResult =
+  DriverEventReaderClaimResult & {
+    supersededOwnerToken: ArtifactDigest;
+    supersededReaderEpoch: number;
+  };
+
 export type DriverEventReaderClaim = {
   stateInstanceId: StateInstanceId;
   sessionId: SessionId;
   ownerToken: ArtifactDigest;
-  mode: "start" | "resume" | "subscribe";
+  mode: "start" | "resume";
+  claimedAt: string;
+};
+
+export type DriverEventReaderOrphanTakeover = {
+  stateInstanceId: StateInstanceId;
+  sessionId: SessionId;
+  ownerToken: ArtifactDigest;
   claimedAt: string;
 };
 
@@ -289,10 +378,54 @@ export type BeginTurnContributionInput = TurnReaderFence & {
   driverTurnRefDigest: ArtifactDigest;
   mode: TurnAdmissionMode;
   bindingDigest: ArtifactDigest;
+  deliveryId: DeliveryId;
+  attempt: number;
+  invocationId: CommandId;
+  invocationGeneration: number;
+  permitId: CommandId;
+  runtimeWriteId: CommandId;
+  visibilityEventId: CommandId;
   expected: DurableTurnState | null;
   next: DurableTurnState;
   recordedAt: string;
 };
+
+export type ReplayableTurnRecoveryBasis = {
+  fence: DeliveryFence;
+  deliveryId: DeliveryId;
+  attempt: number;
+  sourceMessageId: MessageId;
+  protocolTurnId: TurnId;
+  launchId: LaunchId;
+  stateInstanceId: StateInstanceId;
+  sessionId: SessionId;
+  rootProducerFactId: ProducerFactId;
+  inputOrdinal: number;
+  driverTurnRefDigest: ArtifactDigest;
+  mode: TurnAdmissionMode;
+  invocationId: CommandId;
+  invocationGeneration: number;
+  permitId: CommandId;
+  runtimeWriteId: CommandId;
+  visibilityEventId: CommandId;
+  bindingDigest: ArtifactDigest;
+  durable: "model_visible";
+  attemptState: "model_visible";
+  entryChainDepth: 4;
+};
+
+export type TurnRecoveryReadResult =
+  | {
+      kind: "replayable";
+      basis: ReplayableTurnRecoveryBasis;
+      cursor: DriverEventCursorSnapshot;
+    }
+  | {
+      kind: "held_ambiguous";
+      reason:
+        | "PRE_MODEL_VISIBLE_EFFECT_UNKNOWN"
+        | "ACTIVE_AMBIGUOUS";
+    };
 
 export type CommitTurnStepInput = TurnReaderFence & {
   event: TurnEventRecordInput;
@@ -320,7 +453,10 @@ export type SettleTurnContributionInput = TurnReaderFence & {
 };
 
 export type TurnMutationResult = { applied: boolean; durable: DurableTurnState };
-export type TurnStepResult = TurnMutationResult & { nextOrdinal: number };
+export type TurnStepResult = TurnMutationResult & {
+  nextOrdinal: number;
+  lastEventDigest: ArtifactDigest | null;
+};
 
 type TurnRowShape = {
   protocol_turn_id: string;
@@ -1302,6 +1438,7 @@ export class RuntimeJournalTransaction {
 
   #requireTurnReaderFence(fence: TurnReaderFence): {
     next_ordinal: number;
+    last_event_digest: ArtifactDigest | null;
   } {
     assertProtocolId(fence.stateInstanceId, "sti");
     assertProtocolId(fence.sessionId, "ses");
@@ -1312,11 +1449,13 @@ export class RuntimeJournalTransaction {
     const cursor = one<{
       session_id: string;
       next_ordinal: number;
+      last_event_digest: string | null;
       reader_owner_token: string | null;
       reader_epoch: number;
     }>(
       this.#database,
-      `SELECT session_id, next_ordinal, reader_owner_token, reader_epoch
+      `SELECT session_id, next_ordinal, last_event_digest, reader_owner_token,
+              reader_epoch
        FROM driver_event_cursor WHERE state_instance_id = ?`,
       [fence.stateInstanceId],
     );
@@ -1328,7 +1467,115 @@ export class RuntimeJournalTransaction {
     ) {
       storageFail("DRIVER_EVENT_FENCE_MISMATCH", fence.stateInstanceId);
     }
-    return { next_ordinal: Number(cursor.next_ordinal) };
+    return {
+      next_ordinal: Number(cursor.next_ordinal),
+      last_event_digest: (cursor.last_event_digest ?? null) as ArtifactDigest | null,
+    };
+  }
+
+  /**
+   * Authenticated source join. The stored pending_deliveries row is trusted
+   * only after its exact canonical DeliveryEnvelope is reconstructed from the
+   * stored columns, its canonical target key revalidates, and its canonical
+   * digest equals the stored envelope digest through the existing digest path.
+   * Only then is the stored message id exposed. Any row/digest/target-key
+   * reconstruction failure fails STALE_DELIVERY_FENCE with zero mutation. The
+   * source message id is never accepted from a caller.
+   */
+  #requireAuthenticatedSourceMessage(
+    deliveryId: DeliveryId,
+    attempt: number,
+    expected: {
+      launchId: LaunchId;
+      stateInstanceId: StateInstanceId;
+      sessionId: SessionId;
+      turnId: TurnId;
+      producerFactId: ProducerFactId;
+    },
+  ): MessageId {
+    const sourceFail = (): never => storageFail("STALE_DELIVERY_FENCE", deliveryId);
+    const row = one<{
+      attempt: number;
+      replay_of: string | null;
+      message_id: string;
+      producer_fact_id: string;
+      agent_id: string;
+      machine_id: string;
+      expected_launch_id: string | null;
+      envelope_digest: string;
+      target_key: string;
+      target_kind: string;
+      target_id: string;
+      thread_root_message_id: string | null;
+      launch_id: string;
+      state_instance_id: string;
+      session_id: string;
+      turn_id: string;
+      server_seq: number;
+    }>(
+      this.#database,
+      `SELECT attempt, replay_of, message_id, producer_fact_id, agent_id,
+              machine_id, expected_launch_id, envelope_digest, target_key,
+              target_kind, target_id, thread_root_message_id, launch_id,
+              state_instance_id, session_id, turn_id, server_seq
+       FROM pending_deliveries WHERE delivery_id = ?`,
+      [deliveryId],
+    );
+    if (row === undefined) return sourceFail();
+    if (
+      Number(row.attempt) !== attempt ||
+      row.launch_id !== expected.launchId ||
+      row.state_instance_id !== expected.stateInstanceId ||
+      row.session_id !== expected.sessionId ||
+      row.turn_id !== expected.turnId ||
+      row.producer_fact_id !== expected.producerFactId
+    ) {
+      return sourceFail();
+    }
+    let reconstructed;
+    try {
+      const target =
+        row.target_kind === "channel"
+          ? {
+              kind: "channel",
+              channelId: row.target_id,
+              ...(row.thread_root_message_id === null
+                ? {}
+                : { threadRootMessageId: row.thread_root_message_id }),
+            }
+          : {
+              kind: "direct",
+              conversationId: row.target_id,
+              ...(row.thread_root_message_id === null
+                ? {}
+                : { threadRootMessageId: row.thread_root_message_id }),
+            };
+      const candidate = {
+        protocolVersion: 1,
+        deliveryId,
+        attempt: Number(row.attempt),
+        messageId: row.message_id,
+        target,
+        serverSeq: Number(row.server_seq),
+        producerFactId: row.producer_fact_id,
+        agentId: row.agent_id,
+        machineId: row.machine_id,
+        ...(row.expected_launch_id === null
+          ? {}
+          : { expectedLaunchId: row.expected_launch_id }),
+        ...(row.replay_of === null ? {} : { replayOf: row.replay_of }),
+      };
+      reconstructed = parseFrozenDelivery(canonicalProtocolJson(candidate));
+    } catch {
+      return sourceFail();
+    }
+    if (canonicalTargetKey(reconstructed.target) !== row.target_key) {
+      return sourceFail();
+    }
+    if (digestBytes(canonicalProtocolJson(reconstructed)) !== row.envelope_digest) {
+      return sourceFail();
+    }
+    return reconstructed.messageId;
   }
 
   #turnRow(protocolTurnId: TurnId): TurnRowShape | undefined {
@@ -1402,18 +1649,19 @@ export class RuntimeJournalTransaction {
    * canonicalProtocolJson, so JSON.parse yields enumerable string keys only
    * and Object.keys exactness is complete.
    */
-  #requireTerminalEntryChain(
-    deliveryId: DeliveryId,
-    attempt: number,
-    generation: number,
-    fenceJson: string,
-    invocationId: string | null,
-    permitId: string | null,
-    bodyDigest: string | null,
-  ): {
-    writtenEntry: { runtimeWriteId: CommandId; sequence: number; entryDigest: ArtifactDigest };
-    visibleEntry: { runtimeWriteId: CommandId; visibilityEventId: CommandId };
-  } {
+  #validateStoredEntry(
+    context: {
+      deliveryId: DeliveryId;
+      attempt: number;
+      generation: number;
+      fenceJson: string;
+      invocationId: string | null;
+      permitId: string | null;
+    },
+    kind: "permit_recorded" | "write_started" | "input_written" | "model_visible",
+    extraKeys: readonly string[],
+  ): Record<string, unknown> {
+    const { deliveryId, attempt, generation, fenceJson, invocationId, permitId } = context;
     const chainFail = (): never =>
       storageFail("INVALID_JOURNAL_CHAIN", { deliveryId, attempt });
     const bindingFail = (): never =>
@@ -1430,93 +1678,110 @@ export class RuntimeJournalTransaction {
       "invocationId",
       "permitId",
     ];
-    const validate = (
-      kind: "permit_recorded" | "write_started" | "input_written" | "model_visible",
-      extraKeys: readonly string[],
-    ): Record<string, unknown> => {
-      const stored = one<{ entry_json: string; sequence: number }>(
-        this.#database,
-        `SELECT entry_json, sequence FROM native_invocation_entries
-         WHERE delivery_id = ? AND attempt = ? AND invocation_generation = ?
-           AND kind = ?`,
-        [deliveryId, attempt, generation, kind],
+    const stored = one<{ entry_json: string; sequence: number }>(
+      this.#database,
+      `SELECT entry_json, sequence FROM native_invocation_entries
+       WHERE delivery_id = ? AND attempt = ? AND invocation_generation = ?
+         AND kind = ?`,
+      [deliveryId, attempt, generation, kind],
+    );
+    if (stored === undefined) return chainFail();
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(stored.entry_json) as Record<string, unknown>;
+    } catch {
+      return chainFail();
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      chainFail();
+    }
+    const expectedKeys = [...BASE_KEYS, ...extraKeys].sort();
+    const actualKeys = Object.keys(parsed).sort();
+    if (
+      expectedKeys.length !== actualKeys.length ||
+      expectedKeys.some((key, index) => key !== actualKeys[index])
+    ) {
+      chainFail();
+    }
+    try {
+      assertProtocolId(parsed.journalId as string, "cmd");
+      assertProtocolId(parsed.entryId as string, "cmd");
+      assertProtocolId(parsed.invocationId as string, "cmd");
+      assertProtocolId(parsed.permitId as string, "cmd");
+      if (kind === "write_started") {
+        assertArtifactDigest(parsed.inputDigest as string);
+      } else if (kind !== "permit_recorded") {
+        assertProtocolId(parsed.runtimeWriteId as string, "cmd");
+      }
+      if (kind === "model_visible") {
+        assertProtocolId(parsed.visibilityEventId as string, "cmd");
+      }
+      assertArtifactDigest(parsed.entryDigest as string);
+      if (kind === "permit_recorded") {
+        if (parsed.previousEntryDigest !== null) return chainFail();
+      } else {
+        assertArtifactDigest(parsed.previousEntryDigest as string);
+      }
+    } catch {
+      return chainFail();
+    }
+    if (
+      parsed.kind !== kind ||
+      !Number.isSafeInteger(parsed.sequence) ||
+      (parsed.sequence as number) < 1 ||
+      (parsed.sequence as number) !== Number(stored.sequence) ||
+      parsed.invocationGeneration !== generation ||
+      parsed.journalId !== parsed.invocationId
+    ) {
+      chainFail();
+    }
+    const fenceProjection: Record<string, unknown> = {};
+    for (const key of DELIVERY_FENCE_KEYS) {
+      fenceProjection[key] = parsed[key];
+    }
+    let projectionJson: string;
+    try {
+      projectionJson = new TextDecoder().decode(
+        canonicalProtocolJson(fenceProjection),
       );
-      if (stored === undefined) return chainFail();
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(stored.entry_json) as Record<string, unknown>;
-      } catch {
-        return chainFail();
-      }
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-        chainFail();
-      }
-      const expectedKeys = [...BASE_KEYS, ...extraKeys].sort();
-      const actualKeys = Object.keys(parsed).sort();
-      if (
-        expectedKeys.length !== actualKeys.length ||
-        expectedKeys.some((key, index) => key !== actualKeys[index])
-      ) {
-        chainFail();
-      }
-      try {
-        assertProtocolId(parsed.journalId as string, "cmd");
-        assertProtocolId(parsed.entryId as string, "cmd");
-        assertProtocolId(parsed.invocationId as string, "cmd");
-        assertProtocolId(parsed.permitId as string, "cmd");
-        if (kind === "write_started") {
-          assertArtifactDigest(parsed.inputDigest as string);
-        } else if (kind !== "permit_recorded") {
-          assertProtocolId(parsed.runtimeWriteId as string, "cmd");
-        }
-        if (kind === "model_visible") {
-          assertProtocolId(parsed.visibilityEventId as string, "cmd");
-        }
-        assertArtifactDigest(parsed.entryDigest as string);
-        if (kind === "permit_recorded") {
-          if (parsed.previousEntryDigest !== null) return chainFail();
-        } else {
-          assertArtifactDigest(parsed.previousEntryDigest as string);
-        }
-      } catch {
-        return chainFail();
-      }
-      if (
-        parsed.kind !== kind ||
-        !Number.isSafeInteger(parsed.sequence) ||
-        (parsed.sequence as number) < 1 ||
-        (parsed.sequence as number) !== Number(stored.sequence) ||
-        parsed.invocationGeneration !== generation ||
-        parsed.journalId !== parsed.invocationId
-      ) {
-        chainFail();
-      }
-      const fenceProjection: Record<string, unknown> = {};
-      for (const key of DELIVERY_FENCE_KEYS) {
-        fenceProjection[key] = parsed[key];
-      }
-      let projectionJson: string;
-      try {
-        projectionJson = new TextDecoder().decode(
-          canonicalProtocolJson(fenceProjection),
-        );
-      } catch {
-        return chainFail();
-      }
-      if (projectionJson !== fenceJson) bindingFail();
-      if (parsed.invocationId !== invocationId || parsed.permitId !== permitId) {
-        bindingFail();
-      }
-      const unsigned = Object.fromEntries(
-        Object.entries(parsed).filter(([key]) => key !== "entryDigest"),
-      );
-      if (digestCanonical(unsigned) !== parsed.entryDigest) chainFail();
-      return parsed;
-    };
-    const permitRecorded = validate("permit_recorded", []);
-    const started = validate("write_started", ["inputDigest"]);
-    const written = validate("input_written", ["runtimeWriteId"]);
-    const visible = validate("model_visible", ["runtimeWriteId", "visibilityEventId"]);
+    } catch {
+      return chainFail();
+    }
+    if (projectionJson !== fenceJson) bindingFail();
+    if (parsed.invocationId !== invocationId || parsed.permitId !== permitId) {
+      bindingFail();
+    }
+    const unsigned = Object.fromEntries(
+      Object.entries(parsed).filter(([key]) => key !== "entryDigest"),
+    );
+    if (digestCanonical(unsigned) !== parsed.entryDigest) chainFail();
+    return parsed;
+  }
+
+  #requireTerminalEntryChain(
+    deliveryId: DeliveryId,
+    attempt: number,
+    generation: number,
+    fenceJson: string,
+    invocationId: string | null,
+    permitId: string | null,
+    bodyDigest: string | null,
+  ): {
+    writtenEntry: { runtimeWriteId: CommandId; sequence: number; entryDigest: ArtifactDigest };
+    visibleEntry: { runtimeWriteId: CommandId; visibilityEventId: CommandId };
+  } {
+    const chainFail = (): never =>
+      storageFail("INVALID_JOURNAL_CHAIN", { deliveryId, attempt });
+    const bindingFail = (): never =>
+      storageFail("WRITE_STARTED_BINDING_MISMATCH", { deliveryId, attempt });
+    const context = { deliveryId, attempt, generation, fenceJson, invocationId, permitId };
+    const permitRecorded = this.#validateStoredEntry(context, "permit_recorded", []);
+    const started = this.#validateStoredEntry(context, "write_started", ["inputDigest"]);
+    const written = this.#validateStoredEntry(context, "input_written", ["runtimeWriteId"]);
+    const visible = this.#validateStoredEntry(context, "model_visible", [
+      "runtimeWriteId",
+      "visibilityEventId",
+    ]);
     if (
       (permitRecorded.sequence as number) !== 1 ||
       (started.sequence as number) !== 2 ||
@@ -1544,6 +1809,102 @@ export class RuntimeJournalTransaction {
     };
   }
 
+  /**
+   * Recovery-side chain validation through the same single stored-entry
+   * validator. The current-generation entries must form exactly one contiguous
+   * prefix of the SSOT chain at the expected depth: no middle gap, no
+   * unexpected entry, sequences exactly 1..depth, digest/predecessor links
+   * intact. Every present member must equal the persisted admission facts:
+   * permit entry -> permitId; write_started -> invocationId/generation plus
+   * the hardened attempt body digest; input_written -> runtimeWriteId;
+   * model_visible -> the same runtime write plus visibilityEventId. No chain
+   * member may replace, infer, or restamp an admission fact.
+   */
+  #requireRecoveryEntryChain(
+    deliveryId: DeliveryId,
+    attempt: number,
+    generation: number,
+    fenceJson: string,
+    preimage: TurnAdmissionPreimage,
+    bodyDigest: string | null,
+    expectedDepth: 0 | 1 | 2 | 3 | 4,
+  ): void {
+    const chainFail = (): never =>
+      storageFail("INVALID_JOURNAL_CHAIN", { deliveryId, attempt });
+    const bindingFail = (): never =>
+      storageFail("WRITE_STARTED_BINDING_MISMATCH", { deliveryId, attempt });
+    const PREFIX: readonly ("permit_recorded" | "write_started" | "input_written" | "model_visible")[] =
+      ["permit_recorded", "write_started", "input_written", "model_visible"];
+    const rows = all<{ kind: string; sequence: number }>(
+      this.#database,
+      `SELECT kind, sequence FROM native_invocation_entries
+       WHERE delivery_id = ? AND attempt = ? AND invocation_generation = ?
+       ORDER BY sequence`,
+      [deliveryId, attempt, generation],
+    );
+    if (rows.length !== expectedDepth) chainFail();
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index] as { kind: string; sequence: number };
+      if (row.kind !== PREFIX[index] || Number(row.sequence) !== index + 1) {
+        chainFail();
+      }
+    }
+    if (expectedDepth === 0) return;
+    const context = {
+      deliveryId,
+      attempt,
+      generation,
+      fenceJson,
+      invocationId: preimage.invocationId,
+      permitId: preimage.permitId,
+    };
+    const EXTRA_KEYS: readonly (readonly string[])[] = [
+      [],
+      ["inputDigest"],
+      ["runtimeWriteId"],
+      ["runtimeWriteId", "visibilityEventId"],
+    ];
+    const parsedEntries: Record<string, unknown>[] = [];
+    for (let index = 0; index < expectedDepth; index += 1) {
+      parsedEntries.push(
+        this.#validateStoredEntry(
+          context,
+          PREFIX[index] as "permit_recorded",
+          EXTRA_KEYS[index] as readonly string[],
+        ),
+      );
+    }
+    for (let index = 0; index < parsedEntries.length; index += 1) {
+      const entry = parsedEntries[index] as Record<string, unknown>;
+      if ((entry.sequence as number) !== index + 1) chainFail();
+      if (index === 0) {
+        if (entry.previousEntryDigest !== null) chainFail();
+      } else {
+        const previous = parsedEntries[index - 1] as Record<string, unknown>;
+        if (entry.previousEntryDigest !== previous.entryDigest) chainFail();
+      }
+    }
+    if (expectedDepth >= 2) {
+      const started = parsedEntries[1] as Record<string, unknown>;
+      if (bodyDigest === null || started.inputDigest !== bodyDigest) {
+        bindingFail();
+      }
+    }
+    if (expectedDepth >= 3) {
+      const written = parsedEntries[2] as Record<string, unknown>;
+      if (written.runtimeWriteId !== preimage.runtimeWriteId) bindingFail();
+    }
+    if (expectedDepth === 4) {
+      const visible = parsedEntries[3] as Record<string, unknown>;
+      if (
+        visible.runtimeWriteId !== preimage.runtimeWriteId ||
+        visible.visibilityEventId !== preimage.visibilityEventId
+      ) {
+        bindingFail();
+      }
+    }
+  }
+
   beginTurnContribution(input: BeginTurnContributionInput): TurnMutationResult {
     this.#requireTurnReaderFence(input);
     assertProtocolId(input.protocolTurnId, "trn");
@@ -1551,6 +1912,8 @@ export class RuntimeJournalTransaction {
     assertProtocolId(input.rootProducerFactId, "fac");
     assertArtifactDigest(input.driverTurnRefDigest);
     assertArtifactDigest(input.bindingDigest);
+    const preimage = admissionPreimage(input);
+    assertAdmissionPreimage(preimage);
     this.#assertDurableShape(input.next);
     if (input.expected !== null) this.#assertDurableShape(input.expected);
     if (
@@ -1578,6 +1941,87 @@ export class RuntimeJournalTransaction {
         storageFail("INVALID_STATE_TRANSITION", input.protocolTurnId);
       }
     }
+    // Full stored delivery/attempt/fence join precedes any mutation. The
+    // hardened attempt fence is the trust root; the caller never supplies it.
+    const attemptRow = one<{
+      fence_json: string;
+      state: string;
+      launch_id: string | null;
+      state_instance_id: string | null;
+      session_id: string | null;
+      permit_id: string | null;
+      invocation_generation: number | null;
+      invocation_id: string | null;
+    }>(
+      this.#database,
+      `SELECT fence_json, state, launch_id, state_instance_id, session_id,
+              permit_id, invocation_generation, invocation_id
+       FROM native_attempts WHERE delivery_id = ? AND attempt = ?`,
+      [preimage.deliveryId, preimage.attempt],
+    );
+    if (attemptRow === undefined) {
+      storageFail("STALE_DELIVERY_FENCE", preimage.deliveryId);
+    }
+    let storedFence: DeliveryFence;
+    try {
+      storedFence = JSON.parse(attemptRow.fence_json) as DeliveryFence;
+    } catch {
+      return storageFail("STALE_DELIVERY_FENCE", preimage.deliveryId);
+    }
+    if (
+      storedFence.deliveryId !== preimage.deliveryId ||
+      storedFence.attempt !== preimage.attempt ||
+      storedFence.turnId !== input.protocolTurnId ||
+      storedFence.producerFactId !== input.rootProducerFactId ||
+      storedFence.launchId !== input.launchId ||
+      storedFence.sessionId !== input.sessionId ||
+      attemptRow.state_instance_id !== input.stateInstanceId ||
+      attemptRow.session_id !== input.sessionId ||
+      attemptRow.launch_id !== input.launchId
+    ) {
+      storageFail("STALE_DELIVERY_FENCE", preimage.deliveryId);
+    }
+    // Every invocation/permit member already present on the attempt row must
+    // equal the proposed persisted admission member.
+    if (
+      (attemptRow.permit_id !== null && attemptRow.permit_id !== preimage.permitId) ||
+      (attemptRow.invocation_id !== null &&
+        attemptRow.invocation_id !== preimage.invocationId) ||
+      (attemptRow.invocation_generation !== null &&
+        Number(attemptRow.invocation_generation) !== preimage.invocationGeneration)
+    ) {
+      storageFail("STALE_DELIVERY_FENCE", preimage.deliveryId);
+    }
+    // Authenticated source join: the stored pending_deliveries row must
+    // reconstruct its exact canonical DeliveryEnvelope and match its stored
+    // envelope digest before its message id is trusted anywhere.
+    this.#requireAuthenticatedSourceMessage(preimage.deliveryId, preimage.attempt, {
+      launchId: input.launchId,
+      stateInstanceId: input.stateInstanceId,
+      sessionId: input.sessionId,
+      turnId: input.protocolTurnId,
+      producerFactId: input.rootProducerFactId,
+    });
+    // SSOT binding recomputation over the stored fence plus the same
+    // seven-member set; the caller-proposed contribution digest must match.
+    let recomputedBindingDigest: ArtifactDigest;
+    try {
+      recomputedBindingDigest = buildContributionBinding({
+        fence: storedFence,
+        stateInstanceId: input.stateInstanceId,
+        inputOrdinal: input.inputOrdinal,
+        invocationId: preimage.invocationId,
+        invocationGeneration: preimage.invocationGeneration,
+        permitId: preimage.permitId,
+        runtimeWriteId: preimage.runtimeWriteId,
+        visibilityEventId: preimage.visibilityEventId,
+      }).contributionBindingDigest;
+    } catch {
+      return storageFail("WRITE_STARTED_BINDING_MISMATCH", input.protocolTurnId);
+    }
+    if (recomputedBindingDigest !== input.bindingDigest) {
+      storageFail("WRITE_STARTED_BINDING_MISMATCH", input.protocolTurnId);
+    }
     const operationDigest = digestCanonical({
       method: "beginTurnContribution",
       stateInstanceId: input.stateInstanceId,
@@ -1589,6 +2033,13 @@ export class RuntimeJournalTransaction {
       driverTurnRefDigest: input.driverTurnRefDigest,
       mode: input.mode,
       bindingDigest: input.bindingDigest,
+      deliveryId: preimage.deliveryId,
+      attempt: preimage.attempt,
+      invocationId: preimage.invocationId,
+      invocationGeneration: preimage.invocationGeneration,
+      permitId: preimage.permitId,
+      runtimeWriteId: preimage.runtimeWriteId,
+      visibilityEventId: preimage.visibilityEventId,
       expected: input.expected,
       next: input.next,
     });
@@ -1607,8 +2058,10 @@ export class RuntimeJournalTransaction {
              protocol_turn_id, launch_id, state_instance_id, session_id,
              root_producer_fact_id, input_ordinal, driver_turn_ref_digest,
              mode, expected_turn_id, state, binding_digest, steerable,
+             delivery_id, attempt, invocation_id, invocation_generation,
+             permit_id, runtime_write_id, visibility_event_id,
              operation_digest, queued_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ordinary', NULL, 'write_started', ?, 0, ?, ?, ?)`,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ordinary', NULL, 'write_started', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             input.protocolTurnId,
             input.launchId,
@@ -1618,6 +2071,13 @@ export class RuntimeJournalTransaction {
             input.inputOrdinal,
             input.driverTurnRefDigest,
             input.bindingDigest,
+            preimage.deliveryId,
+            preimage.attempt,
+            preimage.invocationId,
+            preimage.invocationGeneration,
+            preimage.permitId,
+            preimage.runtimeWriteId,
+            preimage.visibilityEventId,
             operationDigest,
             input.recordedAt,
             input.recordedAt,
@@ -1641,11 +2101,20 @@ export class RuntimeJournalTransaction {
         `UPDATE local_turns
          SET mode = 'steer', expected_turn_id = protocol_turn_id,
              input_ordinal = ?, state = 'write_started', binding_digest = ?,
-             steerable = 0, operation_digest = ?, updated_at = ?
+             steerable = 0, delivery_id = ?, attempt = ?, invocation_id = ?,
+             invocation_generation = ?, permit_id = ?, runtime_write_id = ?,
+             visibility_event_id = ?, operation_digest = ?, updated_at = ?
          WHERE protocol_turn_id = ?`,
         [
           input.inputOrdinal,
           input.bindingDigest,
+          preimage.deliveryId,
+          preimage.attempt,
+          preimage.invocationId,
+          preimage.invocationGeneration,
+          preimage.permitId,
+          preimage.runtimeWriteId,
+          preimage.visibilityEventId,
           operationDigest,
           input.recordedAt,
           input.protocolTurnId,
@@ -1701,9 +2170,12 @@ export class RuntimeJournalTransaction {
       if (occupied.operation_digest === operationDigest) {
         const row = this.#turnRow(input.event.turnId);
         if (row === undefined) storageFail("ACTIVE_TURN_CONFLICT", input.event.turnId);
+        // An exact replay returns the current authoritative cursor pair from
+        // the same reader-fenced row, not oldInput.ordinal + 1.
         return {
           applied: false,
           nextOrdinal: cursor.next_ordinal,
+          lastEventDigest: cursor.last_event_digest,
           durable: this.#durableTurnState(row),
         };
       }
@@ -1772,7 +2244,12 @@ export class RuntimeJournalTransaction {
     ) {
       storageFail("ACTIVE_TURN_CONFLICT", input.event.turnId);
     }
-    return { applied: true, nextOrdinal: input.event.ordinal + 1, durable };
+    return {
+      applied: true,
+      nextOrdinal: input.event.ordinal + 1,
+      lastEventDigest: input.event.eventDigest,
+      durable,
+    };
   }
 
   commitTurnTerminal(input: CommitTurnTerminalInput): TurnStepResult {
@@ -1970,9 +2447,12 @@ export class RuntimeJournalTransaction {
       // must alias even after the attempt legally advanced to consumed, so the
       // first-insert-only predecessor gates below never run on this path.
       if (existing.operation_digest === operationDigest) {
+        // An exact replay returns the current authoritative cursor pair from
+        // the same reader-fenced row, not oldInput.ordinal + 1.
         return {
           applied: false,
           nextOrdinal: cursor.next_ordinal,
+          lastEventDigest: cursor.last_event_digest,
           durable: this.#durableTurnState(row),
         };
       }
@@ -2078,7 +2558,12 @@ export class RuntimeJournalTransaction {
     if (durable.replyCommitted !== true || durable.phase !== "completed") {
       storageFail("ACTIVE_TURN_CONFLICT", input.expected.protocolTurnId);
     }
-    return { applied: true, nextOrdinal, durable };
+    return {
+      applied: true,
+      nextOrdinal,
+      lastEventDigest: input.basis.completed.eventDigest,
+      durable,
+    };
   }
 
   settleTurnContribution(input: SettleTurnContributionInput): TurnMutationResult {
@@ -2156,6 +2641,247 @@ export class RuntimeJournalTransaction {
       storageFail("ACTIVE_TURN_CONFLICT", input.protocolTurnId);
     }
     return this.#durableTurnState(row);
+  }
+
+  /**
+   * Pure recovery read. Selects the session's single admitted active
+   * contribution and, before returning even a basis-free hold, requires the
+   * persisted seven-member admission set non-null and valid, the full stored
+   * delivery/attempt/fence join, the authenticated source join, the SSOT
+   * binding recomputation, and the exact contiguous current-generation entry
+   * prefix at the native state's depth. The closed disposition is the frozen
+   * v0.7 Cartesian matrix; stable errors are never converted into a union
+   * member or null. Zero mutation on every path.
+   */
+  readTurnRecovery(input: TurnReaderFence): TurnRecoveryReadResult | null {
+    const cursor = this.#requireTurnReaderFence(input);
+    const candidates = all<{
+      protocol_turn_id: string;
+      launch_id: string;
+      state_instance_id: string;
+      session_id: string;
+      root_producer_fact_id: string;
+      input_ordinal: number;
+      driver_turn_ref_digest: string;
+      mode: string;
+      expected_turn_id: string | null;
+      state: string;
+      binding_digest: string | null;
+      delivery_id: string | null;
+      attempt: number | null;
+      invocation_id: string | null;
+      invocation_generation: number | null;
+      permit_id: string | null;
+      runtime_write_id: string | null;
+      visibility_event_id: string | null;
+    }>(
+      this.#database,
+      `SELECT protocol_turn_id, launch_id, state_instance_id, session_id,
+              root_producer_fact_id, input_ordinal, driver_turn_ref_digest,
+              mode, expected_turn_id, state, binding_digest, delivery_id,
+              attempt, invocation_id, invocation_generation, permit_id,
+              runtime_write_id, visibility_event_id
+       FROM local_turns
+       WHERE session_id = ?
+         AND state IN ('write_started', 'input_written', 'model_visible', 'ambiguous')`,
+      [input.sessionId],
+    );
+    // local queued is pre-admission and never an active contribution
+    // candidate; with no admitted candidate this is the null/no-active path.
+    if (candidates.length === 0) return null;
+    if (candidates.length > 1) {
+      storageFail("ACTIVE_TURN_CONFLICT", input.sessionId);
+    }
+    const row = candidates[0] as (typeof candidates)[number];
+    if (row.state_instance_id !== input.stateInstanceId) {
+      storageFail("ACTIVE_TURN_CONFLICT", row.protocol_turn_id);
+    }
+    // Persisted admission set: all seven non-null. An all-null legacy
+    // (pre-0003) or tampered partial-null admitted-active row is unavailable,
+    // never a hold, replay, or null.
+    if (
+      row.delivery_id === null ||
+      row.attempt === null ||
+      row.invocation_id === null ||
+      row.invocation_generation === null ||
+      row.permit_id === null ||
+      row.runtime_write_id === null ||
+      row.visibility_event_id === null
+    ) {
+      storageFail("TURN_RECOVERY_UNAVAILABLE", row.protocol_turn_id);
+    }
+    const preimage = admissionPreimage({
+      deliveryId: row.delivery_id as DeliveryId,
+      attempt: Number(row.attempt),
+      invocationId: row.invocation_id as CommandId,
+      invocationGeneration: Number(row.invocation_generation),
+      permitId: row.permit_id as CommandId,
+      runtimeWriteId: row.runtime_write_id as CommandId,
+      visibilityEventId: row.visibility_event_id as CommandId,
+    });
+    try {
+      assertAdmissionPreimage(preimage);
+    } catch {
+      storageFail("WRITE_STARTED_BINDING_MISMATCH", row.protocol_turn_id);
+    }
+    const attemptRow = one<{
+      fence_json: string;
+      state: string;
+      launch_id: string | null;
+      state_instance_id: string | null;
+      session_id: string | null;
+      permit_id: string | null;
+      invocation_generation: number | null;
+      invocation_id: string | null;
+      body_digest: string | null;
+    }>(
+      this.#database,
+      `SELECT fence_json, state, launch_id, state_instance_id, session_id,
+              permit_id, invocation_generation, invocation_id, body_digest
+       FROM native_attempts WHERE delivery_id = ? AND attempt = ?`,
+      [preimage.deliveryId, preimage.attempt],
+    );
+    if (attemptRow === undefined) {
+      storageFail("STALE_DELIVERY_FENCE", preimage.deliveryId);
+    }
+    let storedFence: DeliveryFence;
+    try {
+      storedFence = JSON.parse(attemptRow.fence_json) as DeliveryFence;
+    } catch {
+      return storageFail("STALE_DELIVERY_FENCE", preimage.deliveryId);
+    }
+    if (
+      storedFence.deliveryId !== preimage.deliveryId ||
+      storedFence.attempt !== preimage.attempt ||
+      storedFence.turnId !== row.protocol_turn_id ||
+      storedFence.producerFactId !== row.root_producer_fact_id ||
+      storedFence.launchId !== row.launch_id ||
+      storedFence.sessionId !== row.session_id ||
+      attemptRow.state_instance_id !== row.state_instance_id ||
+      attemptRow.session_id !== row.session_id ||
+      attemptRow.launch_id !== row.launch_id
+    ) {
+      storageFail("STALE_DELIVERY_FENCE", preimage.deliveryId);
+    }
+    if (
+      (attemptRow.permit_id !== null && attemptRow.permit_id !== preimage.permitId) ||
+      (attemptRow.invocation_id !== null &&
+        attemptRow.invocation_id !== preimage.invocationId) ||
+      (attemptRow.invocation_generation !== null &&
+        Number(attemptRow.invocation_generation) !== preimage.invocationGeneration)
+    ) {
+      storageFail("STALE_DELIVERY_FENCE", preimage.deliveryId);
+    }
+    const sourceMessageId = this.#requireAuthenticatedSourceMessage(
+      preimage.deliveryId,
+      preimage.attempt,
+      {
+        launchId: row.launch_id as LaunchId,
+        stateInstanceId: row.state_instance_id as StateInstanceId,
+        sessionId: row.session_id as SessionId,
+        turnId: row.protocol_turn_id as TurnId,
+        producerFactId: row.root_producer_fact_id as ProducerFactId,
+      },
+    );
+    let recomputedBindingDigest: ArtifactDigest;
+    try {
+      recomputedBindingDigest = buildContributionBinding({
+        fence: storedFence,
+        stateInstanceId: row.state_instance_id as StateInstanceId,
+        inputOrdinal: Number(row.input_ordinal),
+        invocationId: preimage.invocationId,
+        invocationGeneration: preimage.invocationGeneration,
+        permitId: preimage.permitId,
+        runtimeWriteId: preimage.runtimeWriteId,
+        visibilityEventId: preimage.visibilityEventId,
+      }).contributionBindingDigest;
+    } catch {
+      return storageFail("WRITE_STARTED_BINDING_MISMATCH", row.protocol_turn_id);
+    }
+    if (row.binding_digest === null || recomputedBindingDigest !== row.binding_digest) {
+      storageFail("WRITE_STARTED_BINDING_MISMATCH", row.protocol_turn_id);
+    }
+    // Native-attempt axis, validated independently first. Any recovery-active
+    // pairing outside the closed matrix (including pre_permit_disconnect,
+    // not_written, suppressed, consumed) is an impossible Cartesian cell.
+    const DEPTHS: Record<string, 0 | 1 | 2 | 3 | 4> = {
+      accepted: 0,
+      permit_recorded: 1,
+      write_started: 2,
+      input_written: 3,
+      model_visible: 4,
+      ambiguous: 2,
+    };
+    const expectedDepth = DEPTHS[attemptRow.state];
+    if (expectedDepth === undefined) {
+      storageFail("INVALID_JOURNAL_CHAIN", {
+        deliveryId: preimage.deliveryId,
+        attempt: preimage.attempt,
+      });
+    }
+    this.#requireRecoveryEntryChain(
+      preimage.deliveryId,
+      preimage.attempt,
+      preimage.invocationGeneration,
+      attemptRow.fence_json,
+      preimage,
+      attemptRow.body_digest,
+      expectedDepth,
+    );
+    const impossibleCell = (): never =>
+      storageFail("INVALID_JOURNAL_CHAIN", {
+        deliveryId: preimage.deliveryId,
+        attempt: preimage.attempt,
+      });
+    if (row.state === "write_started") {
+      if (attemptRow.state === "ambiguous") {
+        return { kind: "held_ambiguous", reason: "ACTIVE_AMBIGUOUS" };
+      }
+      return { kind: "held_ambiguous", reason: "PRE_MODEL_VISIBLE_EFFECT_UNKNOWN" };
+    }
+    if (row.state === "input_written") {
+      if (attemptRow.state !== "model_visible") impossibleCell();
+      return { kind: "held_ambiguous", reason: "PRE_MODEL_VISIBLE_EFFECT_UNKNOWN" };
+    }
+    if (row.state === "ambiguous") {
+      if (attemptRow.state !== "ambiguous") impossibleCell();
+      return { kind: "held_ambiguous", reason: "ACTIVE_AMBIGUOUS" };
+    }
+    if (attemptRow.state !== "model_visible") impossibleCell();
+    const mode: TurnAdmissionMode =
+      row.mode === "steer"
+        ? { kind: "steer", expectedTurnId: row.expected_turn_id as TurnId }
+        : { kind: "ordinary" };
+    return {
+      kind: "replayable",
+      basis: {
+        fence: storedFence,
+        deliveryId: preimage.deliveryId,
+        attempt: preimage.attempt,
+        sourceMessageId,
+        protocolTurnId: row.protocol_turn_id as TurnId,
+        launchId: row.launch_id as LaunchId,
+        stateInstanceId: row.state_instance_id as StateInstanceId,
+        sessionId: row.session_id as SessionId,
+        rootProducerFactId: row.root_producer_fact_id as ProducerFactId,
+        inputOrdinal: Number(row.input_ordinal),
+        driverTurnRefDigest: row.driver_turn_ref_digest as ArtifactDigest,
+        mode,
+        invocationId: preimage.invocationId,
+        invocationGeneration: preimage.invocationGeneration,
+        permitId: preimage.permitId,
+        runtimeWriteId: preimage.runtimeWriteId,
+        visibilityEventId: preimage.visibilityEventId,
+        bindingDigest: row.binding_digest as ArtifactDigest,
+        durable: "model_visible",
+        attemptState: "model_visible",
+        entryChainDepth: 4,
+      },
+      cursor: {
+        nextOrdinal: cursor.next_ordinal,
+        lastEventDigest: cursor.last_event_digest,
+      },
+    };
   }
 
   readVisibleMessage(
@@ -2621,96 +3347,10 @@ export class RuntimeJournalTransaction {
     storageFail("ACTIVE_TURN_CONFLICT", input.protocolTurnId);
   }
 
-  claimDriverEventReader(input: DriverEventReaderClaim): { readerEpoch: number } {
-    assertProtocolId(input.stateInstanceId, "sti");
-    assertProtocolId(input.sessionId, "ses");
-    assertArtifactDigest(input.ownerToken);
-    const existing = one<{
-      session_id: string;
-      reader_owner_token: string | null;
-      reader_epoch: number;
-    }>(
-      this.#database,
-      `SELECT session_id, reader_owner_token, reader_epoch FROM driver_event_cursor
-       WHERE state_instance_id = ?`,
-      [input.stateInstanceId],
-    );
-    if (existing === undefined) {
-      if (input.mode !== "start") {
-        storageFail(
-          input.mode === "resume" ? "DRIVER_EVENT_FENCE_MISMATCH" : "DRIVER_EVENT_READER_CONFLICT",
-          input.stateInstanceId,
-        );
-      }
-      run(
-        this.#database,
-        `INSERT INTO driver_event_cursor (
-           state_instance_id, session_id, next_ordinal, reader_owner_token,
-           reader_epoch, updated_at
-         ) VALUES (?, ?, 0, ?, 1, ?)`,
-        [input.stateInstanceId, input.sessionId, input.ownerToken, input.claimedAt],
-      );
-      return { readerEpoch: 1 };
-    }
-    if (existing.session_id !== input.sessionId) {
-      storageFail("DRIVER_EVENT_READER_CONFLICT", input.stateInstanceId);
-    }
-    if (input.mode !== "resume") {
-      storageFail("DRIVER_EVENT_READER_CONFLICT", input.stateInstanceId);
-    }
-    if (existing.reader_owner_token !== null) {
-      storageFail("DRIVER_RESUME_OVERLAP", input.stateInstanceId);
-    }
-    const nextEpoch = Number(existing.reader_epoch) + 1;
-    const result = run(
-      this.#database,
-      `UPDATE driver_event_cursor
-       SET reader_owner_token = ?, reader_epoch = ?, updated_at = ?
-       WHERE state_instance_id = ? AND session_id = ? AND reader_owner_token IS NULL
-         AND reader_epoch = ?`,
-      [
-        input.ownerToken,
-        nextEpoch,
-        input.claimedAt,
-        input.stateInstanceId,
-        input.sessionId,
-        existing.reader_epoch,
-      ],
-    );
-    if (Number(result.changes) !== 1) storageFail("DRIVER_RESUME_OVERLAP", input.stateInstanceId);
-    return { readerEpoch: nextEpoch };
-  }
-
-  releaseDriverEventReader(input: {
-    stateInstanceId: StateInstanceId;
-    sessionId: SessionId;
-    ownerToken: ArtifactDigest;
-    readerEpoch: number;
-    releasedAt: string;
-  }): void {
-    assertProtocolId(input.stateInstanceId, "sti");
-    assertProtocolId(input.sessionId, "ses");
-    assertArtifactDigest(input.ownerToken);
-    if (!Number.isSafeInteger(input.readerEpoch) || input.readerEpoch < 1) {
-      storageFail("DRIVER_EVENT_FENCE_MISMATCH", input.stateInstanceId);
-    }
-    const result = run(
-      this.#database,
-      `UPDATE driver_event_cursor SET reader_owner_token = NULL, updated_at = ?
-       WHERE state_instance_id = ? AND session_id = ? AND reader_owner_token = ?
-         AND reader_epoch = ?`,
-      [
-        input.releasedAt,
-        input.stateInstanceId,
-        input.sessionId,
-        input.ownerToken,
-        input.readerEpoch,
-      ],
-    );
-    if (Number(result.changes) !== 1) {
-      storageFail("DRIVER_EVENT_FENCE_MISMATCH", input.stateInstanceId);
-    }
-  }
+  // The public claim/release entry points moved to the machine-lock-owning
+  // DaemonJournal receiver (direct methods proving the current machine lock
+  // and the hidden per-open journal generation). Turn mutations remain
+  // transaction methods behind #requireTurnReaderFence.
 
   commitDriverEvent(input: CommitDriverEventInput): { applied: boolean; nextOrdinal: number } {
     assertProtocolId(input.stateInstanceId, "sti");

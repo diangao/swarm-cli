@@ -54,7 +54,7 @@ function openJournal(): DaemonJournal {
   const path = join(root, "swarm-storage-test-runtime.sqlite");
   const journal = DaemonJournal.open(path);
   journalPaths.set(journal, path);
-  assert.deepEqual(journal.migrate().map((item) => item.version), ["0001", "0002"]);
+  assert.deepEqual(journal.migrate().map((item) => item.version), ["0001", "0002", "0003"]);
   return journal;
 }
 
@@ -488,27 +488,27 @@ test("one event reader owns a cursor; identity and temporal errors stay separate
   const journal = openJournal();
   const owner = digest({ pump: 1 });
   const replacement = digest({ pump: 2 });
-  assert.deepEqual(journal.transaction((transaction) => transaction.claimDriverEventReader({
+  assert.deepEqual(journal.claimDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: owner,
     mode: "start",
     claimedAt: "2026-08-09T07:00:00.000Z",
-  })), { readerEpoch: 1 });
-  assert.equal(storageCode(() => journal.transaction((transaction) => transaction.claimDriverEventReader({
+  }), { readerEpoch: 1, nextOrdinal: 0, lastEventDigest: null });
+  assert.equal(storageCode(() => journal.claimDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: replacement,
-    mode: "subscribe",
+    mode: "start",
     claimedAt: "2026-08-09T07:00:01.000Z",
-  }))), "DRIVER_EVENT_READER_CONFLICT");
-  assert.equal(storageCode(() => journal.transaction((transaction) => transaction.claimDriverEventReader({
+  })), "DRIVER_EVENT_READER_CONFLICT");
+  assert.equal(storageCode(() => journal.claimDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: replacement,
     mode: "resume",
     claimedAt: "2026-08-09T07:00:01.000Z",
-  }))), "DRIVER_RESUME_OVERLAP");
+  })), "DRIVER_RESUME_OVERLAP");
 
   const first = {
     stateInstanceId,
@@ -549,27 +549,27 @@ test("one event reader owns a cursor; identity and temporal errors stay separate
     eventDigest: digest({ event: 3 }),
   }))), "DRIVER_EVENT_ORDER_INVALID");
 
-  journal.transaction((transaction) => transaction.releaseDriverEventReader({
+  journal.releaseDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: owner,
     readerEpoch: 1,
     releasedAt: "2026-08-09T07:00:03.000Z",
-  }));
-  assert.equal(storageCode(() => journal.transaction((transaction) => transaction.claimDriverEventReader({
+  });
+  assert.equal(storageCode(() => journal.claimDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: replacement,
-    mode: "subscribe",
+    mode: "start",
     claimedAt: "2026-08-09T07:00:03.500Z",
-  }))), "DRIVER_EVENT_READER_CONFLICT");
-  assert.deepEqual(journal.transaction((transaction) => transaction.claimDriverEventReader({
+  })), "DRIVER_EVENT_READER_CONFLICT");
+  assert.deepEqual(journal.claimDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: replacement,
     mode: "resume",
     claimedAt: "2026-08-09T07:00:04.000Z",
-  })), { readerEpoch: 2 });
+  }), { readerEpoch: 2, nextOrdinal: 2, lastEventDigest: digest({ event: 1 }) });
   journal.close();
 });
 
@@ -578,22 +578,22 @@ test("state-instance reader ownership binds one immutable session with zero conf
   const sessionB = id("ses", "b") as SessionId;
   const ownerA = digest({ pump: "state-owner-a" });
   const ownerB = digest({ pump: "state-owner-b" });
-  assert.deepEqual(journal.transaction((transaction) => transaction.claimDriverEventReader({
+  assert.deepEqual(journal.claimDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: ownerA,
     mode: "start",
     claimedAt: "2026-08-09T07:10:00.000Z",
-  })), { readerEpoch: 1 });
+  }), { readerEpoch: 1, nextOrdinal: 0, lastEventDigest: null });
   const ownedRows = driverEventRows(journal);
 
-  assert.equal(storageCode(() => journal.transaction((transaction) => transaction.claimDriverEventReader({
+  assert.equal(storageCode(() => journal.claimDriverEventReader({
     stateInstanceId,
     sessionId: sessionB,
     ownerToken: ownerB,
     mode: "start",
     claimedAt: "2026-08-09T07:10:01.000Z",
-  }))), "DRIVER_EVENT_READER_CONFLICT");
+  })), "DRIVER_EVENT_READER_CONFLICT");
   assert.equal(driverEventRows(journal), ownedRows);
   assert.equal(storageCode(() => journal.transaction((transaction) => transaction.commitDriverEvent({
     stateInstanceId,
@@ -621,36 +621,36 @@ test("state-instance reader ownership binds one immutable session with zero conf
 test("stale reader epochs cannot release or commit when an owner token is reused", () => {
   const journal = openJournal();
   const reusedOwner = digest({ pump: "reused-owner" });
-  assert.deepEqual(journal.transaction((transaction) => transaction.claimDriverEventReader({
+  assert.deepEqual(journal.claimDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: reusedOwner,
     mode: "start",
     claimedAt: "2026-08-09T07:20:00.000Z",
-  })), { readerEpoch: 1 });
-  journal.transaction((transaction) => transaction.releaseDriverEventReader({
+  }), { readerEpoch: 1, nextOrdinal: 0, lastEventDigest: null });
+  journal.releaseDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: reusedOwner,
     readerEpoch: 1,
     releasedAt: "2026-08-09T07:20:01.000Z",
-  }));
-  assert.deepEqual(journal.transaction((transaction) => transaction.claimDriverEventReader({
+  });
+  assert.deepEqual(journal.claimDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: reusedOwner,
     mode: "resume",
     claimedAt: "2026-08-09T07:20:02.000Z",
-  })), { readerEpoch: 2 });
+  }), { readerEpoch: 2, nextOrdinal: 0, lastEventDigest: null });
   const epochTwoRows = driverEventRows(journal);
 
-  assert.equal(storageCode(() => journal.transaction((transaction) => transaction.releaseDriverEventReader({
+  assert.equal(storageCode(() => journal.releaseDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: reusedOwner,
     readerEpoch: 1,
     releasedAt: "2026-08-09T07:20:03.000Z",
-  }))), "DRIVER_EVENT_FENCE_MISMATCH");
+  })), "DRIVER_EVENT_FENCE_MISMATCH");
   assert.equal(driverEventRows(journal), epochTwoRows);
   assert.equal(storageCode(() => journal.transaction((transaction) => transaction.commitDriverEvent({
     stateInstanceId,
@@ -672,13 +672,13 @@ test("stale reader epochs cannot release or commit when an owner token is reused
     eventDigest: digest({ event: "current-epoch" }),
     recordedAt: "2026-08-09T07:20:05.000Z",
   })), { applied: true, nextOrdinal: 1 });
-  journal.transaction((transaction) => transaction.releaseDriverEventReader({
+  journal.releaseDriverEventReader({
     stateInstanceId,
     sessionId,
     ownerToken: reusedOwner,
     readerEpoch: 2,
     releasedAt: "2026-08-09T07:20:06.000Z",
-  }));
+  });
   journal.close();
 });
 
@@ -1239,21 +1239,34 @@ test("consumed refuses a completion row that no longer matches journal truth", (
 });
 
 const turnOwner = digest({ turnPump: 1 });
-const turnBinding = digest({ turnBinding: 1 });
+// The local binding digest is the real SSOT contribution digest over the
+// seeded fence and the seven persisted admission members; admission recomputes
+// and enforces it, so the fixture must carry the true value.
+function contributionDigest(inputOrdinal: number): ArtifactDigest {
+  return buildContributionBinding({
+    fence,
+    stateInstanceId,
+    inputOrdinal,
+    invocationId: id("cmd", "a") as CommandId,
+    invocationGeneration: 1,
+    permitId: id("cmd", "b") as CommandId,
+    runtimeWriteId,
+    visibilityEventId,
+  }).contributionBindingDigest;
+}
+const turnBinding = contributionDigest(0);
 
 function turnFence(): { stateInstanceId: StateInstanceId; sessionId: SessionId; ownerToken: ArtifactDigest; readerEpoch: number } {
   return { stateInstanceId, sessionId, ownerToken: turnOwner, readerEpoch: 1 };
 }
 
 function claimTurnReader(journal: DaemonJournal): void {
-  journal.transaction((transaction) => {
-    transaction.claimDriverEventReader({
-      stateInstanceId,
-      sessionId,
-      ownerToken: turnOwner,
-      mode: "start",
-      claimedAt: "2026-08-09T07:00:00.100Z",
-    });
+  journal.claimDriverEventReader({
+    stateInstanceId,
+    sessionId,
+    ownerToken: turnOwner,
+    mode: "start",
+    claimedAt: "2026-08-09T07:00:00.100Z",
   });
 }
 
@@ -1286,6 +1299,13 @@ function beginInput(overrides: Record<string, unknown> = {}): never {
     driverTurnRefDigest: digest({ turnRef: 1 }),
     mode: { kind: "ordinary" },
     bindingDigest: turnBinding,
+    deliveryId,
+    attempt: 1,
+    invocationId: id("cmd", "a") as CommandId,
+    invocationGeneration: 1,
+    permitId: id("cmd", "b") as CommandId,
+    runtimeWriteId,
+    visibilityEventId,
     expected: null,
     next: durable("write_started"),
     recordedAt: "2026-08-09T07:00:00.200Z",
@@ -1437,10 +1457,21 @@ test("turn port replay aliases under new timestamps and refuses forged transitio
     transaction.commitTurnStep(stepInput(0, "input_written", "write_started", "model_visible")),
   )), "ACTIVE_TURN_CONFLICT");
   assert.equal(turnStateRows(journal), before);
+  // A caller-forged binding digest that does not reproduce from the stored
+  // fence and the seven persisted members fails the SSOT recompute before any
+  // mutation or operation-digest comparison.
   assert.equal(storageCode(() => journal.transaction((transaction) =>
     transaction.beginTurnContribution(beginInput({
       bindingDigest: digest({ turnBinding: 2 }),
       next: durable("write_started", { bindingDigest: digest({ turnBinding: 2 }) }),
+    })),
+  )), "WRITE_STARTED_BINDING_MISMATCH");
+  assert.equal(turnStateRows(journal), before);
+  // A genuinely divergent admission (recompute-consistent but a changed
+  // logical member) diverges the operation digest and conflicts zero-mutation.
+  assert.equal(storageCode(() => journal.transaction((transaction) =>
+    transaction.beginTurnContribution(beginInput({
+      driverTurnRefDigest: digest({ turnRef: 2 }),
     })),
   )), "ACTIVE_TURN_CONFLICT");
   assert.equal(turnStateRows(journal), before);
@@ -1876,8 +1907,9 @@ test("steer admission is whole-state guarded and settle repairs are closed", () 
     transaction.beginTurnContribution(beginInput({
       mode: { kind: "steer", expectedTurnId: turnId },
       inputOrdinal: 1,
+      bindingDigest: contributionDigest(1),
       expected: durable("model_visible", { steerable: true }),
-      next: durable("write_started", { inputOrdinal: 1 }),
+      next: durable("write_started", { inputOrdinal: 1, bindingDigest: contributionDigest(1) }),
     })),
   )), "ACTIVE_TURN_CONFLICT");
   assert.equal(turnStateRows(journal), before);
@@ -2196,5 +2228,454 @@ test("visible-message readback returns the exact ledger row for suppression rech
     modelVisibleReceiptId: id("rcp", "a") as ReceiptId,
     visibleAt: "2026-08-09T07:00:05.000Z",
   });
+  journal.close();
+});
+
+// ===========================================================================
+// Task #334 — fresh-process turn recovery precursor controls (frozen v0.7
+// contract): durable admission preimage, authenticated source join, closed
+// readTurnRecovery union, Cartesian phase/depth matrix, current-cursor
+// mutation watermarks, and legacy fail-closed discriminator.
+// ===========================================================================
+
+function rawUpdate(journal: DaemonJournal, sql: string, values: unknown[] = []): void {
+  const path = journalPaths.get(journal);
+  if (path === undefined) assert.fail("journal path is not registered");
+  const database = new DatabaseSync(path);
+  try {
+    database.prepare(sql).run(...(values as never[]));
+  } finally {
+    database.close();
+  }
+}
+
+function recoverySnapshot(journal: DaemonJournal): string {
+  return JSON.stringify({ turns: turnStateRows(journal), attempts: attemptRows(journal) });
+}
+
+function advanceToWriteStarted(journal: DaemonJournal): void {
+  const permit = boundEntry("permit_recorded", 1, null, {});
+  const started = boundEntry("write_started", 2, permit.entryDigest, {
+    inputDigest: bodyDigestGen1,
+  });
+  journal.transaction((transaction) => {
+    transaction.appendNativeInvocationEntry({ entry: permit });
+    transaction.transitionNativeAttempt(
+      transitionInput("accepted", "permit_recorded", { permitId: permit.permitId }),
+    );
+    transaction.appendNativeInvocationEntry({ entry: started });
+    transaction.transitionNativeAttempt(
+      transitionInput("permit_recorded", "write_started", {
+        invocationGeneration: 1,
+        invocationId: started.invocationId,
+        bodyDigest: bodyDigestGen1,
+      }),
+    );
+  });
+}
+
+test("recovery returns the exact replayable basis, cursor, and authenticated source", () => {
+  const journal = openJournal();
+  readyForTerminal(journal);
+  const result = journal.transaction((transaction) =>
+    transaction.readTurnRecovery(turnFence()),
+  );
+  assert.deepEqual(result, {
+    kind: "replayable",
+    basis: {
+      fence,
+      deliveryId,
+      attempt: 1,
+      sourceMessageId: messageId,
+      protocolTurnId: turnId,
+      launchId,
+      stateInstanceId,
+      sessionId,
+      rootProducerFactId: producerFactId,
+      inputOrdinal: 0,
+      driverTurnRefDigest: digest({ turnRef: 1 }),
+      mode: { kind: "ordinary" },
+      invocationId: id("cmd", "a") as CommandId,
+      invocationGeneration: 1,
+      permitId: id("cmd", "b") as CommandId,
+      runtimeWriteId,
+      visibilityEventId,
+      bindingDigest: turnBinding,
+      durable: "model_visible",
+      attemptState: "model_visible",
+      entryChainDepth: 4,
+    },
+    cursor: { nextOrdinal: 2, lastEventDigest: digest({ turnEvent: 1 }) },
+  });
+  // Pure read: byte-identical rows across the successful read.
+  const before = recoverySnapshot(journal);
+  journal.transaction((transaction) => transaction.readTurnRecovery(turnFence()));
+  assert.equal(recoverySnapshot(journal), before);
+  // Fresh-instance resume: replaying admission with the exact recovered
+  // members aliases applied:false with no double insert.
+  if (result?.kind !== "replayable") assert.fail("expected replayable");
+  const basis = result.basis;
+  assert.equal(journal.transaction((transaction) =>
+    transaction.beginTurnContribution(beginInput({
+      deliveryId: basis.deliveryId,
+      attempt: basis.attempt,
+      invocationId: basis.invocationId,
+      invocationGeneration: basis.invocationGeneration,
+      permitId: basis.permitId,
+      runtimeWriteId: basis.runtimeWriteId,
+      visibilityEventId: basis.visibilityEventId,
+      bindingDigest: basis.bindingDigest,
+    })),
+  ).applied, false);
+  assert.equal(recoverySnapshot(journal), before);
+  journal.close();
+});
+
+test("recovery holds are basis-free and follow the closed Cartesian matrix", () => {
+  // local write_started x native accepted / depth 0.
+  {
+    const journal = openJournal();
+    reserve(journal);
+    bindDelivery(journal);
+    claimTurnReader(journal);
+    journal.transaction((transaction) => {
+      transaction.beginTurnContribution(beginInput());
+    });
+    assert.deepEqual(journal.transaction((transaction) =>
+      transaction.readTurnRecovery(turnFence()),
+    ), { kind: "held_ambiguous", reason: "PRE_MODEL_VISIBLE_EFFECT_UNKNOWN" });
+    journal.close();
+  }
+  // local write_started x native ambiguous / depth 2 -> ACTIVE_AMBIGUOUS.
+  {
+    const journal = openJournal();
+    reserve(journal);
+    bindDelivery(journal);
+    claimTurnReader(journal);
+    advanceToWriteStarted(journal);
+    journal.transaction((transaction) => {
+      transaction.beginTurnContribution(beginInput());
+      transaction.transitionNativeAttempt(
+        transitionInput("write_started", "ambiguous", {
+          disconnectId: id("cmd", "d") as CommandId,
+        }),
+      );
+    });
+    assert.deepEqual(journal.transaction((transaction) =>
+      transaction.readTurnRecovery(turnFence()),
+    ), { kind: "held_ambiguous", reason: "ACTIVE_AMBIGUOUS" });
+    // local ambiguous x native ambiguous / depth 2 -> ACTIVE_AMBIGUOUS.
+    journal.transaction((transaction) => {
+      transaction.settleTurnContribution({
+        ...turnFence(),
+        protocolTurnId: turnId,
+        inputOrdinal: 0,
+        kind: "ambiguous",
+        expected: durable("write_started"),
+        next: durable("ambiguous"),
+        recordedAt: "2026-08-09T07:00:08.000Z",
+      } as never);
+    });
+    assert.deepEqual(journal.transaction((transaction) =>
+      transaction.readTurnRecovery(turnFence()),
+    ), { kind: "held_ambiguous", reason: "ACTIVE_AMBIGUOUS" });
+    journal.close();
+  }
+  // local input_written requires native model_visible / depth 4.
+  {
+    const journal = openJournal();
+    reserve(journal);
+    bindDelivery(journal);
+    claimTurnReader(journal);
+    advanceToModelVisible(journal);
+    journal.transaction((transaction) => {
+      transaction.beginTurnContribution(beginInput());
+      transaction.commitTurnStep(stepInput(0, "input_written", "write_started", "input_written"));
+    });
+    assert.deepEqual(journal.transaction((transaction) =>
+      transaction.readTurnRecovery(turnFence()),
+    ), { kind: "held_ambiguous", reason: "PRE_MODEL_VISIBLE_EFFECT_UNKNOWN" });
+    journal.close();
+  }
+  // Impossible cell: local model_visible x native input_written / depth 3
+  // fails closed and returns no union member.
+  {
+    const journal = openJournal();
+    reserve(journal);
+    bindDelivery(journal);
+    claimTurnReader(journal);
+    const permit = boundEntry("permit_recorded", 1, null, {});
+    const started = boundEntry("write_started", 2, permit.entryDigest, {
+      inputDigest: bodyDigestGen1,
+    });
+    const written = boundEntry("input_written", 3, started.entryDigest, {
+      runtimeWriteId,
+    });
+    journal.transaction((transaction) => {
+      transaction.appendNativeInvocationEntry({ entry: permit });
+      transaction.transitionNativeAttempt(
+        transitionInput("accepted", "permit_recorded", { permitId: permit.permitId }),
+      );
+      transaction.appendNativeInvocationEntry({ entry: started });
+      transaction.transitionNativeAttempt(
+        transitionInput("permit_recorded", "write_started", {
+          invocationGeneration: 1,
+          invocationId: started.invocationId,
+          bodyDigest: bodyDigestGen1,
+        }),
+      );
+      transaction.appendNativeInvocationEntry({ entry: written });
+      transaction.transitionNativeAttempt(
+        transitionInput("write_started", "input_written"),
+      );
+    });
+    journal.transaction((transaction) => {
+      transaction.beginTurnContribution(beginInput());
+      transaction.commitTurnStep(stepInput(0, "input_written", "write_started", "input_written"));
+      transaction.commitTurnStep(stepInput(1, "model_visible", "input_written", "model_visible"));
+    });
+    const before = recoverySnapshot(journal);
+    assert.equal(storageCode(() => journal.transaction((transaction) =>
+      transaction.readTurnRecovery(turnFence()),
+    )), "INVALID_JOURNAL_CHAIN");
+    assert.equal(recoverySnapshot(journal), before);
+    journal.close();
+  }
+});
+
+test("recovery null path covers queued pre-admission and terminal non-resurrection", () => {
+  {
+    const journal = openJournal();
+    reserve(journal);
+    bindDelivery(journal);
+    claimTurnReader(journal);
+    journal.transaction((transaction) => {
+      transaction.prepareTurn({
+        protocolTurnId: turnId,
+        launchId,
+        stateInstanceId,
+        sessionId,
+        rootProducerFactId: producerFactId,
+        inputOrdinal: 0,
+        driverTurnRefDigest: digest({ turnRef: 1 }),
+        mode: "ordinary",
+        queuedAt: "2026-08-09T07:00:00.150Z",
+      } as never);
+    });
+    assert.equal(journal.transaction((transaction) =>
+      transaction.readTurnRecovery(turnFence()),
+    ), null);
+    journal.close();
+  }
+  {
+    const journal = openJournal();
+    readyForTerminal(journal);
+    journal.transaction((transaction) => {
+      transaction.commitTurnTerminal(terminalInput());
+    });
+    const before = recoverySnapshot(journal);
+    assert.equal(journal.transaction((transaction) =>
+      transaction.readTurnRecovery(turnFence()),
+    ), null);
+    assert.equal(recoverySnapshot(journal), before);
+    journal.close();
+  }
+});
+
+test("recovery fails closed on stale readers, legacy rows, tampered members, and duplicates", () => {
+  const journal = openJournal();
+  readyForTerminal(journal);
+  const before = recoverySnapshot(journal);
+  // Wrong reader authority.
+  assert.equal(storageCode(() => journal.transaction((transaction) =>
+    transaction.readTurnRecovery({ ...turnFence(), readerEpoch: 9 }),
+  )), "DRIVER_EVENT_FENCE_MISMATCH");
+  // All-null legacy admission members.
+  rawUpdate(journal, `UPDATE local_turns SET delivery_id = NULL, attempt = NULL,
+    invocation_id = NULL, invocation_generation = NULL, permit_id = NULL,
+    runtime_write_id = NULL, visibility_event_id = NULL`);
+  assert.equal(storageCode(() => journal.transaction((transaction) =>
+    transaction.readTurnRecovery(turnFence()),
+  )), "TURN_RECOVERY_UNAVAILABLE");
+  journal.close();
+
+  // Partial-null tampered active row.
+  const partial = openJournal();
+  readyForTerminal(partial);
+  rawUpdate(partial, "UPDATE local_turns SET permit_id = NULL");
+  assert.equal(storageCode(() => partial.transaction((transaction) =>
+    transaction.readTurnRecovery(turnFence()),
+  )), "TURN_RECOVERY_UNAVAILABLE");
+  partial.close();
+
+  // Structurally corrupt member set (pairwise distinctness broken out of
+  // band) fails the wrapped recompute path, never an unhandled throw.
+  const corrupt = openJournal();
+  readyForTerminal(corrupt);
+  rawUpdate(corrupt, "UPDATE local_turns SET invocation_id = ?", [id("cmd", "b")]);
+  assert.equal(storageCode(() => corrupt.transaction((transaction) =>
+    transaction.readTurnRecovery(turnFence()),
+  )), "WRITE_STARTED_BINDING_MISMATCH");
+  corrupt.close();
+
+  // A divergent persisted member with a consistently recomputed binding still
+  // fails: the stored chain must equal the persisted admission facts.
+  const diverged = openJournal();
+  readyForTerminal(diverged);
+  const forgedBinding = buildContributionBinding({
+    fence,
+    stateInstanceId,
+    inputOrdinal: 0,
+    invocationId: id("cmd", "a") as CommandId,
+    invocationGeneration: 1,
+    permitId: id("cmd", "b") as CommandId,
+    runtimeWriteId: id("cmd", "x") as CommandId,
+    visibilityEventId,
+  }).contributionBindingDigest;
+  rawUpdate(diverged, "UPDATE local_turns SET runtime_write_id = ?, binding_digest = ?", [
+    id("cmd", "x"),
+    forgedBinding,
+  ]);
+  assert.equal(storageCode(() => diverged.transaction((transaction) =>
+    transaction.readTurnRecovery(turnFence()),
+  )), "WRITE_STARTED_BINDING_MISMATCH");
+  diverged.close();
+
+  // Duplicate active candidates (partial unique index neutralized in-test).
+  const dup = openJournal();
+  readyForTerminal(dup);
+  rawUpdate(dup, "DROP INDEX local_turns_one_active_per_session");
+  rawUpdate(dup, `INSERT INTO local_turns (
+      protocol_turn_id, launch_id, state_instance_id, session_id,
+      root_producer_fact_id, input_ordinal, driver_turn_ref_digest, mode,
+      expected_turn_id, state, binding_digest, steerable, delivery_id, attempt,
+      invocation_id, invocation_generation, permit_id, runtime_write_id,
+      visibility_event_id, operation_digest, queued_at, updated_at
+    ) SELECT ?, launch_id, state_instance_id, session_id,
+      root_producer_fact_id, input_ordinal, driver_turn_ref_digest, mode,
+      expected_turn_id, state, binding_digest, steerable, delivery_id, attempt,
+      invocation_id, invocation_generation, permit_id, runtime_write_id,
+      visibility_event_id, operation_digest, queued_at, updated_at
+    FROM local_turns WHERE protocol_turn_id = ?`, [id("trn", "b"), turnId]);
+  assert.equal(storageCode(() => dup.transaction((transaction) =>
+    transaction.readTurnRecovery(turnFence()),
+  )), "ACTIVE_TURN_CONFLICT");
+  dup.close();
+  void before;
+});
+
+test("source join authenticates the stored delivery row at admission and recovery", () => {
+  const mutations: readonly [string, unknown[]][] = [
+    ["UPDATE pending_deliveries SET message_id = ?", [id("msg", "x")]],
+    ["UPDATE pending_deliveries SET envelope_digest = ?", [digest({ forged: "envelope" })]],
+    ["UPDATE pending_deliveries SET target_key = 'forged-target-key'", []],
+    ["UPDATE pending_deliveries SET server_seq = 99", []],
+    ["UPDATE pending_deliveries SET expected_launch_id = NULL", []],
+  ];
+  for (const [sql, values] of mutations) {
+    // Recovery path.
+    const journal = openJournal();
+    readyForTerminal(journal);
+    rawUpdate(journal, sql, values);
+    const before = recoverySnapshot(journal);
+    assert.equal(storageCode(() => journal.transaction((transaction) =>
+      transaction.readTurnRecovery(turnFence()),
+    )), "STALE_DELIVERY_FENCE");
+    assert.equal(recoverySnapshot(journal), before);
+    journal.close();
+    // Admission path.
+    const admit = openJournal();
+    reserve(admit);
+    bindDelivery(admit);
+    claimTurnReader(admit);
+    rawUpdate(admit, sql, values);
+    const admitBefore = recoverySnapshot(admit);
+    assert.equal(storageCode(() => admit.transaction((transaction) =>
+      transaction.beginTurnContribution(beginInput()),
+    )), "STALE_DELIVERY_FENCE");
+    assert.equal(recoverySnapshot(admit), admitBefore);
+    admit.close();
+  }
+});
+
+test("admission requires the exact stored delivery, attempt, and member joins", () => {
+  // Missing attempt row.
+  {
+    const journal = openJournal();
+    reserve(journal);
+    claimTurnReader(journal);
+    const before = recoverySnapshot(journal);
+    assert.equal(storageCode(() => journal.transaction((transaction) =>
+      transaction.beginTurnContribution(beginInput()),
+    )), "STALE_DELIVERY_FENCE");
+    assert.equal(recoverySnapshot(journal), before);
+    journal.close();
+  }
+  // Attempt-row invocation member divergence.
+  {
+    const journal = openJournal();
+    reserve(journal);
+    bindDelivery(journal);
+    claimTurnReader(journal);
+    advanceToModelVisible(journal);
+    const before = recoverySnapshot(journal);
+    const divergentBinding = buildContributionBinding({
+      fence,
+      stateInstanceId,
+      inputOrdinal: 0,
+      invocationId: id("cmd", "x") as CommandId,
+      invocationGeneration: 1,
+      permitId: id("cmd", "b") as CommandId,
+      runtimeWriteId,
+      visibilityEventId,
+    }).contributionBindingDigest;
+    assert.equal(storageCode(() => journal.transaction((transaction) =>
+      transaction.beginTurnContribution(beginInput({
+        invocationId: id("cmd", "x") as CommandId,
+        bindingDigest: divergentBinding,
+        next: durable("write_started", { bindingDigest: divergentBinding }),
+      })),
+    )), "STALE_DELIVERY_FENCE");
+    assert.equal(recoverySnapshot(journal), before);
+    journal.close();
+  }
+  // Pairwise distinctness violation fails before any join or mutation.
+  {
+    const journal = openJournal();
+    reserve(journal);
+    bindDelivery(journal);
+    claimTurnReader(journal);
+    const before = recoverySnapshot(journal);
+    assert.equal(storageCode(() => journal.transaction((transaction) =>
+      transaction.beginTurnContribution(beginInput({
+        invocationId: id("cmd", "b") as CommandId,
+      })),
+    )), "INVALID_STATE_TRANSITION");
+    assert.equal(recoverySnapshot(journal), before);
+    journal.close();
+  }
+});
+
+test("exact step and terminal replays return the current authoritative cursor pair", () => {
+  const journal = openJournal();
+  readyForTerminal(journal);
+  assert.deepEqual(journal.transaction((transaction) => {
+    const result = transaction.commitTurnTerminal(terminalInput());
+    return { applied: result.applied, nextOrdinal: result.nextOrdinal, lastEventDigest: result.lastEventDigest };
+  }), { applied: true, nextOrdinal: 4, lastEventDigest: digest({ turnEvent: "completed" }) });
+  // Old exact step replay after later ordinals returns the LATER cursor.
+  const stepReplay = journal.transaction((transaction) =>
+    transaction.commitTurnStep(stepInput(0, "input_written", "write_started", "input_written")),
+  );
+  assert.equal(stepReplay.applied, false);
+  assert.equal(stepReplay.nextOrdinal, 4);
+  assert.equal(stepReplay.lastEventDigest, digest({ turnEvent: "completed" }));
+  // Old exact terminal replay does the same.
+  const terminalReplay = journal.transaction((transaction) =>
+    transaction.commitTurnTerminal(terminalInput({ recordedAt: "2026-08-09T09:59:59.000Z" })),
+  );
+  assert.equal(terminalReplay.applied, false);
+  assert.equal(terminalReplay.nextOrdinal, 4);
+  assert.equal(terminalReplay.lastEventDigest, digest({ turnEvent: "completed" }));
   journal.close();
 });
