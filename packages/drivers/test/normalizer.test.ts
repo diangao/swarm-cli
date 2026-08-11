@@ -232,3 +232,54 @@ test("driver stream accepts one visible reply and completion", () => {
   normalizer.accept({ kind: "turn_completed", turnId });
   normalizer.finish();
 });
+
+test("retained turn prefix finalization accepts legal cuts without weakening full-stream finish", () => {
+  const expectation = {
+    expectedTurnId: turnId,
+    expectedBindingDigest: `sha256:${"8".repeat(64)}` as ArtifactDigest,
+    expectedResolvedWaiterId: commandId,
+    expectedSourceMessageId: messageId,
+  };
+
+  const empty = DriverEventStreamNormalizer.fromDurableModelVisible(expectation);
+  assert.equal(empty.finishRetainedTurnPrefix(), "active");
+  assert.equal(driverCode(() => empty.finish()), "DRIVER_EVENT_ORDER_INVALID");
+
+  const boundary = DriverEventStreamNormalizer.fromDurableModelVisible(expectation);
+  boundary.accept({
+    kind: "turn_boundary",
+    turnId,
+    boundary: "tool",
+    steerable: true,
+  });
+  assert.equal(boundary.finishRetainedTurnPrefix(), "active");
+  assert.equal(driverCode(() => boundary.finish()), "DRIVER_EVENT_ORDER_INVALID");
+
+  const reply = DriverEventStreamNormalizer.fromDurableModelVisible(expectation);
+  reply.accept({ kind: "assistant_reply", turnId, text: "Retained reply." });
+  assert.equal(reply.finishRetainedTurnPrefix(), "active");
+  assert.equal(driverCode(() => reply.finish()), "DRIVER_EVENT_ORDER_INVALID");
+
+  const coordination = DriverEventStreamNormalizer.fromDurableModelVisible(expectation);
+  coordination.accept({ kind: "assistant_reply", turnId, text: "Retained reply." });
+  coordination.accept({
+    kind: "coordination_call",
+    turnId,
+    commandId,
+    command: { protocolVersion: version, title: "Follow up", sourceMessageId: messageId },
+  });
+  assert.equal(coordination.finishRetainedTurnPrefix(), "active");
+  assert.equal(driverCode(() => coordination.finish()), "DRIVER_EVENT_ORDER_INVALID");
+
+  const completed = DriverEventStreamNormalizer.fromDurableModelVisible(expectation);
+  completed.accept({ kind: "assistant_reply", turnId, text: "Retained reply." });
+  completed.accept({ kind: "turn_completed", turnId });
+  assert.equal(completed.finishRetainedTurnPrefix(), "completed");
+  assert.doesNotThrow(() => completed.finish());
+
+  const ordinary = new DriverEventStreamNormalizer();
+  assert.equal(
+    driverCode(() => ordinary.finishRetainedTurnPrefix()),
+    "DRIVER_EVENT_ORDER_INVALID",
+  );
+});
