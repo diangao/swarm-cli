@@ -195,7 +195,132 @@ test("retained replay validates the whole finite suffix before yielding and clos
   assert.equal(releases, 1);
 });
 
-test("wrong source, waiter, binding, gap, and incomplete suffix fail before first yield", async (t) => {
+test("retained replay accepts legal finite prefixes at the frozen snapshot head", async (t) => {
+  const cases: Array<[
+    string,
+    readonly DriverEventObservation["event"][],
+    readonly RetainedDriverEventRecord["event"]["kind"][],
+  ]> = [
+    ["empty", [], []],
+    ["boundary", [{
+      kind: "turn_boundary",
+      turnId,
+      boundary: "tool",
+      steerable: true,
+    }], ["turn_boundary"]],
+    ["reply", [{
+      kind: "assistant_reply",
+      turnId,
+      text: "private reply marker",
+    }], ["assistant_reply"]],
+    ["reply and coordination", [{
+      kind: "assistant_reply",
+      turnId,
+      text: "private reply marker",
+    }, {
+      kind: "coordination_call",
+      turnId,
+      commandId: id("cmd", "f") as CommandId,
+      command: {
+        protocolVersion: version,
+        title: "Follow up",
+        sourceMessageId,
+      },
+    }], ["assistant_reply", "coordination_call"]],
+    ["completed", [{
+      kind: "assistant_reply",
+      turnId,
+      text: "private reply marker",
+    }, {
+      kind: "turn_completed",
+      turnId,
+    }], ["assistant_reply", "turn_completed"]],
+  ];
+
+  for (const [name, events, kinds] of cases) {
+    await t.test(name, async () => {
+      const retention = new MemoryRetention();
+      const live = await retention.claim(attempt());
+      const records = events.map((event) => retention.appendPrepared(
+        live,
+        retention.prepareAppend(live, observation(event)),
+      ).record);
+      const replayLease = {
+        ...live,
+        processMode: "resume",
+        replayMode: "retained_only",
+        snapshotHeadNextOrdinal: records.length,
+      } as const;
+      const claim: DriverCompositeCursorClaimHandle = {
+        authority: replayLease,
+        privateLease: replayLease,
+        async abort() { return closeResult(true); },
+        async release() { return closeResult(true); },
+      };
+      const replay = new FiniteDriverRetainedReplay(claim, records, expectation());
+      assert.deepEqual((await collect(replay.records)).map((record) => record.event.kind), kinds);
+      await replay.close();
+    });
+  }
+});
+
+test("retained prefix finalization rejects illegal turn order before first yield", async (t) => {
+  const coordination = (character: string): DriverEventObservation["event"] => ({
+    kind: "coordination_call",
+    turnId,
+    commandId: id("cmd", character) as CommandId,
+    command: {
+      protocolVersion: version,
+      title: "Follow up",
+      sourceMessageId,
+    },
+  });
+  const reply = (text: string): DriverEventObservation["event"] => ({
+    kind: "assistant_reply",
+    turnId,
+    text,
+  });
+  const cases: Array<[string, readonly DriverEventObservation["event"][]]> = [
+    ["coordination before reply", [coordination("1")]],
+    ["completion before reply", [{ kind: "turn_completed", turnId }]],
+    ["duplicate reply", [reply("first"), reply("second")]],
+    ["duplicate coordination", [reply("first"), coordination("2"), coordination("3")]],
+    ["event after completion", [
+      reply("first"),
+      { kind: "turn_completed", turnId },
+      reply("after completion"),
+    ]],
+    ["pre-watermark event", [{
+      kind: "model_visible",
+      turnId,
+      visibilityEventId: id("cmd", "4") as CommandId,
+    }]],
+  ];
+
+  for (const [name, events] of cases) {
+    await t.test(name, async () => {
+      const retention = new MemoryRetention();
+      const live = await retention.claim(attempt());
+      const records = events.map((event) => retention.appendPrepared(
+        live,
+        retention.prepareAppend(live, observation(event)),
+      ).record);
+      const replayLease = {
+        ...live,
+        processMode: "resume",
+        replayMode: "retained_only",
+        snapshotHeadNextOrdinal: records.length,
+      } as const;
+      assert.throws(
+        () => validateRetainedSnapshot(replayLease, records, expectation()),
+        (error: unknown) => error instanceof Error
+          && error.message === "DRIVER_EVENT_ORDER_INVALID",
+      );
+    });
+  }
+});
+
+test("wrong source, waiter, binding, gap, and illegal suffix fail before first yield", async (t) => {
   const retention = new MemoryRetention();
   const lease = await retention.claim(attempt());
   const reply = retention.appendPrepared(lease, retention.prepareAppend(lease, observation({

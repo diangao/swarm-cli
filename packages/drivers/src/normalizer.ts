@@ -230,6 +230,17 @@ export class DriverEventStreamNormalizer {
     if (!this.#terminal && this.#active !== null) this.#order();
   }
 
+  /**
+   * Finalizes a bounded retained snapshot that starts immediately after a
+   * durable model-visible event. Unlike finish(), this reports whether the
+   * validated snapshot is a legal active prefix or a completed turn; it never
+   * invents completion and is unavailable to ordinary live-stream instances.
+   */
+  finishRetainedTurnPrefix(): "active" | "completed" {
+    if (this.#durableExpectation === null || this.#terminal) this.#order();
+    return this.#active === null ? "completed" : "active";
+  }
+
   #activeFor(turnId: TurnId): ActiveDriverTurn {
     if (this.#active === null) return this.#order();
     if (this.#active.turnId !== turnId) return this.#fence();

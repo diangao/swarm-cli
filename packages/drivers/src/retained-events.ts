@@ -368,10 +368,10 @@ export function validateRetainedSnapshot(
     previousRecordDigest = record.recordDigest;
     ordinal += 1;
   }
-  normalizer.finish();
   if (ordinal !== lease.snapshotHeadNextOrdinal) {
     throw new DriverRetentionError("DRIVER_RETAINED_EVENT_GAP");
   }
+  normalizer.finishRetainedTurnPrefix();
   return records;
 }
 
