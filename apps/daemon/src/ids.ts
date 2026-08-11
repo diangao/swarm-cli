@@ -1,7 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import type { CommandId } from "@swarm/protocol";
-import type { NativeCommandIdSource } from "@swarm/daemon-core";
+import type {
+  DeliveryCommandIdDerivationPort,
+  NativeCommandIdSource,
+} from "@swarm/daemon-core";
 
 const ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
 
@@ -12,6 +15,12 @@ export function deterministicCommandId(seed: string): CommandId {
     value += ALPHABET[(bytes[index % bytes.length] ?? 0) & 31];
   }
   return `cmd_${value}` as CommandId;
+}
+
+export class AppDeliveryCommandIdDerivation implements DeliveryCommandIdDerivationPort {
+  deterministicCommandId(seed: string): CommandId {
+    return deterministicCommandId(seed);
+  }
 }
 
 export class RandomCommandIdSource implements NativeCommandIdSource {

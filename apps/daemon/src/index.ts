@@ -1,6 +1,7 @@
 export {
   closeDaemonApp,
   createDaemonApp,
+  createDeliveryKernel,
   createInProcessLoopbackDaemon,
   createNativeDriverRuntime,
   type DaemonApp,
