@@ -1,4 +1,12 @@
-import { DaemonCore, type NativeServerPort } from "@swarm/daemon-core";
+import {
+  DaemonCore,
+  DeliveryKernel,
+  type DeliveryClock,
+  type DeliveryExecutionPort,
+  type DeliveryJournalPort,
+  type DeliveryServerCommitPort,
+  type NativeServerPort,
+} from "@swarm/daemon-core";
 import {
   ClaudeNativeProcessDriver,
   CodexNativeProcessDriver,
@@ -7,7 +15,7 @@ import {
 import { DaemonJournal } from "@swarm/storage";
 import type { LaunchId, ProtocolVersion } from "@swarm/protocol";
 
-import { RandomCommandIdSource } from "./ids.js";
+import { AppDeliveryCommandIdDerivation, RandomCommandIdSource } from "./ids.js";
 import { LoopbackNativeServer, LoopbackServerConnection } from "./loopback.js";
 import { NativeSqliteJournal } from "./native-journal.js";
 import { ClaudeChildRuntimeHost } from "./claude-runtime-host.js";
@@ -23,6 +31,18 @@ export type DaemonApp = {
   waveZeroJournal: DaemonJournal;
   server?: LoopbackNativeServer;
 };
+
+export function createDeliveryKernel(input: {
+  journal: DeliveryJournalPort;
+  execution: DeliveryExecutionPort;
+  server: DeliveryServerCommitPort;
+  clock: DeliveryClock;
+}): DeliveryKernel {
+  return new DeliveryKernel({
+    ...input,
+    ids: new AppDeliveryCommandIdDerivation(),
+  });
+}
 
 export async function createDaemonApp(input: {
   sqlitePath: string;
