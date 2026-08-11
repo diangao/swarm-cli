@@ -15,6 +15,7 @@ import { protocolDigest } from "@swarm/runtime-contract";
 
 import {
   DriverStartPreparation,
+  type DriverCursorClaimCoordinator,
   type DriverEventPumpLease,
   type DriverEventRecord,
   type DriverEventWaiterSpec,
@@ -28,6 +29,11 @@ import {
   type NativeProcessWriteOutcome,
   type SpawnHandle,
 } from "../port.js";
+import type {
+  DriverCompositeCursorClaimHandle,
+  DriverRetainedEventSource,
+  DriverRetainedReplay,
+} from "../retained-events.js";
 import {
   DriverNormalizationError,
   assertDriverCapability,
@@ -54,6 +60,7 @@ type CodexProcessContext = {
   readonly sessionId: SessionId;
   readonly identity?: DriverIdentity;
   readonly activeTurnCommands: Map<TurnId, CommandId>;
+  readonly cursorClaim: DriverCompositeCursorClaimHandle;
   lease: DriverEventPumpLease;
   preparation?: DriverStartPreparation;
   released: boolean;
@@ -61,10 +68,18 @@ type CodexProcessContext = {
 
 export class CodexNativeProcessDriver implements NativeProcessDriver {
   readonly #host: CodexRuntimeHost;
+  readonly #retained: DriverRetainedEventSource;
+  readonly #cursorClaimCoordinator: DriverCursorClaimCoordinator;
   readonly #contexts = new Map<string, CodexProcessContext>();
 
-  constructor(host: CodexRuntimeHost) {
+  constructor(
+    host: CodexRuntimeHost,
+    retained: DriverRetainedEventSource,
+    cursorClaimCoordinator: DriverCursorClaimCoordinator,
+  ) {
     this.#host = host;
+    this.#retained = retained;
+    this.#cursorClaimCoordinator = cursorClaimCoordinator;
   }
 
   async probe(spec: DriverProbeSpec): Promise<DriverIdentity> {
@@ -94,6 +109,22 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
       argv: CODEX_APP_SERVER_ARGV,
       acceptWireMessage: (message) => wire.accept(message),
     });
+    let cursorClaim: DriverCompositeCursorClaimHandle;
+    try {
+      cursorClaim = await this.#cursorClaimCoordinator.claimAfterSpawn({
+        spec,
+        process: spawned.process,
+        pump: spawned.pump,
+        cursorOwnerToken: spawned.cursorOwnerToken,
+      });
+    } catch (cause) {
+      return await stopAfterFailedStart(
+        this.#host,
+        spawned.process,
+        cause,
+        "CODEX_DRIVER_START_AUTHORITY_FAILED",
+      );
+    }
     let capturedLease: DriverEventPumpLease | undefined;
     let preparation: DriverStartPreparation;
     try {
@@ -101,7 +132,7 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
         spec,
         process: spawned.process,
         pump: spawned.pump,
-        cursorOwnerToken: spawned.cursorOwnerToken,
+        cursorClaim,
         initializeWaiterId: spawned.initializeWaiterId,
         initializeBindingDigest: spawned.initializeBindingDigest,
         writeInitialize: async (witness) => {
@@ -135,6 +166,7 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
       sessionId: spec.sessionId,
       identity: spec.driverIdentity,
       activeTurnCommands: new Map(),
+      cursorClaim,
       lease: capturedLease,
       preparation,
       released: false,
@@ -145,16 +177,41 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
 
   async resume(spec: DriverResumeSpec): Promise<SpawnHandle> {
     const wire = new CodexWireState();
-    const resumed = await this.#host.resume(spec, {
-      argv: CODEX_APP_SERVER_ARGV,
-      acceptWireMessage: (message) => wire.accept(message),
-    });
-    assertResumeProcess(resumed.process, spec);
-    const lease = await resumed.pump.claimCursor({
+    const ticket = this.#cursorClaimCoordinator.beginLiveResume({
+      protocolVersion: spec.launch.protocolVersion,
+      launchId: spec.launch.launchId,
+      stateInstanceId: spec.launch.stateInstanceId,
       sessionId: spec.expectedSessionId,
-      ownerToken: spec.cursorOwnerToken,
-      mode: "resume",
+      cursorOwnerToken: spec.cursorOwnerToken,
+      authorization: spec.liveResumeAuthorization,
     });
+    let resumed: Awaited<ReturnType<CodexRuntimeHost["resume"]>>;
+    try {
+      resumed = await this.#host.resume(spec, {
+        argv: CODEX_APP_SERVER_ARGV,
+        acceptWireMessage: (message) => wire.accept(message),
+      });
+    } catch (cause) {
+      this.#cursorClaimCoordinator.cancelLiveResume(ticket);
+      throw cause;
+    }
+    let cursorClaim: DriverCompositeCursorClaimHandle;
+    try {
+      assertResumeProcess(resumed.process, spec);
+      cursorClaim = await this.#cursorClaimCoordinator.claimForLiveResume({
+        ticket,
+        pump: resumed.pump,
+      });
+    } catch (cause) {
+      this.#cursorClaimCoordinator.cancelLiveResume(ticket);
+      return await stopAfterFailedStart(
+        this.#host,
+        resumed.process,
+        cause,
+        "CODEX_DRIVER_RESUME_AUTHORITY_FAILED",
+      );
+    }
+    const lease = cursorClaim.privateLease;
     const waiterSpec: DriverEventWaiterSpec = {
       kind: "resume",
       waiterId: resumed.resumeWaiterId,
@@ -178,7 +235,18 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
       const ready = await resumed.pump.waitForRecord(lease, waiter);
       assertReadyRecord(ready, resumed.process, spec.expectedSessionId, lease, waiter);
     } catch (cause) {
-      await cleanupWaiter(resumed.pump, lease, waiterSpec, cause, true);
+      let cleanedCause: unknown = cause;
+      try {
+        await cleanupWaiter(resumed.pump, lease, waiterSpec, cause, cursorClaim);
+      } catch (error) {
+        cleanedCause = error;
+      }
+      return await stopAfterFailedStart(
+        this.#host,
+        resumed.process,
+        cleanedCause,
+        "CODEX_DRIVER_RESUME_FAILED",
+      );
     }
     this.#contexts.set(resumed.process.processHandleRefPrivate, {
       process: resumed.process,
@@ -187,6 +255,7 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
       wire,
       sessionId: spec.expectedSessionId,
       activeTurnCommands: new Map(),
+      cursorClaim,
       lease,
       released: false,
     });
@@ -202,7 +271,13 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
     const context = this.#context(process, session);
     const requestId = binding.invocation.invocationId;
     const request = context.wire.turnStartRequest(requestId, session, input, binding);
-    return this.#writeTurn(context, requestId, request, binding);
+    return this.#writeTurn(
+      context,
+      requestId,
+      request,
+      binding,
+      input.input.current.delivery.messageId,
+    );
   }
 
   steerTurn(
@@ -215,7 +290,13 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
     const context = this.#context(process, session);
     const requestId = binding.invocation.invocationId;
     const request = context.wire.turnSteerRequest(requestId, session, input, binding);
-    return this.#writeTurn(context, requestId, request, binding);
+    return this.#writeTurn(
+      context,
+      requestId,
+      request,
+      binding,
+      input.input.current.delivery.messageId,
+    );
   }
 
   async interrupt(
@@ -243,7 +324,7 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
     try {
       await context.transport.request(request, waiter, () => context.wire.markRequestWritten(id));
     } catch (cause) {
-      await cleanupWaiter(context.pump, context.lease, waiter, cause, false);
+      await cleanupWaiter(context.pump, context.lease, waiter, cause);
     }
     await cancelAfterAcknowledged(context.pump, context.lease, waiter, "CODEX_INTERRUPT_CLEANUP_FAILED");
   }
@@ -261,6 +342,16 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
     const context = this.#contexts.get(process.processHandleRefPrivate);
     if (context === undefined || context.process !== process || context.released) this.#fence();
     return records(context);
+  }
+
+  recoverEvents(input: {
+    claim: DriverCompositeCursorClaimHandle;
+    expectedTurnId: TurnId;
+    expectedBindingDigest: ArtifactDigest;
+    expectedResolvedWaiterId: CommandId;
+    expectedSourceMessageId: import("@swarm/protocol").MessageId;
+  }): Promise<DriverRetainedReplay> {
+    return this.#retained.openReplay(input);
   }
 
   async stop(process: SpawnHandle, reason: StopReason): Promise<void> {
@@ -284,7 +375,7 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
     }
     if (!preparationReleased && !context.released) {
       try {
-        await context.pump.release(context.lease);
+        await context.cursorClaim.release();
       } catch (error) {
         failures.push(error);
       }
@@ -299,6 +390,7 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
     requestId: string,
     request: Parameters<CodexTransport["request"]>[0],
     binding: DriverTurnBinding,
+    sourceMessageId: import("@swarm/protocol").MessageId,
   ): Promise<NativeProcessWriteOutcome> {
     const bindingDigest = protocolDigest(binding);
     let waiter: DriverRegisteredEventWaiter;
@@ -314,7 +406,12 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
       throw cause;
     }
     try {
-      await context.transport.request(request, waiter, () => context.wire.markRequestWritten(requestId));
+      await context.transport.request(
+        request,
+        waiter,
+        () => context.wire.markRequestWritten(requestId),
+        { predecessor: waiter, sourceMessageId },
+      );
     } catch {
       await cancelIgnoringFailure(context, waiter);
       return { kind: "ambiguous" };
@@ -332,7 +429,7 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
       kind: "written",
       runtimeWriteId: binding.runtimeWriteId,
       visibilityEventId: binding.visibilityEventId,
-      events: nativeEvents(context, binding.protocolTurnId),
+      events: nativeEvents(context, binding.protocolTurnId, waiter.waiterId),
     };
   }
 
@@ -355,7 +452,7 @@ export class CodexNativeProcessDriver implements NativeProcessDriver {
       assertWaiter(waiter, spec, context.lease.readerEpoch);
       return waiter;
     } catch (cause) {
-      return await cleanupWaiter(context.pump, context.lease, spec, cause, false);
+      return await cleanupWaiter(context.pump, context.lease, spec, cause);
     }
   }
 
@@ -435,8 +532,10 @@ function assertWaiter(
     || waiter.bindingDigest !== expected.bindingDigest
     || waiter.readerEpoch !== readerEpoch
     || waiter.registeredBeforeWrite !== true
-    || !Number.isSafeInteger(waiter.registeredThroughOrdinal)
-    || waiter.registeredThroughOrdinal < 0
+    || waiter.stream !== (expected.kind === "turn" ? "turn" : "lifecycle")
+    || (waiter.registeredThroughOrdinal !== null
+      && (!Number.isSafeInteger(waiter.registeredThroughOrdinal)
+        || waiter.registeredThroughOrdinal < 0))
   ) throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
 }
 
@@ -451,9 +550,11 @@ function assertReadyRecord(
     record.stateInstanceId !== process.stateInstanceId
     || record.sessionId !== sessionId
     || record.readerEpoch !== lease.readerEpoch
+    || record.stream !== "lifecycle"
     || record.resolvedWaiterId !== waiter.waiterId
     || record.bindingDigest !== waiter.bindingDigest
-    || record.ordinal <= waiter.registeredThroughOrdinal
+    || (waiter.registeredThroughOrdinal !== null
+      && record.ordinal <= waiter.registeredThroughOrdinal)
     || record.event.kind !== "runtime_ready"
   ) throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
 }
@@ -468,9 +569,11 @@ function assertTurnRecord(
     record.stateInstanceId !== context.process.stateInstanceId
     || record.sessionId !== context.sessionId
     || record.readerEpoch !== context.lease.readerEpoch
+    || record.stream !== "turn"
     || record.resolvedWaiterId !== waiter.waiterId
     || record.bindingDigest !== waiter.bindingDigest
-    || record.ordinal <= waiter.registeredThroughOrdinal
+    || (waiter.registeredThroughOrdinal !== null
+      && record.ordinal <= waiter.registeredThroughOrdinal)
     || record.event.kind !== "model_visible"
     || record.event.turnId !== binding.protocolTurnId
     || record.event.visibilityEventId !== binding.visibilityEventId
@@ -491,6 +594,7 @@ async function* records(context: CodexProcessContext): AsyncIterable<NormalizedD
 async function* nativeEvents(
   context: CodexProcessContext,
   turnId: TurnId,
+  waiterId: CommandId,
 ): AsyncIterable<NativeRuntimeEvent> {
   for await (const record of context.pump.subscribe(context.lease)) {
     if (
@@ -498,6 +602,7 @@ async function* nativeEvents(
       || record.sessionId !== context.sessionId
       || record.readerEpoch !== context.lease.readerEpoch
     ) throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
+    if (record.resolvedWaiterId !== waiterId) continue;
     const event = record.event;
     if ("turnId" in event && event.turnId !== turnId) {
       throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
@@ -557,7 +662,7 @@ async function cleanupWaiter(
   lease: DriverEventPumpLease,
   waiter: DriverEventWaiterSpec,
   cause: unknown,
-  release: boolean,
+  claim?: DriverCompositeCursorClaimHandle,
 ): Promise<never> {
   const failures: unknown[] = [cause];
   try {
@@ -565,9 +670,9 @@ async function cleanupWaiter(
   } catch (error) {
     failures.push(error);
   }
-  if (release) {
+  if (claim !== undefined) {
     try {
-      await pump.release(lease);
+      await claim.abort();
     } catch (error) {
       failures.push(error);
     }

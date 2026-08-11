@@ -1,10 +1,20 @@
 import { DaemonCore, type NativeServerPort } from "@swarm/daemon-core";
-import type { NativeRuntimePort } from "@swarm/drivers";
+import {
+  ClaudeNativeProcessDriver,
+  CodexNativeProcessDriver,
+  type NativeRuntimePort,
+} from "@swarm/drivers";
 import { DaemonJournal } from "@swarm/storage";
+import type { LaunchId, ProtocolVersion } from "@swarm/protocol";
 
 import { RandomCommandIdSource } from "./ids.js";
 import { LoopbackNativeServer, LoopbackServerConnection } from "./loopback.js";
 import { NativeSqliteJournal } from "./native-journal.js";
+import { ClaudeChildRuntimeHost } from "./claude-runtime-host.js";
+import { CodexChildRuntimeHost } from "./codex-runtime-host.js";
+import { NativeCursorClaimCoordinator, NativeTurnRuntime } from "./native-turn-runtime.js";
+import { SqlitePrivateDriverEventRetention } from "./private-driver-events.js";
+import { RetainedTurnJournal } from "./retained-turn-journal.js";
 
 export type DaemonApp = {
   core: DaemonCore;
@@ -76,5 +86,90 @@ export async function closeDaemonApp(app: DaemonApp): Promise<void> {
     } finally {
       app.waveZeroJournal.close();
     }
+  }
+}
+
+export type NativeDriverRuntimeComposition = {
+  journal: DaemonJournal;
+  retention: SqlitePrivateDriverEventRetention;
+  coordinator: NativeCursorClaimCoordinator;
+  codex: CodexNativeProcessDriver;
+  claude: ClaudeNativeProcessDriver;
+  runtime: NativeTurnRuntime;
+  turnJournal: RetainedTurnJournal;
+  close(): Promise<void>;
+};
+
+export function createNativeDriverRuntime(input: {
+  waveZeroSqlitePath: string;
+  privateLaunchRoot: string;
+  sourceWorkspace?: string;
+  protocolVersion: ProtocolVersion;
+  launchId: LaunchId;
+  codex: {
+    executable: string;
+    prefixArgv?: readonly string[];
+    cwd?: string;
+    environment?: Readonly<Record<string, string>>;
+  };
+  claude: {
+    executable: string;
+    prefixArgv?: readonly string[];
+    cwd?: string;
+    environment?: Readonly<Record<string, string>>;
+  };
+}): NativeDriverRuntimeComposition {
+  const journal = DaemonJournal.open(input.waveZeroSqlitePath);
+  let retention: SqlitePrivateDriverEventRetention | undefined;
+  try {
+    journal.migrate();
+    retention = new SqlitePrivateDriverEventRetention({
+      launchRoot: input.privateLaunchRoot,
+      protocolVersion: input.protocolVersion,
+      launchId: input.launchId,
+      ...(input.sourceWorkspace === undefined ? {} : { sourceWorkspace: input.sourceWorkspace }),
+    });
+    const privateRetention = retention;
+    const coordinator = new NativeCursorClaimCoordinator({ journal });
+    const codexHost = new CodexChildRuntimeHost({ ...input.codex, retention: privateRetention });
+    const claudeHost = new ClaudeChildRuntimeHost({ ...input.claude, retention: privateRetention });
+    const codex = new CodexNativeProcessDriver(codexHost, privateRetention, coordinator);
+    const claude = new ClaudeNativeProcessDriver(claudeHost, privateRetention, coordinator);
+    const runtime = new NativeTurnRuntime({ journal, coordinator, codex, claude });
+    const turnJournal = new RetainedTurnJournal(privateRetention);
+    let closed = false;
+    return {
+      journal,
+      retention: privateRetention,
+      coordinator,
+      codex,
+      claude,
+      runtime,
+      turnJournal,
+      async close() {
+        if (closed) return;
+        closed = true;
+        const hostResults = await Promise.allSettled([
+          codexHost.close(),
+          claudeHost.close(),
+        ]);
+        try {
+          const failures = hostResults.flatMap(
+            (result) => result.status === "rejected" ? [result.reason] : [],
+          );
+          if (failures.length > 0) throw new AggregateError(failures, "NATIVE_HOST_CLOSE_FAILED");
+        } finally {
+          try {
+            journal.close();
+          } finally {
+            privateRetention.close();
+          }
+        }
+      },
+    };
+  } catch (error) {
+    retention?.close();
+    journal.close();
+    throw error;
   }
 }

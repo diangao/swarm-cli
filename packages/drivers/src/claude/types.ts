@@ -2,6 +2,7 @@ import type {
   ArtifactDigest,
   CommandId,
   DriverIdentity,
+  MessageId,
   NormalizedDriverEvent,
   StopReason,
 } from "@swarm/protocol";
@@ -33,6 +34,10 @@ export type ClaudeInterruptRequest = Readonly<{
 }>;
 
 export type ClaudeWritePredecessor = DriverStartWriteWitness | DriverRegisteredEventWaiter;
+export type ClaudeTurnObservationCorrelation = Readonly<{
+  sourceMessageId: MessageId;
+  predecessor: DriverRegisteredEventWaiter;
+}>;
 
 export interface ClaudeTransport {
   begin(predecessor: DriverStartWriteWitness | DriverRegisteredEventWaiter): Promise<void>;
@@ -40,6 +45,7 @@ export interface ClaudeTransport {
     line: Uint8Array,
     predecessor: DriverRegisteredEventWaiter,
     onWritten: () => readonly NormalizedDriverEvent[],
+    correlation: ClaudeTurnObservationCorrelation,
   ): Promise<void>;
   writeControl(
     line: Uint8Array,

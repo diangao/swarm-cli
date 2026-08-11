@@ -15,6 +15,7 @@ import { protocolDigest } from "@swarm/runtime-contract";
 
 import {
   DriverStartPreparation,
+  type DriverCursorClaimCoordinator,
   type DriverEventPumpLease,
   type DriverEventRecord,
   type DriverEventWaiterSpec,
@@ -28,6 +29,11 @@ import {
   type NativeProcessWriteOutcome,
   type SpawnHandle,
 } from "../port.js";
+import type {
+  DriverCompositeCursorClaimHandle,
+  DriverRetainedEventSource,
+  DriverRetainedReplay,
+} from "../retained-events.js";
 import { DriverNormalizationError, assertDriverCapability } from "../normalizer.js";
 import {
   CLAUDE_CAPABILITY,
@@ -51,6 +57,7 @@ type ClaudeProcessContext = {
   readonly sessionId: SessionId;
   readonly runtimeSessionRef: string;
   readonly identity?: DriverIdentity;
+  readonly cursorClaim: DriverCompositeCursorClaimHandle;
   lease: DriverEventPumpLease;
   preparation?: DriverStartPreparation;
   released: boolean;
@@ -58,10 +65,18 @@ type ClaudeProcessContext = {
 
 export class ClaudeNativeProcessDriver implements NativeProcessDriver {
   readonly #host: ClaudeRuntimeHost;
+  readonly #retained: DriverRetainedEventSource;
+  readonly #cursorClaimCoordinator: DriverCursorClaimCoordinator;
   readonly #contexts = new Map<string, ClaudeProcessContext>();
 
-  constructor(host: ClaudeRuntimeHost) {
+  constructor(
+    host: ClaudeRuntimeHost,
+    retained: DriverRetainedEventSource,
+    cursorClaimCoordinator: DriverCursorClaimCoordinator,
+  ) {
     this.#host = host;
+    this.#retained = retained;
+    this.#cursorClaimCoordinator = cursorClaimCoordinator;
   }
 
   async probe(spec: DriverProbeSpec): Promise<DriverIdentity> {
@@ -90,6 +105,22 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
       argv: [...CLAUDE_STREAM_ARGV, "--session-id", runtimeSessionRef],
       acceptWireMessage: (message) => wire.accept(message),
     });
+    let cursorClaim: DriverCompositeCursorClaimHandle;
+    try {
+      cursorClaim = await this.#cursorClaimCoordinator.claimAfterSpawn({
+        spec,
+        process: spawned.process,
+        pump: spawned.pump,
+        cursorOwnerToken: spawned.cursorOwnerToken,
+      });
+    } catch (cause) {
+      return await stopAfterFailedStart(
+        this.#host,
+        spawned.process,
+        cause,
+        "CLAUDE_DRIVER_START_AUTHORITY_FAILED",
+      );
+    }
     let capturedLease: DriverEventPumpLease | undefined;
     let preparation: DriverStartPreparation;
     try {
@@ -97,7 +128,7 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
         spec,
         process: spawned.process,
         pump: spawned.pump,
-        cursorOwnerToken: spawned.cursorOwnerToken,
+        cursorClaim,
         initializeWaiterId: spawned.initializeWaiterId,
         initializeBindingDigest: spawned.initializeBindingDigest,
         writeInitialize: async (witness) => {
@@ -124,6 +155,7 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
       sessionId: spec.sessionId,
       runtimeSessionRef,
       identity: spec.driverIdentity,
+      cursorClaim,
       lease: capturedLease,
       preparation,
       released: false,
@@ -135,16 +167,41 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
   async resume(spec: DriverResumeSpec): Promise<SpawnHandle> {
     if (!isUuid(spec.runtimeSessionRefPrivate)) this.#protocol();
     const wire = new ClaudeWireState(spec.expectedSessionId, spec.runtimeSessionRefPrivate);
-    const resumed = await this.#host.resume(spec, {
-      argv: [...CLAUDE_STREAM_ARGV, "--resume", spec.runtimeSessionRefPrivate],
-      acceptWireMessage: (message) => wire.accept(message),
-    });
-    assertResumeProcess(resumed.process, spec);
-    const lease = await resumed.pump.claimCursor({
+    const ticket = this.#cursorClaimCoordinator.beginLiveResume({
+      protocolVersion: spec.launch.protocolVersion,
+      launchId: spec.launch.launchId,
+      stateInstanceId: spec.launch.stateInstanceId,
       sessionId: spec.expectedSessionId,
-      ownerToken: spec.cursorOwnerToken,
-      mode: "resume",
+      cursorOwnerToken: spec.cursorOwnerToken,
+      authorization: spec.liveResumeAuthorization,
     });
+    let resumed: Awaited<ReturnType<ClaudeRuntimeHost["resume"]>>;
+    try {
+      resumed = await this.#host.resume(spec, {
+        argv: [...CLAUDE_STREAM_ARGV, "--resume", spec.runtimeSessionRefPrivate],
+        acceptWireMessage: (message) => wire.accept(message),
+      });
+    } catch (cause) {
+      this.#cursorClaimCoordinator.cancelLiveResume(ticket);
+      throw cause;
+    }
+    let cursorClaim: DriverCompositeCursorClaimHandle;
+    try {
+      assertResumeProcess(resumed.process, spec);
+      cursorClaim = await this.#cursorClaimCoordinator.claimForLiveResume({
+        ticket,
+        pump: resumed.pump,
+      });
+    } catch (cause) {
+      this.#cursorClaimCoordinator.cancelLiveResume(ticket);
+      return await stopAfterFailedStart(
+        this.#host,
+        resumed.process,
+        cause,
+        "CLAUDE_DRIVER_RESUME_AUTHORITY_FAILED",
+      );
+    }
+    const lease = cursorClaim.privateLease;
     const waiterSpec: DriverEventWaiterSpec = {
       kind: "resume",
       waiterId: resumed.resumeWaiterId,
@@ -161,7 +218,18 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
       const ready = await resumed.pump.waitForRecord(lease, waiter);
       assertReadyRecord(ready, resumed.process, spec.expectedSessionId, lease, waiter);
     } catch (cause) {
-      await cleanupWaiter(resumed.pump, lease, waiterSpec, cause, true);
+      let cleanedCause: unknown = cause;
+      try {
+        await cleanupWaiter(resumed.pump, lease, waiterSpec, cause, cursorClaim);
+      } catch (error) {
+        cleanedCause = error;
+      }
+      return await stopAfterFailedStart(
+        this.#host,
+        resumed.process,
+        cleanedCause,
+        "CLAUDE_DRIVER_RESUME_FAILED",
+      );
     }
     this.#contexts.set(resumed.process.processHandleRefPrivate, {
       process: resumed.process,
@@ -170,6 +238,7 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
       wire,
       sessionId: spec.expectedSessionId,
       runtimeSessionRef: spec.runtimeSessionRefPrivate,
+      cursorClaim,
       lease,
       released: false,
     });
@@ -220,12 +289,12 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
     try {
       receipt = await context.transport.writeControl(prepared.line, waiter);
     } catch (cause) {
-      await cleanupWaiter(context.pump, context.lease, waiter, cause, false);
+      await cleanupWaiter(context.pump, context.lease, waiter, cause);
     }
     try {
       context.wire.acceptInterruptReceipt(receipt, prepared.request.request_id);
     } catch (cause) {
-      await cleanupWaiter(context.pump, context.lease, waiter, cause, false);
+      await cleanupWaiter(context.pump, context.lease, waiter, cause);
     }
     await cancelAfterAcknowledged(context.pump, context.lease, waiter, "CLAUDE_INTERRUPT_CLEANUP_FAILED");
   }
@@ -243,6 +312,16 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
     const context = this.#contexts.get(process.processHandleRefPrivate);
     if (context === undefined || context.process !== process || context.released) this.#fence();
     return records(context);
+  }
+
+  recoverEvents(input: {
+    claim: DriverCompositeCursorClaimHandle;
+    expectedTurnId: TurnId;
+    expectedBindingDigest: ArtifactDigest;
+    expectedResolvedWaiterId: CommandId;
+    expectedSourceMessageId: import("@swarm/protocol").MessageId;
+  }): Promise<DriverRetainedReplay> {
+    return this.#retained.openReplay(input);
   }
 
   async stop(process: SpawnHandle, reason: StopReason): Promise<void> {
@@ -266,7 +345,7 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
     }
     if (!preparationReleased && !context.released) {
       try {
-        await context.pump.release(context.lease);
+        await context.cursorClaim.release();
       } catch (error) {
         failures.push(error);
       }
@@ -292,13 +371,14 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
     try {
       prepared = context.wire.beginTurn(session, input, binding);
     } catch (cause) {
-      return await cleanupWaiter(context.pump, context.lease, waiter, cause, false);
+      return await cleanupWaiter(context.pump, context.lease, waiter, cause);
     }
     try {
       await context.transport.writeLine(
         prepared.line,
         waiter,
         () => context.wire.markInputWritten(prepared.input.uuid),
+        { predecessor: waiter, sourceMessageId: input.input.current.delivery.messageId },
       );
     } catch {
       await cancelIgnoringFailure(context, waiter);
@@ -316,7 +396,7 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
       kind: "written",
       runtimeWriteId: binding.runtimeWriteId,
       visibilityEventId: binding.visibilityEventId,
-      events: nativeEvents(context, binding.protocolTurnId),
+      events: nativeEvents(context, binding.protocolTurnId, waiter.waiterId),
     };
   }
 
@@ -339,7 +419,7 @@ export class ClaudeNativeProcessDriver implements NativeProcessDriver {
       assertWaiter(waiter, spec, context.lease.readerEpoch);
       return waiter;
     } catch (cause) {
-      return await cleanupWaiter(context.pump, context.lease, spec, cause, false);
+      return await cleanupWaiter(context.pump, context.lease, spec, cause);
     }
   }
 
@@ -417,8 +497,10 @@ function assertWaiter(
     || waiter.bindingDigest !== expected.bindingDigest
     || waiter.readerEpoch !== readerEpoch
     || waiter.registeredBeforeWrite !== true
-    || !Number.isSafeInteger(waiter.registeredThroughOrdinal)
-    || waiter.registeredThroughOrdinal < 0
+    || waiter.stream !== (expected.kind === "turn" ? "turn" : "lifecycle")
+    || (waiter.registeredThroughOrdinal !== null
+      && (!Number.isSafeInteger(waiter.registeredThroughOrdinal)
+        || waiter.registeredThroughOrdinal < 0))
   ) throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
 }
 
@@ -433,9 +515,11 @@ function assertReadyRecord(
     record.stateInstanceId !== process.stateInstanceId
     || record.sessionId !== sessionId
     || record.readerEpoch !== lease.readerEpoch
+    || record.stream !== "lifecycle"
     || record.resolvedWaiterId !== waiter.waiterId
     || record.bindingDigest !== waiter.bindingDigest
-    || record.ordinal <= waiter.registeredThroughOrdinal
+    || (waiter.registeredThroughOrdinal !== null
+      && record.ordinal <= waiter.registeredThroughOrdinal)
     || record.event.kind !== "runtime_ready"
   ) throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
 }
@@ -450,9 +534,11 @@ function assertTurnRecord(
     record.stateInstanceId !== context.process.stateInstanceId
     || record.sessionId !== context.sessionId
     || record.readerEpoch !== context.lease.readerEpoch
+    || record.stream !== "turn"
     || record.resolvedWaiterId !== waiter.waiterId
     || record.bindingDigest !== waiter.bindingDigest
-    || record.ordinal <= waiter.registeredThroughOrdinal
+    || (waiter.registeredThroughOrdinal !== null
+      && record.ordinal <= waiter.registeredThroughOrdinal)
     || record.event.kind !== "model_visible"
     || record.event.turnId !== binding.protocolTurnId
     || record.event.visibilityEventId !== binding.visibilityEventId
@@ -473,6 +559,7 @@ async function* records(context: ClaudeProcessContext): AsyncIterable<Normalized
 async function* nativeEvents(
   context: ClaudeProcessContext,
   turnId: TurnId,
+  waiterId: CommandId,
 ): AsyncIterable<NativeRuntimeEvent> {
   for await (const record of context.pump.subscribe(context.lease)) {
     if (
@@ -480,6 +567,7 @@ async function* nativeEvents(
       || record.sessionId !== context.sessionId
       || record.readerEpoch !== context.lease.readerEpoch
     ) throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
+    if (record.resolvedWaiterId !== waiterId) continue;
     const event = record.event;
     if ("turnId" in event && event.turnId !== turnId) {
       throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
@@ -539,7 +627,7 @@ async function cleanupWaiter(
   lease: DriverEventPumpLease,
   waiter: DriverEventWaiterSpec,
   cause: unknown,
-  release: boolean,
+  claim?: DriverCompositeCursorClaimHandle,
 ): Promise<never> {
   const failures: unknown[] = [cause];
   try {
@@ -547,9 +635,9 @@ async function cleanupWaiter(
   } catch (error) {
     failures.push(error);
   }
-  if (release) {
+  if (claim !== undefined) {
     try {
-      await pump.release(lease);
+      await claim.abort();
     } catch (error) {
       failures.push(error);
     }

@@ -29,6 +29,11 @@ import {
   type NativeProcessDriver,
   type SpawnHandle,
 } from "../src/port.js";
+import type {
+  DriverCompositeCursorClaimHandle,
+  DriverCursorAuthority,
+  DriverPrivateClaimAttempt,
+} from "../src/retained-events.js";
 
 const token = "01j00000000000000000000000";
 const version = 1 as ProtocolVersion;
@@ -90,10 +95,18 @@ const readyLaunch: ReadyLaunchFence = {
 };
 
 const lease: DriverEventPumpLease = {
+  protocolVersion: version,
+  launchId,
   stateInstanceId,
   sessionId,
   ownerToken,
   readerEpoch: 1,
+  nextOrdinal: 0,
+  lastEventDigest: null,
+  claimAttemptId: waiterId,
+  processMode: "start",
+  replayMode: "live",
+  snapshotHeadNextOrdinal: 0,
 };
 
 const waiter: DriverRegisteredEventWaiter = {
@@ -103,6 +116,7 @@ const waiter: DriverRegisteredEventWaiter = {
   sessionId,
   bindingDigest,
   registeredBeforeWrite: true,
+  stream: "lifecycle",
   readerEpoch: lease.readerEpoch,
   registeredThroughOrdinal: 0,
 };
@@ -114,6 +128,7 @@ const runtimeReady = {
 } satisfies NormalizedDriverEvent;
 
 const readyRecord: DriverEventRecord = {
+  stream: "lifecycle",
   stateInstanceId,
   sessionId,
   readerEpoch: lease.readerEpoch,
@@ -152,15 +167,19 @@ class RecordingPump implements DriverEventPump {
     }
   }
 
-  async claimCursor(input: {
-    sessionId: SessionId;
-    ownerToken: ArtifactDigest;
-    mode: "start" | "resume";
-  }): Promise<DriverEventPumpLease> {
+  async claimCursor(input: DriverPrivateClaimAttempt): Promise<DriverEventPumpLease> {
     this.calls.push("claim");
-    assert.deepEqual(input, { sessionId, ownerToken, mode: "start" });
+    assert.deepEqual(input, claimAttempt());
     return this.#options.claimedLease ?? lease;
   }
+
+  async releaseClaimAttempt(input: DriverPrivateClaimAttempt): Promise<void> {
+    this.calls.push("release");
+    assert.deepEqual(input, claimAttempt());
+    if (this.#options.releaseError !== undefined) throw this.#options.releaseError;
+  }
+
+  async closeLeaseObservers(_lease: DriverEventPumpLease): Promise<void> {}
 
   async registerWaiter(
     actualLease: DriverEventPumpLease,
@@ -204,11 +223,6 @@ class RecordingPump implements DriverEventPump {
     assert.deepEqual(actualLease, lease);
   }
 
-  async release(actualLease: DriverEventPumpLease): Promise<void> {
-    this.calls.push("release");
-    assert.deepEqual(actualLease, this.#options.claimedLease ?? lease);
-    if (this.#options.releaseError !== undefined) throw this.#options.releaseError;
-  }
 }
 
 class ConformingStartDriver implements Pick<NativeProcessDriver, "start"> {
@@ -226,7 +240,7 @@ class ConformingStartDriver implements Pick<NativeProcessDriver, "start"> {
       spec,
       process,
       pump: this.#pump,
-      cursorOwnerToken: ownerToken,
+      cursorClaim: await claimForTest(this.#pump),
       initializeWaiterId: waiterId,
       initializeBindingDigest: bindingDigest,
       writeInitialize: async ({ lease: witnessedLease, waiter: witnessedWaiter }) => {
@@ -585,6 +599,16 @@ test("start session allocation does not weaken the existing exact resume fence",
     expectedSessionId: sessionId,
     runtimeSessionRefPrivate: "private-session",
     cursorOwnerToken: ownerToken,
+    liveResumeAuthorization: Object.freeze({
+      protocolVersion: launchSpec.launch.protocolVersion,
+      launchId: launchSpec.launch.launchId,
+      stateInstanceId,
+      sessionId,
+      ownerToken,
+      provedReaderEpoch: 1,
+      nextOrdinal: 0,
+      lastEventDigest: null,
+    }),
   };
   assert.equal(resume.expectedSessionId, launchSpec.sessionId);
   assert.equal(resume.launch.stateInstanceId, process.stateInstanceId);
@@ -608,11 +632,56 @@ async function prepare(
     spec: launchSpec,
     process,
     pump,
-    cursorOwnerToken: ownerToken,
+    cursorClaim: await claimForTest(pump),
     initializeWaiterId: waiterId,
     initializeBindingDigest: bindingDigest,
     writeInitialize,
   });
+}
+
+function claimAttempt(): DriverPrivateClaimAttempt {
+  return {
+    protocolVersion: version,
+    launchId,
+    stateInstanceId,
+    sessionId,
+    ownerToken,
+    readerEpoch: 1,
+    nextOrdinal: 0,
+    lastEventDigest: null,
+    claimAttemptId: waiterId,
+    processMode: "start",
+    replayMode: "live",
+  };
+}
+
+async function claimForTest(pump: DriverEventPump): Promise<DriverCompositeCursorClaimHandle> {
+  const attempt = claimAttempt();
+  const privateLease = await pump.claimCursor(attempt);
+  const authority: DriverCursorAuthority = {
+    protocolVersion: attempt.protocolVersion,
+    launchId: attempt.launchId,
+    stateInstanceId: attempt.stateInstanceId,
+    sessionId: attempt.sessionId,
+    ownerToken: attempt.ownerToken,
+    readerEpoch: attempt.readerEpoch,
+    nextOrdinal: attempt.nextOrdinal,
+    lastEventDigest: attempt.lastEventDigest,
+  };
+  let closed = false;
+  const close = async () => {
+    if (closed) return { applied: false, storageReleased: true, privateReleased: true };
+    closed = true;
+    await pump.closeLeaseObservers(privateLease);
+    await pump.releaseClaimAttempt(attempt);
+    return { applied: true, storageReleased: true, privateReleased: true };
+  };
+  return {
+    authority,
+    privateLease,
+    abort: close,
+    release: close,
+  };
 }
 
 async function asyncDriverCode(action: () => Promise<unknown>): Promise<string> {

@@ -1,6 +1,7 @@
 import type {
   ArtifactDigest,
   DriverIdentity,
+  MessageId,
   NormalizedDriverEvent,
   StopReason,
 } from "@swarm/protocol";
@@ -39,6 +40,11 @@ export type CodexJsonRpcNotification = Readonly<{
 
 export type CodexWritePredecessor = DriverStartWriteWitness | DriverRegisteredEventWaiter;
 
+export type CodexTurnObservationCorrelation = Readonly<{
+  sourceMessageId: MessageId;
+  predecessor: DriverRegisteredEventWaiter;
+}>;
+
 /**
  * The transport owns JSON-RPC correlation through the sole adapter pump. A
  * resolved request means its response was consumed by that pump and normalized
@@ -49,6 +55,7 @@ export interface CodexTransport {
     request: CodexJsonRpcRequest,
     predecessor: CodexWritePredecessor,
     onWritten?: () => void,
+    correlation?: CodexTurnObservationCorrelation,
   ): Promise<void>;
   notify(notification: CodexJsonRpcNotification, predecessor: CodexWritePredecessor): Promise<void>;
 }
