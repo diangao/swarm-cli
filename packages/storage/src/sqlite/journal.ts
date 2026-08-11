@@ -1,11 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  fstatSync,
   openSync,
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename } from "node:path";
@@ -34,7 +36,13 @@ import {
   parseFrozenDelivery,
   targetColumns,
 } from "../protocol.js";
-import { RuntimeJournalTransaction } from "./runtime-journal.js";
+import {
+  RuntimeJournalTransaction,
+  type DriverEventReaderClaim,
+  type DriverEventReaderClaimResult,
+  type DriverEventReaderOrphanTakeover,
+  type DriverEventReaderTakeoverResult,
+} from "./runtime-journal.js";
 
 type DeliveryBinding = {
   launchId: LaunchId;
@@ -136,6 +144,17 @@ function acquireJournalLock(lockPath: string): number {
     }
   }
   return storageFail("MACHINE_JOURNAL_LOCKED");
+}
+
+const JOURNAL_INSTANCE_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
+
+function mintJournalInstanceId(): string {
+  const bytes = randomBytes(26);
+  let suffix = "";
+  for (let index = 0; index < 26; index += 1) {
+    suffix += JOURNAL_INSTANCE_ALPHABET[(bytes[index] as number) % 32];
+  }
+  return `cmd_${suffix}`;
 }
 
 function openJournalDatabase(path: string): DatabaseSync {
@@ -408,6 +427,10 @@ export class DaemonJournal {
   #database!: DatabaseSync;
   #lockDescriptor!: number;
   #closed = false;
+  // Hidden per-open journal generation: minted after the machine lock is won,
+  // never caller-supplied, never exposed as reader authority, and synchronously
+  // invalidated before SQLite close or lock release on every close/reset path.
+  #journalInstanceId: string | null = null;
 
   private constructor(path: string) {
     this.#path = path;
@@ -416,7 +439,9 @@ export class DaemonJournal {
     try {
       this.#database = openJournalDatabase(path);
       this.#configure();
+      this.#journalInstanceId = mintJournalInstanceId();
     } catch (error) {
+      this.#journalInstanceId = null;
       try {
         this.#database?.close();
       } catch {
@@ -581,6 +606,7 @@ export class DaemonJournal {
     if (process.env.NODE_ENV !== "test" || !basename(this.#path).startsWith("swarm-storage-test-")) {
       storageFail("INVALID_DATABASE_TARGET", this.#path);
     }
+    this.#journalInstanceId = null;
     this.#database.close();
     this.#closed = true;
     closeSync(this.#lockDescriptor);
@@ -592,11 +618,13 @@ export class DaemonJournal {
     this.#database = openJournalDatabase(this.#path);
     this.#closed = false;
     this.#configure();
+    this.#journalInstanceId = mintJournalInstanceId();
     return this.migrate();
   }
 
   close(): void {
     if (this.#closed) return;
+    this.#journalInstanceId = null;
     try {
       this.#database.close();
     } finally {
@@ -604,6 +632,230 @@ export class DaemonJournal {
       rmSync(this.#lockPath, { force: true });
       this.#closed = true;
     }
+  }
+
+  /**
+   * Direct lock-owning claim surface. Every method first proves the journal is
+   * open, the retained lock descriptor is still the acquired on-disk lock, and
+   * the hidden per-open journal generation is live; a stale method reference
+   * after close/reset fails the existing closed-journal error and can never
+   * reuse the generation.
+   */
+  claimDriverEventReader(input: DriverEventReaderClaim): DriverEventReaderClaimResult {
+    const journalInstanceId = this.#requireDirectClaimReceiver();
+    assertProtocolId(input.stateInstanceId, "sti");
+    assertProtocolId(input.sessionId, "ses");
+    assertArtifactDigest(input.ownerToken);
+    if (input.mode !== "start" && input.mode !== "resume") {
+      storageFail("DRIVER_EVENT_READER_CONFLICT", input.stateInstanceId);
+    }
+    return this.transaction(() => {
+      const existing = one<{
+        session_id: string;
+        next_ordinal: number;
+        last_event_digest: string | null;
+        reader_owner_token: string | null;
+        reader_epoch: number;
+        reader_journal_instance_id: string | null;
+      }>(
+        this.#database,
+        `SELECT session_id, next_ordinal, last_event_digest, reader_owner_token,
+                reader_epoch, reader_journal_instance_id
+         FROM driver_event_cursor WHERE state_instance_id = ?`,
+        [input.stateInstanceId],
+      );
+      if (existing === undefined) {
+        if (input.mode !== "start") {
+          storageFail("DRIVER_EVENT_FENCE_MISMATCH", input.stateInstanceId);
+        }
+        run(
+          this.#database,
+          `INSERT INTO driver_event_cursor (
+             state_instance_id, session_id, next_ordinal, reader_owner_token,
+             reader_epoch, reader_journal_instance_id, updated_at
+           ) VALUES (?, ?, 0, ?, 1, ?, ?)`,
+          [
+            input.stateInstanceId,
+            input.sessionId,
+            input.ownerToken,
+            journalInstanceId,
+            input.claimedAt,
+          ],
+        );
+        return { readerEpoch: 1, nextOrdinal: 0, lastEventDigest: null };
+      }
+      if (existing.session_id !== input.sessionId) {
+        storageFail("DRIVER_EVENT_READER_CONFLICT", input.stateInstanceId);
+      }
+      if (input.mode !== "resume") {
+        storageFail("DRIVER_EVENT_READER_CONFLICT", input.stateInstanceId);
+      }
+      if (existing.reader_owner_token !== null) {
+        if (existing.reader_journal_instance_id === null) {
+          // Upgraded pre-0003 row with an owner but no journal generation: it is
+          // not guessed stale and cannot be resumed or taken over normally.
+          storageFail("DRIVER_EVENT_FENCE_MISMATCH", input.stateInstanceId);
+        }
+        storageFail("DRIVER_RESUME_OVERLAP", input.stateInstanceId);
+      }
+      if (existing.reader_journal_instance_id !== null) {
+        // Pair invariant broken out-of-band: owner null requires instance null.
+        storageFail("DRIVER_EVENT_FENCE_MISMATCH", input.stateInstanceId);
+      }
+      const nextEpoch = Number(existing.reader_epoch) + 1;
+      const result = run(
+        this.#database,
+        `UPDATE driver_event_cursor
+         SET reader_owner_token = ?, reader_epoch = ?,
+             reader_journal_instance_id = ?, updated_at = ?
+         WHERE state_instance_id = ? AND session_id = ?
+           AND reader_owner_token IS NULL AND reader_journal_instance_id IS NULL
+           AND reader_epoch = ?`,
+        [
+          input.ownerToken,
+          nextEpoch,
+          journalInstanceId,
+          input.claimedAt,
+          input.stateInstanceId,
+          input.sessionId,
+          existing.reader_epoch,
+        ],
+      );
+      if (changes(result) !== 1) {
+        storageFail("DRIVER_RESUME_OVERLAP", input.stateInstanceId);
+      }
+      return {
+        readerEpoch: nextEpoch,
+        nextOrdinal: Number(existing.next_ordinal),
+        lastEventDigest: (existing.last_event_digest ?? null) as DriverEventReaderClaimResult["lastEventDigest"],
+      };
+    });
+  }
+
+  claimOrphanedDriverEventReader(
+    input: DriverEventReaderOrphanTakeover,
+  ): DriverEventReaderTakeoverResult {
+    const journalInstanceId = this.#requireDirectClaimReceiver();
+    assertProtocolId(input.stateInstanceId, "sti");
+    assertProtocolId(input.sessionId, "ses");
+    assertArtifactDigest(input.ownerToken);
+    return this.transaction(() => {
+      const existing = one<{
+        session_id: string;
+        next_ordinal: number;
+        last_event_digest: string | null;
+        reader_owner_token: string | null;
+        reader_epoch: number;
+        reader_journal_instance_id: string | null;
+      }>(
+        this.#database,
+        `SELECT session_id, next_ordinal, last_event_digest, reader_owner_token,
+                reader_epoch, reader_journal_instance_id
+         FROM driver_event_cursor WHERE state_instance_id = ?`,
+        [input.stateInstanceId],
+      );
+      if (existing === undefined || existing.session_id !== input.sessionId) {
+        storageFail("DRIVER_EVENT_FENCE_MISMATCH", input.stateInstanceId);
+      }
+      if (
+        existing.reader_owner_token === null ||
+        existing.reader_journal_instance_id === null
+      ) {
+        // No orphan: either nothing is claimed (normal resume path) or the row
+        // is an unsupported pre-0003 owned row without a journal generation.
+        storageFail("DRIVER_EVENT_FENCE_MISMATCH", input.stateInstanceId);
+      }
+      if (existing.reader_journal_instance_id === journalInstanceId) {
+        // The current process cannot steal its own live reader.
+        storageFail("DRIVER_RESUME_OVERLAP", input.stateInstanceId);
+      }
+      const nextEpoch = Number(existing.reader_epoch) + 1;
+      const result = run(
+        this.#database,
+        `UPDATE driver_event_cursor
+         SET reader_owner_token = ?, reader_epoch = ?,
+             reader_journal_instance_id = ?, updated_at = ?
+         WHERE state_instance_id = ? AND session_id = ?
+           AND reader_owner_token = ? AND reader_epoch = ?
+           AND reader_journal_instance_id = ?`,
+        [
+          input.ownerToken,
+          nextEpoch,
+          journalInstanceId,
+          input.claimedAt,
+          input.stateInstanceId,
+          input.sessionId,
+          existing.reader_owner_token,
+          existing.reader_epoch,
+          existing.reader_journal_instance_id,
+        ],
+      );
+      if (changes(result) !== 1) {
+        storageFail("DRIVER_RESUME_OVERLAP", input.stateInstanceId);
+      }
+      return {
+        readerEpoch: nextEpoch,
+        nextOrdinal: Number(existing.next_ordinal),
+        lastEventDigest: (existing.last_event_digest ?? null) as DriverEventReaderTakeoverResult["lastEventDigest"],
+        supersededOwnerToken: existing.reader_owner_token as DriverEventReaderTakeoverResult["supersededOwnerToken"],
+        supersededReaderEpoch: Number(existing.reader_epoch),
+      };
+    });
+  }
+
+  releaseDriverEventReader(input: {
+    stateInstanceId: StateInstanceId;
+    sessionId: SessionId;
+    ownerToken: ArtifactDigest;
+    readerEpoch: number;
+    releasedAt: string;
+  }): void {
+    this.#requireDirectClaimReceiver();
+    assertProtocolId(input.stateInstanceId, "sti");
+    assertProtocolId(input.sessionId, "ses");
+    assertArtifactDigest(input.ownerToken);
+    if (!Number.isSafeInteger(input.readerEpoch) || input.readerEpoch < 1) {
+      storageFail("DRIVER_EVENT_FENCE_MISMATCH", input.stateInstanceId);
+    }
+    this.transaction(() => {
+      const result = run(
+        this.#database,
+        `UPDATE driver_event_cursor
+         SET reader_owner_token = NULL, reader_journal_instance_id = NULL,
+             updated_at = ?
+         WHERE state_instance_id = ? AND session_id = ? AND reader_owner_token = ?
+           AND reader_epoch = ?`,
+        [
+          input.releasedAt,
+          input.stateInstanceId,
+          input.sessionId,
+          input.ownerToken,
+          input.readerEpoch,
+        ],
+      );
+      if (changes(result) !== 1) {
+        storageFail("DRIVER_EVENT_FENCE_MISMATCH", input.stateInstanceId);
+      }
+    });
+  }
+
+  #requireDirectClaimReceiver(): string {
+    this.#assertOpen();
+    if (this.#journalInstanceId === null) {
+      storageFail("JOURNAL_LOCKED", "journal generation is invalidated");
+    }
+    let descriptorInode: number | bigint;
+    let lockInode: number | bigint;
+    try {
+      descriptorInode = fstatSync(this.#lockDescriptor).ino;
+      lockInode = statSync(this.#lockPath).ino;
+    } catch (error) {
+      return storageFail("JOURNAL_LOCKED", error);
+    }
+    if (descriptorInode !== lockInode) {
+      storageFail("JOURNAL_LOCKED", "machine lock descriptor superseded");
+    }
+    return this.#journalInstanceId;
   }
 
   #configure(): void {

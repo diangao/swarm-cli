@@ -29,8 +29,13 @@ const postgresNativeIngressPath = new URL(
 );
 const postgres = readFileSync(postgresPath, "utf8");
 const postgresNativeIngress = readFileSync(postgresNativeIngressPath, "utf8");
+const sqliteV3Path = new URL(
+  "../../migrations/sqlite/0003_driver_reader_generation.up.sql",
+  import.meta.url,
+);
 const sqlite = readFileSync(sqlitePath, "utf8");
 const sqliteV2 = readFileSync(sqliteV2Path, "utf8");
+const sqliteV3 = readFileSync(sqliteV3Path, "utf8");
 
 const gate1Root = new URL("../../../../contracts/gate1/", import.meta.url);
 const gate1ScenarioBytes = readFileSync(new URL("wave1.v1.json", gate1Root));
@@ -79,6 +84,7 @@ test("frozen PostgreSQL invariant controls are present", () => {
 test("frozen SQLite invariant controls are present", () => {
   assert.doesNotThrow(() => assertSqliteMigrationContract(sqlite));
   assert.doesNotThrow(() => assertSqliteMigrationContract(sqliteV2, "0002"));
+  assert.doesNotThrow(() => assertSqliteMigrationContract(sqliteV3, "0003"));
 });
 
 test("frozen PostgreSQL native-ingress controls are present", () => {
@@ -340,4 +346,35 @@ test("PostgreSQL child environment never inherits ambient libpq credentials", ()
     if (priorService === undefined) delete process.env.PGSERVICE;
     else process.env.PGSERVICE = priorService;
   }
+});
+
+test("seeded SQLite v3 recovery-preimage controls fail when removed", () => {
+  for (const seed of [
+    "ALTER TABLE driver_event_cursor ADD COLUMN reader_journal_instance_id TEXT CHECK (",
+    "substr(reader_journal_instance_id, 1, 4) = 'cmd_'",
+    "ALTER TABLE local_turns ADD COLUMN delivery_id TEXT CHECK (",
+    "substr(delivery_id, 1, 4) = 'dlv_'",
+    "attempt IS NULL OR (attempt >= 1 AND attempt <= 2147483647)",
+    "ALTER TABLE local_turns ADD COLUMN invocation_id TEXT CHECK (",
+    "invocation_generation >= 1 AND invocation_generation <= 9007199254740991",
+    "ALTER TABLE local_turns ADD COLUMN permit_id TEXT CHECK (",
+    "ALTER TABLE local_turns ADD COLUMN runtime_write_id TEXT CHECK (",
+    "ALTER TABLE local_turns ADD COLUMN visibility_event_id TEXT CHECK (",
+  ]) {
+    assert.throws(
+      () => assertSqliteMigrationContract(sqliteV3.replace(seed, "SEEDED_DEFECT"), "0003"),
+      (error: unknown) => error instanceof StorageError && error.code === "INVALID_MIGRATION",
+    );
+  }
+});
+
+test("unsupported SQLite migration versions stay rejected", () => {
+  assert.throws(
+    () => assertSqliteMigrationContract(sqliteV3, "0004"),
+    (error: unknown) => error instanceof StorageError && error.code === "INVALID_MIGRATION",
+  );
+  assert.throws(
+    () => assertSqliteMigrationContract("ALTER TABLE anything;", "0005"),
+    (error: unknown) => error instanceof StorageError && error.code === "INVALID_MIGRATION",
+  );
 });

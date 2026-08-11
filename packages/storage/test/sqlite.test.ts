@@ -95,7 +95,7 @@ const detailDigest = `sha256:${"a".repeat(64)}` as ArtifactDigest;
 
 test("migrations are checksum-stable and a second daemon cannot own the journal", () => {
   const { journal, path } = openJournal();
-  assert.deepEqual(journal.migrate().map((receipt) => receipt.applied), [false, false]);
+  assert.deepEqual(journal.migrate().map((receipt) => receipt.applied), [false, false, false]);
   assert.throws(() => DaemonJournal.open(path), (error: unknown) => {
     return error instanceof StorageError && error.code === "MACHINE_JOURNAL_LOCKED";
   });
@@ -347,7 +347,7 @@ test("test reset is guarded and rebuilds from forward migrations", () => {
   const prior = process.env.NODE_ENV;
   process.env.NODE_ENV = "test";
   try {
-    assert.deepEqual(journal.resetForTests().map((receipt) => receipt.applied), [true, true]);
+    assert.deepEqual(journal.resetForTests().map((receipt) => receipt.applied), [true, true, true]);
   } finally {
     if (prior === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = prior;
@@ -361,4 +361,149 @@ test("direct and channel targets never share a canonical key", () => {
     conversationId: id("cvs", "a") as ConversationId,
   };
   assert.notEqual(canonicalTargetKey(target()), canonicalTargetKey(direct));
+});
+
+// ===========================================================================
+// Task #334 — machine-lock-owning claim surface, hidden journal generation,
+// orphan takeover, and the owner/journal-instance pair invariant.
+// ===========================================================================
+
+const readerStateInstanceId = id("sti", "r") as StateInstanceId;
+const readerSessionId = id("ses", "r") as SessionId;
+
+function readerClaim(ownerSeed: string, mode: "start" | "resume") {
+  return {
+    stateInstanceId: readerStateInstanceId,
+    sessionId: readerSessionId,
+    ownerToken: digest(new TextEncoder().encode(ownerSeed)),
+    mode,
+    claimedAt: "2026-08-10T00:00:00.000Z",
+  };
+}
+
+function storageCodeOf(callback: () => unknown): string {
+  try {
+    callback();
+  } catch (error) {
+    if (error instanceof StorageError) return error.code;
+    throw error;
+  }
+  assert.fail("expected a StorageError");
+}
+
+test("a live reader cannot be stolen: second open fails and self-takeover is refused", () => {
+  const { journal, path } = openJournal();
+  assert.deepEqual(journal.claimDriverEventReader(readerClaim("owner-a", "start")), {
+    readerEpoch: 1,
+    nextOrdinal: 0,
+    lastEventDigest: null,
+  });
+  // A second live daemon never reaches the claim surface.
+  assert.equal(storageCodeOf(() => DaemonJournal.open(path)), "MACHINE_JOURNAL_LOCKED");
+  // The current process cannot steal its own live reader: stored and current
+  // journal generations are equal.
+  assert.equal(storageCodeOf(() => journal.claimOrphanedDriverEventReader({
+    stateInstanceId: readerStateInstanceId,
+    sessionId: readerSessionId,
+    ownerToken: digest(new TextEncoder().encode("thief")),
+    claimedAt: "2026-08-10T00:00:01.000Z",
+  })), "DRIVER_RESUME_OVERLAP");
+  // Normal resume against the live owner never steals either.
+  assert.equal(storageCodeOf(() => journal.claimDriverEventReader(readerClaim("owner-b", "resume"))), "DRIVER_RESUME_OVERLAP");
+  journal.close();
+});
+
+test("orphan takeover CASes the exact previous owner and stale reclaims lose", () => {
+  const { journal, path } = openJournal();
+  const first = journal.claimDriverEventReader(readerClaim("owner-a", "start"));
+  assert.equal(first.readerEpoch, 1);
+  // Crash simulation: the daemon dies without releasing the reader; the
+  // machine lock is released by process death (close() releases the lock but
+  // never the reader claim).
+  journal.close();
+  const fresh = DaemonJournal.open(path);
+  fresh.migrate();
+  const takeover = fresh.claimOrphanedDriverEventReader({
+    stateInstanceId: readerStateInstanceId,
+    sessionId: readerSessionId,
+    ownerToken: digest(new TextEncoder().encode("owner-fresh")),
+    claimedAt: "2026-08-10T00:01:00.000Z",
+  });
+  assert.deepEqual(takeover, {
+    readerEpoch: 2,
+    nextOrdinal: 0,
+    lastEventDigest: null,
+    supersededOwnerToken: digest(new TextEncoder().encode("owner-a")),
+    supersededReaderEpoch: 1,
+  });
+  // A delayed loser (same previous owner identity) cannot take over again.
+  assert.equal(storageCodeOf(() => fresh.claimOrphanedDriverEventReader({
+    stateInstanceId: readerStateInstanceId,
+    sessionId: readerSessionId,
+    ownerToken: digest(new TextEncoder().encode("owner-late")),
+    claimedAt: "2026-08-10T00:01:01.000Z",
+  })), "DRIVER_RESUME_OVERLAP");
+  // Normal resume against the new live owner never steals.
+  assert.equal(storageCodeOf(() => fresh.claimDriverEventReader(readerClaim("owner-b", "resume"))), "DRIVER_RESUME_OVERLAP");
+  fresh.close();
+});
+
+test("hidden journal generation dies with close and reset, and reopen mints fresh", () => {
+  const { journal, path } = openJournal();
+  journal.claimDriverEventReader(readerClaim("owner-a", "start"));
+  journal.releaseDriverEventReader({
+    stateInstanceId: readerStateInstanceId,
+    sessionId: readerSessionId,
+    ownerToken: digest(new TextEncoder().encode("owner-a")),
+    readerEpoch: 1,
+    releasedAt: "2026-08-10T00:02:00.000Z",
+  });
+  journal.close();
+  // A stale method reference after close cannot claim, release, or take over.
+  assert.equal(storageCodeOf(() => journal.claimDriverEventReader(readerClaim("owner-b", "resume"))), "JOURNAL_LOCKED");
+  assert.equal(storageCodeOf(() => journal.claimOrphanedDriverEventReader({
+    stateInstanceId: readerStateInstanceId,
+    sessionId: readerSessionId,
+    ownerToken: digest(new TextEncoder().encode("owner-b")),
+    claimedAt: "2026-08-10T00:02:01.000Z",
+  })), "JOURNAL_LOCKED");
+  assert.equal(storageCodeOf(() => journal.releaseDriverEventReader({
+    stateInstanceId: readerStateInstanceId,
+    sessionId: readerSessionId,
+    ownerToken: digest(new TextEncoder().encode("owner-b")),
+    readerEpoch: 1,
+    releasedAt: "2026-08-10T00:02:02.000Z",
+  })), "JOURNAL_LOCKED");
+  // Reopen mints a distinct generation; resume succeeds only from the
+  // cleared cursor and records the current generation.
+  const reopened = DaemonJournal.open(path);
+  reopened.migrate();
+  assert.deepEqual(reopened.claimDriverEventReader(readerClaim("owner-c", "resume")), {
+    readerEpoch: 2,
+    nextOrdinal: 0,
+    lastEventDigest: null,
+  });
+  reopened.close();
+});
+
+test("an upgraded owned row without a journal generation fails closed, never guessed stale", () => {
+  const { journal, path } = openJournal();
+  journal.claimDriverEventReader(readerClaim("owner-a", "start"));
+  // Simulate a pre-0003 owned row: owner non-null, journal instance null.
+  const database = new DatabaseSync(path);
+  try {
+    database.prepare(
+      "UPDATE driver_event_cursor SET reader_journal_instance_id = NULL",
+    ).run();
+  } finally {
+    database.close();
+  }
+  assert.equal(storageCodeOf(() => journal.claimDriverEventReader(readerClaim("owner-b", "resume"))), "DRIVER_EVENT_FENCE_MISMATCH");
+  assert.equal(storageCodeOf(() => journal.claimOrphanedDriverEventReader({
+    stateInstanceId: readerStateInstanceId,
+    sessionId: readerSessionId,
+    ownerToken: digest(new TextEncoder().encode("owner-b")),
+    claimedAt: "2026-08-10T00:03:00.000Z",
+  })), "DRIVER_EVENT_FENCE_MISMATCH");
+  journal.close();
 });
