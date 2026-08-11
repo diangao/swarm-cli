@@ -1,5 +1,6 @@
 import {
   messageBodyHasContent,
+  type ArtifactDigest,
   type CommandId,
   type DriverIdentity,
   type MessageId,
@@ -129,10 +130,37 @@ type ActiveDriverTurn = {
   coordinationSeen: boolean;
 };
 
+export type DurableModelVisibleExpectation = {
+  expectedTurnId: TurnId;
+  expectedBindingDigest: ArtifactDigest;
+  expectedResolvedWaiterId: CommandId;
+  expectedSourceMessageId: MessageId;
+};
+
 export class DriverEventStreamNormalizer {
   #ready = false;
   #terminal = false;
   #active: ActiveDriverTurn | null = null;
+  readonly #durableExpectation: DurableModelVisibleExpectation | null;
+
+  constructor(expectation: DurableModelVisibleExpectation | null = null) {
+    this.#durableExpectation = expectation;
+    if (expectation !== null) {
+      this.#ready = true;
+      this.#active = {
+        turnId: expectation.expectedTurnId,
+        phase: "model_visible",
+        replySeen: false,
+        coordinationSeen: false,
+      };
+    }
+  }
+
+  static fromDurableModelVisible(
+    expectation: DurableModelVisibleExpectation,
+  ): DriverEventStreamNormalizer {
+    return new DriverEventStreamNormalizer(expectation);
+  }
 
   accept(event: NormalizedDriverEvent): NormalizedDriverEvent {
     if (this.#terminal) this.#order();
@@ -183,6 +211,10 @@ export class DriverEventStreamNormalizer {
     }
     if (event.kind === "coordination_call") {
       if (!active.replySeen || active.coordinationSeen) this.#order();
+      if (
+        this.#durableExpectation !== null
+        && event.command.sourceMessageId !== this.#durableExpectation.expectedSourceMessageId
+      ) this.#fence();
       active.coordinationSeen = true;
       return event;
     }

@@ -20,6 +20,16 @@ import type {
 } from "@swarm/protocol";
 import type { CompiledNativeTurn } from "@swarm/runtime-contract";
 import { DriverNormalizationError } from "./normalizer.js";
+import type {
+  DriverCompositeCursorClaimHandle,
+  DriverEventRecord as RetainedDriverRecord,
+  DriverLiveResumeAuthorization,
+  DriverLiveResumeTicket,
+  DriverPrivateClaimAttempt,
+  DriverRetainedReplay,
+  RetainedDriverEventLease,
+} from "./retained-events.js";
+import { DriverRetentionError } from "./retained-events.js";
 
 export type NativeWriteBinding = {
   invocationId: CommandId;
@@ -73,6 +83,7 @@ export type DriverResumeSpec = {
   expectedSessionId: SessionId;
   runtimeSessionRefPrivate: string;
   cursorOwnerToken: ArtifactDigest;
+  liveResumeAuthorization: DriverLiveResumeAuthorization;
 };
 
 export type SpawnHandle = {
@@ -83,18 +94,51 @@ export type SpawnHandle = {
   transportDigest: ArtifactDigest;
 };
 
+export interface DriverCursorClaimCoordinator {
+  claimAfterSpawn(input: {
+    spec: DriverLaunchSpec;
+    process: SpawnHandle;
+    pump: DriverEventPump;
+    cursorOwnerToken: ArtifactDigest;
+  }): Promise<DriverCompositeCursorClaimHandle>;
+
+  claimForReplay(input: {
+    protocolVersion: ProtocolVersion;
+    launchId: LaunchId;
+    stateInstanceId: StateInstanceId;
+    sessionId: SessionId;
+    cursorOwnerToken: ArtifactDigest;
+    pump: DriverEventPump;
+  }): Promise<DriverCompositeCursorClaimHandle>;
+
+  beginLiveResume(input: {
+    protocolVersion: ProtocolVersion;
+    launchId: LaunchId;
+    stateInstanceId: StateInstanceId;
+    sessionId: SessionId;
+    cursorOwnerToken: ArtifactDigest;
+    authorization: DriverLiveResumeAuthorization;
+  }): DriverLiveResumeTicket;
+
+  claimForLiveResume(input: {
+    ticket: DriverLiveResumeTicket;
+    pump: DriverEventPump;
+  }): Promise<DriverCompositeCursorClaimHandle>;
+
+  cancelLiveResume(ticket: DriverLiveResumeTicket): void;
+
+  releaseReplayAsNoActive(
+    claim: DriverCompositeCursorClaimHandle,
+  ): Promise<DriverLiveResumeAuthorization>;
+}
+
 export type DriverStatus =
   | { kind: "spawning"; launch: SpawnedLaunchFence }
   | { kind: "ready"; launch: ReadyLaunchFence }
   | { kind: "running"; launch: ReadyLaunchFence; activeTurnId: TurnId }
   | { kind: "terminal"; reason: TerminalReason };
 
-export type DriverEventPumpLease = {
-  stateInstanceId: StateInstanceId;
-  sessionId: SessionId;
-  ownerToken: ArtifactDigest;
-  readerEpoch: number;
-};
+export type DriverEventPumpLease = RetainedDriverEventLease;
 
 export type DriverEventWaiterSpec = {
   kind: "initialize" | "resume" | "turn";
@@ -113,28 +157,17 @@ export type DriverEventWaiter = DriverEventWaiterSpec & {
 
 /** Exact pump registration returned after snapshotting the durable cursor. */
 export type DriverRegisteredEventWaiter = DriverEventWaiter & {
+  stream: "lifecycle" | "turn";
   readerEpoch: number;
-  registeredThroughOrdinal: number;
+  registeredThroughOrdinal: number | null;
 };
 
-export type DriverEventRecord = {
-  stateInstanceId: StateInstanceId;
-  sessionId: SessionId;
-  readerEpoch: number;
-  resolvedWaiterId: CommandId;
-  ordinal: number;
-  eventDigest: ArtifactDigest;
-  bindingDigest?: ArtifactDigest;
-  event: NormalizedDriverEvent;
-};
+export type DriverEventRecord = RetainedDriverRecord;
 
 export interface DriverEventPump {
   readonly stateInstanceId: StateInstanceId;
-  claimCursor(input: {
-    sessionId: SessionId;
-    ownerToken: ArtifactDigest;
-    mode: "start" | "resume";
-  }): Promise<DriverEventPumpLease>;
+  claimCursor(input: DriverPrivateClaimAttempt): Promise<RetainedDriverEventLease>;
+  releaseClaimAttempt(input: DriverPrivateClaimAttempt): Promise<void>;
   registerWaiter(
     lease: DriverEventPumpLease,
     spec: DriverEventWaiterSpec,
@@ -144,11 +177,11 @@ export interface DriverEventPump {
     spec: DriverEventWaiterSpec,
   ): Promise<void>;
   waitForRecord(
-    lease: DriverEventPumpLease,
+    lease: RetainedDriverEventLease,
     waiter: DriverRegisteredEventWaiter,
   ): Promise<DriverEventRecord>;
   subscribe(lease: DriverEventPumpLease): AsyncIterable<DriverEventRecord>;
-  release(lease: DriverEventPumpLease): Promise<void>;
+  closeLeaseObservers(lease: RetainedDriverEventLease): Promise<void>;
 }
 
 export type DriverStartWriteWitness = {
@@ -175,7 +208,7 @@ export type DriverStartPreparationInput = {
   spec: DriverLaunchSpec;
   process: SpawnHandle;
   pump: DriverEventPump;
-  cursorOwnerToken: ArtifactDigest;
+  cursorClaim: DriverCompositeCursorClaimHandle;
   initializeWaiterId: CommandId;
   initializeBindingDigest: ArtifactDigest;
   writeInitialize(witness: DriverStartWriteWitness): Promise<void>;
@@ -191,6 +224,7 @@ export class DriverStartPreparation {
   readonly #spec: DriverLaunchSpec;
   readonly #process: SpawnHandle;
   readonly #pump: DriverEventPump;
+  readonly #cursorClaim: DriverCompositeCursorClaimHandle;
   readonly #lease: DriverEventPumpLease;
   readonly #waiter: DriverRegisteredEventWaiter;
   readonly #waiterSpec: DriverEventWaiterSpec;
@@ -216,6 +250,7 @@ export class DriverStartPreparation {
     this.#spec = input.spec;
     this.#process = input.process;
     this.#pump = input.pump;
+    this.#cursorClaim = input.cursorClaim;
     this.#lease = lease;
     this.#waiter = waiter;
     this.#waiterSpec = waiterSpec;
@@ -236,16 +271,16 @@ export class DriverStartPreparation {
       sessionId: input.spec.sessionId,
       bindingDigest: input.initializeBindingDigest,
     };
-    let lease: DriverEventPumpLease | undefined;
+    const lease = input.cursorClaim.privateLease;
     let waiterRegistrationAttempted = false;
 
     try {
-      lease = await input.pump.claimCursor({
-        sessionId: input.spec.sessionId,
-        ownerToken: input.cursorOwnerToken,
-        mode: "start",
-      });
-      assertLease(lease, input.process.stateInstanceId, input.spec.sessionId, input.cursorOwnerToken);
+      assertLease(
+        lease,
+        input.process.stateInstanceId,
+        input.spec.sessionId,
+        input.cursorClaim.authority.ownerToken,
+      );
 
       waiterRegistrationAttempted = true;
       const waiter = await input.pump.registerWaiter(lease, waiterSpec);
@@ -254,14 +289,12 @@ export class DriverStartPreparation {
 
       return new DriverStartPreparation(input, lease, waiter, waiterSpec);
     } catch (cause) {
-      if (lease !== undefined) {
-        await unwindAfterFailure(
-          input.pump,
-          lease,
-          waiterRegistrationAttempted ? waiterSpec : undefined,
-          cause,
-        );
-      }
+      await unwindAfterFailure(
+        input.pump,
+        input.cursorClaim,
+        waiterRegistrationAttempted ? waiterSpec : undefined,
+        cause,
+      );
       throw cause;
     }
   }
@@ -376,7 +409,11 @@ export class DriverStartPreparation {
   }
 
   #cleanup(): Promise<unknown[]> {
-    this.#cleanupPromise ??= cleanupWaiterAndLease(this.#pump, this.#lease, this.#waiterSpec);
+    this.#cleanupPromise ??= cleanupWaiterAndClaim(
+      this.#pump,
+      this.#cursorClaim,
+      this.#waiterSpec,
+    );
     return this.#cleanupPromise;
   }
 }
@@ -409,16 +446,35 @@ export interface NativeProcessDriver {
   ): Promise<void>;
   status(process: SpawnHandle, session?: DriverSession): Promise<DriverStatus>;
   events(process: SpawnHandle): AsyncIterable<NormalizedDriverEvent>;
+  recoverEvents(input: {
+    claim: DriverCompositeCursorClaimHandle;
+    expectedTurnId: TurnId;
+    expectedBindingDigest: ArtifactDigest;
+    expectedResolvedWaiterId: CommandId;
+    expectedSourceMessageId: import("@swarm/protocol").MessageId;
+  }): Promise<DriverRetainedReplay>;
   stop(process: SpawnHandle, reason: StopReason): Promise<void>;
 }
 
 function assertStartInput(input: DriverStartPreparationInput): void {
+  const authority = input.cursorClaim.authority;
+  const lease = input.cursorClaim.privateLease;
   if (
     input.process.launchId !== input.spec.launch.launchId
     || input.process.transportDigest !== input.spec.transportDigest
     || input.pump.stateInstanceId !== input.process.stateInstanceId
+    || authority.protocolVersion !== input.spec.launch.protocolVersion
+    || authority.launchId !== input.spec.launch.launchId
+    || authority.stateInstanceId !== input.process.stateInstanceId
+    || authority.sessionId !== input.spec.sessionId
+    || authority.nextOrdinal !== lease.nextOrdinal
+    || authority.lastEventDigest !== lease.lastEventDigest
+    || authority.ownerToken !== lease.ownerToken
+    || authority.readerEpoch !== lease.readerEpoch
+    || lease.replayMode !== "live"
+    || lease.processMode !== "start"
   ) {
-    throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
+    throw new DriverRetentionError("DRIVER_START_AUTHORITY_REQUIRED");
   }
 }
 
@@ -453,8 +509,10 @@ function assertWaiter(
     || waiter.bindingDigest !== expected.bindingDigest
     || waiter.registeredBeforeWrite !== true
     || waiter.readerEpoch !== readerEpoch
-    || !Number.isSafeInteger(waiter.registeredThroughOrdinal)
-    || waiter.registeredThroughOrdinal < 0
+    || waiter.stream !== (expected.kind === "turn" ? "turn" : "lifecycle")
+    || (waiter.registeredThroughOrdinal !== null
+      && (!Number.isSafeInteger(waiter.registeredThroughOrdinal)
+        || waiter.registeredThroughOrdinal < 0))
   ) {
     throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
   }
@@ -471,10 +529,12 @@ function assertRuntimeReadyRecord(
     record.stateInstanceId !== stateInstanceId
     || record.sessionId !== sessionId
     || record.readerEpoch !== readerEpoch
+    || record.stream !== "lifecycle"
     || record.resolvedWaiterId !== waiter.waiterId
     || record.bindingDigest !== waiter.bindingDigest
     || !Number.isSafeInteger(record.ordinal)
-    || record.ordinal <= waiter.registeredThroughOrdinal
+    || (waiter.registeredThroughOrdinal !== null
+      && record.ordinal <= waiter.registeredThroughOrdinal)
     || record.event.kind !== "runtime_ready"
   ) {
     throw new DriverNormalizationError("DRIVER_EVENT_FENCE_MISMATCH");
@@ -501,29 +561,29 @@ function sameReadyLaunch(
 
 async function unwindAfterFailure(
   pump: DriverEventPump,
-  lease: DriverEventPumpLease,
+  claim: DriverCompositeCursorClaimHandle,
   waiterSpec: DriverEventWaiterSpec | undefined,
   cause: unknown,
 ): Promise<never> {
-  const cleanupErrors = await cleanupWaiterAndLease(pump, lease, waiterSpec);
+  const cleanupErrors = await cleanupWaiterAndClaim(pump, claim, waiterSpec);
   return throwWithCleanup(cause, cleanupErrors, "DRIVER_START_PREPARATION_FAILED");
 }
 
-async function cleanupWaiterAndLease(
+async function cleanupWaiterAndClaim(
   pump: DriverEventPump,
-  lease: DriverEventPumpLease,
+  claim: DriverCompositeCursorClaimHandle,
   waiterSpec: DriverEventWaiterSpec | undefined,
 ): Promise<unknown[]> {
   const failures: unknown[] = [];
   if (waiterSpec !== undefined) {
     try {
-      await pump.cancelWaiter(lease, waiterSpec);
+      await pump.cancelWaiter(claim.privateLease, waiterSpec);
     } catch (cleanupError) {
       failures.push(cleanupError);
     }
   }
   try {
-    await pump.release(lease);
+    await claim.abort();
   } catch (cleanupError) {
     failures.push(cleanupError);
   }

@@ -10,7 +10,6 @@ import type {
   DriverTurnBinding,
   NormalizedDriverEvent,
   ReadyLaunchFence,
-  SessionId,
 } from "@swarm/protocol";
 import type { CompiledNativeTurn } from "@swarm/runtime-contract";
 
@@ -22,9 +21,16 @@ import type {
   DriverLaunchSpec,
   DriverProbeSpec,
   DriverRegisteredEventWaiter,
+  DriverResumeSpec,
   DriverStatus,
+  DriverCursorClaimCoordinator,
   SpawnHandle,
 } from "../src/port.js";
+import type {
+  DriverCompositeCursorClaimHandle,
+  DriverPrivateClaimAttempt,
+  DriverRetainedEventSource,
+} from "../src/retained-events.js";
 import { DriverNormalizationError } from "../src/normalizer.js";
 import { CodexNativeProcessDriver } from "../src/codex/adapter.js";
 import {
@@ -81,7 +87,11 @@ const claudeIdentity: DriverIdentity = {
   capability: { ...CLAUDE_CAPABILITY },
 };
 const compiled = {
-  input: {} as CompiledNativeTurn["input"],
+  input: {
+    current: {
+      delivery: { messageId: `msg_${"0".repeat(26)}` },
+    },
+  } as CompiledNativeTurn["input"],
   bytes: new TextEncoder().encode("PRIVATE_BODY_MUST_NOT_ENTER_ARGV"),
   inputDigest: binding.inputDigest,
 } satisfies CompiledNativeTurn;
@@ -89,7 +99,7 @@ const compiled = {
 test("Codex start proves claim→waiter→wire order and mismatch probe cannot spawn", async () => {
   const pump = new RecordingPump();
   const host = new CodexHost(pump);
-  const driver = new CodexNativeProcessDriver(host);
+  const driver = codexDriver(host);
   const spec = launchSpec(codexIdentity);
   const started = await driver.start(spec);
   assert.deepEqual(host.argv, CODEX_APP_SERVER_ARGV);
@@ -100,7 +110,7 @@ test("Codex start proves claim→waiter→wire order and mismatch probe cannot s
 
   const badHost = new CodexHost(new RecordingPump());
   badHost.probeVersion = "codex-cli 0.145.1";
-  const bad = new CodexNativeProcessDriver(badHost);
+  const bad = codexDriver(badHost);
   assert.equal(await asyncDriverCode(() => bad.probe(probeSpec(codexIdentity))), "DRIVER_PROTOCOL_UNSUPPORTED");
   assert.equal(badHost.spawnCount, 0);
 });
@@ -108,7 +118,7 @@ test("Codex start proves claim→waiter→wire order and mismatch probe cannot s
 test("Claude start uses the exact secret-free argv after waiter registration", async () => {
   const pump = new RecordingPump();
   const host = new ClaudeHost(pump);
-  const driver = new ClaudeNativeProcessDriver(host);
+  const driver = claudeDriver(host);
   const spec = launchSpec(claudeIdentity);
   const started = await driver.start(spec);
   const runtimeSessionRef = claudeRuntimeSessionUuid(spec.sessionId);
@@ -119,11 +129,78 @@ test("Claude start uses the exact secret-free argv after waiter registration", a
   await bindReady(started.preparation, spec, process);
 });
 
+test("Codex and Claude resume claim live authority before accepting a future new turn", async () => {
+  const codexPump = new RecordingPump();
+  const codexHost = new CodexHost(codexPump);
+  codexHost.completeTurn = true;
+  const codex = codexDriver(codexHost);
+  const codexSpec = resumeSpec(codexIdentity, "codex-thread-private");
+  const codexProcess = await codex.resume(codexSpec);
+  assert.equal(codexPump.lease.processMode, "resume");
+  assert.equal(codexPump.lease.replayMode, "live");
+  const codexOutcome = await codex.startTurn(
+    codexProcess,
+    readySession(launchSpec(codexIdentity), codexIdentity, "codex-thread-private"),
+    compiled,
+    binding,
+  );
+  assert.equal(codexOutcome.kind, "written");
+  if (codexOutcome.kind === "written") {
+    assert.deepEqual(await collect(codexOutcome.events), [
+      { kind: "assistant_reply", text: "Done." },
+      { kind: "turn_complete" },
+    ]);
+  }
+  await codex.stop(codexProcess, "daemon_shutdown");
+
+  const claudePump = new RecordingPump();
+  const claudeHost = new ClaudeHost(claudePump);
+  claudeHost.completeTurn = true;
+  const claude = claudeDriver(claudeHost);
+  const claudeSession = claudeRuntimeSessionUuid(binding.delivery.sessionId);
+  const claudeSpec = resumeSpec(claudeIdentity, claudeSession);
+  const claudeProcess = await claude.resume(claudeSpec);
+  assert.equal(claudePump.lease.processMode, "resume");
+  assert.equal(claudePump.lease.replayMode, "live");
+  const claudeOutcome = await claude.startTurn(
+    claudeProcess,
+    readySession(launchSpec(claudeIdentity), claudeIdentity, claudeSession),
+    compiled,
+    binding,
+  );
+  assert.equal(claudeOutcome.kind, "written");
+  if (claudeOutcome.kind === "written") {
+    assert.deepEqual(await collect(claudeOutcome.events), [
+      { kind: "assistant_reply", text: "Done." },
+      { kind: "turn_complete" },
+    ]);
+  }
+  await claude.stop(claudeProcess, "daemon_shutdown");
+});
+
+test("live resume authorization is consumed before any provider host effect", async () => {
+  const pump = new RecordingPump();
+  const host = new CodexHost(pump);
+  const rejectedCoordinator: DriverCursorClaimCoordinator = {
+    ...testCursorCoordinator,
+    beginLiveResume() {
+      throw new Error("DRIVER_START_AUTHORITY_REQUIRED");
+    },
+  };
+  const driver = new CodexNativeProcessDriver(host, unusedRetainedSource, rejectedCoordinator);
+  await assert.rejects(
+    driver.resume(resumeSpec(codexIdentity, "codex-thread-private")),
+    /DRIVER_START_AUTHORITY_REQUIRED/u,
+  );
+  assert.equal(host.spawnCount, 0);
+  assert.deepEqual(host.writes, []);
+});
+
 test("a failed post-spawn handshake unwinds pump ownership and stops the exact child", async () => {
   const pump = new RecordingPump();
   const host = new CodexHost(pump);
   host.failInitialize = true;
-  const driver = new CodexNativeProcessDriver(host);
+  const driver = codexDriver(host);
   assert.equal(
     await asyncErrorMessage(() => driver.start(launchSpec(codexIdentity))),
     "wire failed",
@@ -140,7 +217,7 @@ test("a failed post-spawn handshake unwinds pump ownership and stops the exact c
 test("waiter mismatch is cleaned before write and the same exact turn can retry", async () => {
   const pump = new RecordingPump();
   const host = new CodexHost(pump);
-  const driver = new CodexNativeProcessDriver(host);
+  const driver = codexDriver(host);
   const spec = launchSpec(codexIdentity);
   const started = await driver.start(spec);
   await bindReady(started.preparation, spec, process);
@@ -166,7 +243,7 @@ test("a live Codex pump closes the per-turn stream at exact completion", async (
   pump.hangAfterRecords = true;
   const host = new CodexHost(pump);
   host.completeTurn = true;
-  const driver = new CodexNativeProcessDriver(host);
+  const driver = codexDriver(host);
   const spec = launchSpec(codexIdentity);
   const started = await driver.start(spec);
   await bindReady(started.preparation, spec, process);
@@ -197,7 +274,7 @@ test("a live Claude pump closes the per-turn stream at exact result", async () =
   pump.hangAfterRecords = true;
   const host = new ClaudeHost(pump);
   host.completeTurn = true;
-  const driver = new ClaudeNativeProcessDriver(host);
+  const driver = claudeDriver(host);
   const spec = launchSpec(claudeIdentity);
   const started = await driver.start(spec);
   await bindReady(started.preparation, spec, process);
@@ -229,7 +306,7 @@ test("swapped or wrong visibility ids produce no native written outcome and pres
   codexPump.wrongNextVisibilityEventId = binding.runtimeWriteId;
   const codexHost = new CodexHost(codexPump);
   codexHost.completeTurn = true;
-  const codexDriver = new CodexNativeProcessDriver(codexHost);
+  const codexDriver = codexDriverForHost(codexHost);
   const codexSpec = launchSpec(codexIdentity);
   const codexStarted = await codexDriver.start(codexSpec);
   await bindReady(codexStarted.preparation, codexSpec, process);
@@ -249,7 +326,7 @@ test("swapped or wrong visibility ids produce no native written outcome and pres
   claudePump.wrongNextVisibilityEventId = `cmd_${"9".repeat(26)}` as CommandId;
   const claudeHost = new ClaudeHost(claudePump);
   claudeHost.completeTurn = true;
-  const claudeDriver = new ClaudeNativeProcessDriver(claudeHost);
+  const claudeDriver = claudeDriverForHost(claudeHost);
   const claudeSpec = launchSpec(claudeIdentity);
   const claudeStarted = await claudeDriver.start(claudeSpec);
   await bindReady(claudeStarted.preparation, claudeSpec, process);
@@ -271,10 +348,18 @@ class RecordingPump implements DriverEventPump {
   readonly calls: string[] = [];
   readonly timeline: string[] = [];
   readonly lease: DriverEventPumpLease = {
+    protocolVersion: binding.delivery.protocolVersion,
+    launchId: binding.delivery.launchId,
     stateInstanceId,
     sessionId: binding.delivery.sessionId,
     ownerToken: digest("9"),
     readerEpoch: 1,
+    nextOrdinal: 0,
+    lastEventDigest: null,
+    claimAttemptId: binding.invocation.invocationId,
+    processMode: "start",
+    replayMode: "live",
+    snapshotHeadNextOrdinal: 0,
   };
   wrongNextWaiterEpoch = false;
   wrongNextVisibilityEventId: CommandId | undefined;
@@ -283,16 +368,20 @@ class RecordingPump implements DriverEventPump {
   #records: DriverEventRecord[] = [];
   #ordinal = 0;
 
-  async claimCursor(input: {
-    sessionId: SessionId;
-    ownerToken: ArtifactDigest;
-    mode: "start" | "resume";
-  }): Promise<DriverEventPumpLease> {
-    this.calls.push(`claim:${input.mode}`);
-    this.timeline.push(`claim:${input.mode}`);
+  async claimCursor(input: DriverPrivateClaimAttempt): Promise<DriverEventPumpLease> {
+    this.calls.push(`claim:${input.processMode}`);
+    this.timeline.push(`claim:${input.processMode}`);
     this.lease.ownerToken = input.ownerToken;
+    Object.assign(this.lease, input, { snapshotHeadNextOrdinal: input.nextOrdinal });
     return this.lease;
   }
+
+  async releaseClaimAttempt(_input: DriverPrivateClaimAttempt): Promise<void> {
+    this.calls.push("release");
+    this.timeline.push("release");
+  }
+
+  async closeLeaseObservers(_lease: DriverEventPumpLease): Promise<void> {}
 
   async registerWaiter(
     _lease: DriverEventPumpLease,
@@ -303,6 +392,7 @@ class RecordingPump implements DriverEventPump {
     const waiter = {
       ...spec,
       registeredBeforeWrite: true as const,
+      stream: spec.kind === "turn" ? "turn" as const : "lifecycle" as const,
       readerEpoch: this.wrongNextWaiterEpoch ? this.lease.readerEpoch + 1 : this.lease.readerEpoch,
       registeredThroughOrdinal: this.#ordinal,
     };
@@ -323,7 +413,10 @@ class RecordingPump implements DriverEventPump {
   ): Promise<DriverEventRecord> {
     this.calls.push(`wait:${waiter.kind}`);
     this.timeline.push(`wait:${waiter.kind}`);
-    const index = this.#records.findIndex((record) => record.resolvedWaiterId === waiter.waiterId);
+    const expectedKind = waiter.kind === "turn" ? "model_visible" : "runtime_ready";
+    const index = this.#records.findIndex((record) => (
+      record.resolvedWaiterId === waiter.waiterId && record.event.kind === expectedKind
+    ));
     if (index < 0) throw new Error("record missing");
     return this.#records.splice(index, 1)[0]!;
   }
@@ -331,11 +424,6 @@ class RecordingPump implements DriverEventPump {
   async *subscribe(_lease: DriverEventPumpLease): AsyncIterable<DriverEventRecord> {
     while (this.#records.length > 0) yield this.#records.shift()!;
     if (this.hangAfterRecords) await new Promise<void>(() => undefined);
-  }
-
-  async release(_lease: DriverEventPumpLease): Promise<void> {
-    this.calls.push("release");
-    this.timeline.push("release");
   }
 
   push(events: readonly NormalizedDriverEvent[]): void {
@@ -348,17 +436,18 @@ class RecordingPump implements DriverEventPump {
       if (event.kind === "model_visible") this.wrongNextVisibilityEventId = undefined;
       this.#ordinal += 1;
       this.#records.push({
+        stream: storedEvent.kind === "runtime_ready" || storedEvent.kind === "runtime_terminal"
+          ? "lifecycle"
+          : "turn",
         stateInstanceId,
         sessionId: binding.delivery.sessionId,
         readerEpoch: this.lease.readerEpoch,
-        resolvedWaiterId: storedEvent.kind === "runtime_ready" || storedEvent.kind === "model_visible"
-          ? waiter.waiterId
-          : `cmd_${"8".repeat(26)}` as CommandId,
+        resolvedWaiterId: waiter.waiterId,
         ordinal: this.#ordinal,
         eventDigest: digest("a"),
         bindingDigest: waiter.bindingDigest,
         event: storedEvent,
-      });
+      } as DriverEventRecord);
     }
   }
 }
@@ -454,8 +543,14 @@ class CodexHost implements CodexRuntimeHost {
     };
   }
 
-  async resume(): Promise<never> {
-    throw new Error("unused");
+  async resume(spec: DriverResumeSpec, input: Parameters<CodexRuntimeHost["resume"]>[1]) {
+    const spawned = await this.spawn(launchSpec(codexIdentity), input);
+    return {
+      ...spawned,
+      cursorOwnerToken: spec.cursorOwnerToken,
+      resumeWaiterId: `cmd_${"2".repeat(26)}` as CommandId,
+      resumeBindingDigest: digest("d"),
+    };
   }
 
   async status(): Promise<DriverStatus> {
@@ -537,8 +632,14 @@ class ClaudeHost implements ClaudeRuntimeHost {
     };
   }
 
-  async resume(): Promise<never> {
-    throw new Error("unused");
+  async resume(spec: DriverResumeSpec, input: Parameters<ClaudeRuntimeHost["resume"]>[1]) {
+    const spawned = await this.spawn(launchSpec(claudeIdentity), input);
+    return {
+      ...spawned,
+      cursorOwnerToken: spec.cursorOwnerToken,
+      resumeWaiterId: `cmd_${"3".repeat(26)}` as CommandId,
+      resumeBindingDigest: digest("e"),
+    };
   }
 
   async status(): Promise<DriverStatus> {
@@ -579,6 +680,27 @@ function launchSpec(identity: DriverIdentity): DriverLaunchSpec {
   };
 }
 
+function resumeSpec(identity: DriverIdentity, runtimeSessionRefPrivate: string): DriverResumeSpec {
+  const start = launchSpec(identity);
+  const cursorOwnerToken = digest("9");
+  return {
+    launch: { ...start.launch, stateInstanceId },
+    expectedSessionId: start.sessionId,
+    runtimeSessionRefPrivate,
+    cursorOwnerToken,
+    liveResumeAuthorization: Object.freeze({
+      protocolVersion: start.launch.protocolVersion,
+      launchId: start.launch.launchId,
+      stateInstanceId,
+      sessionId: start.sessionId,
+      ownerToken: cursorOwnerToken,
+      provedReaderEpoch: 1,
+      nextOrdinal: 0,
+      lastEventDigest: null,
+    }),
+  };
+}
+
 function probeSpec(identity: DriverIdentity): DriverProbeSpec {
   return {
     protocolVersion: identity.protocolVersion,
@@ -604,6 +726,136 @@ async function bindReady(
     value: "ready",
   }));
   assert.equal(persisted.value, "ready");
+}
+
+const unusedRetainedSource: DriverRetainedEventSource = {
+  async openReplay() {
+    throw new Error("retained replay is not used by the live adapter controls");
+  },
+};
+
+const testCursorCoordinator: DriverCursorClaimCoordinator = {
+  async claimAfterSpawn(input) {
+    return claimPump(input.pump, {
+      protocolVersion: input.spec.launch.protocolVersion,
+      launchId: input.spec.launch.launchId,
+      stateInstanceId: input.process.stateInstanceId,
+      sessionId: input.spec.sessionId,
+      ownerToken: input.cursorOwnerToken,
+      readerEpoch: 1,
+      nextOrdinal: 0,
+      lastEventDigest: null,
+      claimAttemptId: binding.invocation.invocationId,
+      processMode: "start",
+      replayMode: "live",
+    });
+  },
+  async claimForReplay(input) {
+    return claimPump(input.pump, {
+      protocolVersion: input.protocolVersion,
+      launchId: input.launchId,
+      stateInstanceId: input.stateInstanceId,
+      sessionId: input.sessionId,
+      ownerToken: input.cursorOwnerToken,
+      readerEpoch: 1,
+      nextOrdinal: 0,
+      lastEventDigest: null,
+      claimAttemptId: binding.invocation.invocationId,
+      processMode: "resume",
+      replayMode: "retained_only",
+    });
+  },
+  beginLiveResume(input) {
+    assert.equal(input.authorization.protocolVersion, input.protocolVersion);
+    assert.equal(input.authorization.launchId, input.launchId);
+    assert.equal(input.authorization.stateInstanceId, input.stateInstanceId);
+    assert.equal(input.authorization.sessionId, input.sessionId);
+    assert.equal(input.authorization.ownerToken, input.cursorOwnerToken);
+    return Object.freeze({
+      protocolVersion: input.protocolVersion,
+      launchId: input.launchId,
+      stateInstanceId: input.stateInstanceId,
+      sessionId: input.sessionId,
+      ownerToken: input.cursorOwnerToken,
+      nextOrdinal: input.authorization.nextOrdinal,
+      lastEventDigest: input.authorization.lastEventDigest,
+    });
+  },
+  async claimForLiveResume(input) {
+    return claimPump(input.pump, {
+      protocolVersion: input.ticket.protocolVersion,
+      launchId: input.ticket.launchId,
+      stateInstanceId: input.ticket.stateInstanceId,
+      sessionId: input.ticket.sessionId,
+      ownerToken: input.ticket.ownerToken,
+      readerEpoch: 1,
+      nextOrdinal: input.ticket.nextOrdinal,
+      lastEventDigest: input.ticket.lastEventDigest,
+      claimAttemptId: binding.invocation.invocationId,
+      processMode: "resume",
+      replayMode: "live",
+    });
+  },
+  cancelLiveResume() {},
+  async releaseReplayAsNoActive(claim) {
+    await claim.abort();
+    return Object.freeze({
+      protocolVersion: claim.authority.protocolVersion,
+      launchId: claim.authority.launchId,
+      stateInstanceId: claim.authority.stateInstanceId,
+      sessionId: claim.authority.sessionId,
+      ownerToken: claim.authority.ownerToken,
+      provedReaderEpoch: claim.authority.readerEpoch,
+      nextOrdinal: claim.authority.nextOrdinal,
+      lastEventDigest: claim.authority.lastEventDigest,
+    });
+  },
+};
+
+function codexDriver(host: CodexRuntimeHost): CodexNativeProcessDriver {
+  return new CodexNativeProcessDriver(host, unusedRetainedSource, testCursorCoordinator);
+}
+
+function codexDriverForHost(host: CodexRuntimeHost): CodexNativeProcessDriver {
+  return codexDriver(host);
+}
+
+function claudeDriver(host: ClaudeRuntimeHost): ClaudeNativeProcessDriver {
+  return new ClaudeNativeProcessDriver(host, unusedRetainedSource, testCursorCoordinator);
+}
+
+function claudeDriverForHost(host: ClaudeRuntimeHost): ClaudeNativeProcessDriver {
+  return claudeDriver(host);
+}
+
+async function claimPump(
+  pump: DriverEventPump,
+  attempt: DriverPrivateClaimAttempt,
+): Promise<DriverCompositeCursorClaimHandle> {
+  const privateLease = await pump.claimCursor(attempt);
+  let closed = false;
+  const close = async () => {
+    if (closed) return { applied: false, storageReleased: true, privateReleased: true };
+    closed = true;
+    await pump.closeLeaseObservers(privateLease);
+    await pump.releaseClaimAttempt(attempt);
+    return { applied: true, storageReleased: true, privateReleased: true };
+  };
+  return {
+    authority: {
+      protocolVersion: attempt.protocolVersion,
+      launchId: attempt.launchId,
+      stateInstanceId: attempt.stateInstanceId,
+      sessionId: attempt.sessionId,
+      ownerToken: attempt.ownerToken,
+      readerEpoch: attempt.readerEpoch,
+      nextOrdinal: attempt.nextOrdinal,
+      lastEventDigest: attempt.lastEventDigest,
+    },
+    privateLease,
+    abort: close,
+    release: close,
+  };
 }
 
 function readySession(
