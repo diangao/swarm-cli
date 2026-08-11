@@ -41,3 +41,6 @@ export type {
   RecordBodyReadInput,
   RecordMetadataOnlyInput,
 } from "./recorder.js";
+
+export { Wave2Fake } from "./wave2/fake.js";
+export type { DefectResponse, LedgerEvent, Wave2Ledger } from "./wave2/fake.js";
