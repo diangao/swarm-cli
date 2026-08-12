@@ -84,6 +84,11 @@ jobs:
         run: pnpm test
       - name: Test storage with PostgreSQL 16
         run: pnpm --filter @swarm/storage test:postgres
+      - name: Verify Wave 3 shared-seam package contracts
+        run: |
+          pnpm --filter @swarm/protocol test
+          pnpm --filter @swarm/testkit test
+          pnpm --filter @swarm/storage test:postgres
       - name: Check package boundaries
         run: pnpm check:boundaries
       - name: Prove package-boundary seeded negative

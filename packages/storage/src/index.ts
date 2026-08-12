@@ -2,9 +2,14 @@ export { StorageError, storageFail, type StorageErrorCode } from "./errors.js";
 export {
   assertPostgresMigrationContract,
   assertPostgresNativeIngressMigrationContract,
+  assertPostgresWave3MigrationContract,
   assertSqliteMigrationContract,
 } from "./contracts.js";
-export { type MigrationReceipt } from "./migrations.js";
+export {
+  WAVE3_POSTGRES_MIGRATION,
+  WAVE3_POSTGRES_MIGRATION_CHECKSUM,
+  type MigrationReceipt,
+} from "./migrations.js";
 export {
   canonicalTargetKey,
   parseFrozenDelivery,
@@ -46,6 +51,19 @@ export {
   type ReminderMutationInput,
 } from "./postgres/server-reminders.js";
 export { PsqlSession, sqlLiteral } from "./postgres/session.js";
+export {
+  ArtifactV3Repository,
+  ReviewV3Repository,
+  TaskGraphV3Repository,
+  TaskLeaseV3Repository,
+  Wave3RegistryRepository,
+  Wave3SchemaRepository,
+  WorkspaceReservationV3Repository,
+  type RegisterRootTaskV3,
+  type RegisterTaskV3,
+  type Wave3PgTestLatchName,
+  type Wave3PgTestLatchPort,
+} from "./postgres/task-v3.js";
 export {
   AgentRegistryRepository,
   MembershipRepository,

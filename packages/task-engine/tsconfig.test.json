@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": false, "outDir": "./build-test", "declaration": false, "sourceMap": true }
+}

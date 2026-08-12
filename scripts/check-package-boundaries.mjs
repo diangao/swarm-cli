@@ -100,14 +100,70 @@ const policies = new Map([
     "verifiers",
     {
       workspace: new Set(["protocol", "security", "testkit"]),
-      forbiddenBuiltins: new Set(["child_process", "cluster", "net", "worker_threads"]),
+      forbiddenBuiltins: new Set([
+        "child_process",
+        "cluster",
+        "net",
+        "worker_threads",
+      ]),
+    },
+  ],
+  [
+    "task-engine",
+    {
+      workspace: new Set(["protocol"]),
+      forbiddenBuiltins: highAuthorityBuiltins,
+      closedManifest: true,
+      allowMissingSource: true,
+    },
+  ],
+  [
+    "artifacts",
+    {
+      workspace: new Set(["protocol", "security"]),
+      forbiddenBuiltins: new Set([
+        "child_process",
+        "cluster",
+        "fs",
+        "net",
+        "process",
+        "worker_threads",
+      ]),
+      allowedBuiltinSubpaths: new Map([
+        ["child_process", new Set(["src/git"])],
+        ["fs", new Set(["src/git", "src/store"])],
+        ["process", new Set(["src/git", "src/store"])],
+      ]),
+      closedManifest: true,
+      allowMissingSource: true,
     },
   ],
   [
     "app:daemon",
     {
-      workspace: new Set(["protocol", "storage", "runtime-contract", "drivers", "daemon-core"]),
+      workspace: new Set([
+        "protocol",
+        "storage",
+        "runtime-contract",
+        "drivers",
+        "daemon-core",
+      ]),
       forbiddenBuiltins: new Set(["cluster", "worker_threads"]),
+    },
+  ],
+  [
+    "app:server",
+    {
+      workspace: new Set([
+        "protocol",
+        "storage",
+        "security",
+        "artifacts",
+        "task-engine",
+      ]),
+      forbiddenBuiltins: new Set(["cluster", "worker_threads"]),
+      closedManifest: true,
+      allowMissingSource: true,
     },
   ],
 ]);
@@ -122,7 +178,10 @@ async function sourceFiles(directory) {
   for (const entry of entries) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) files.push(...(await sourceFiles(path)));
-    if (entry.isFile() && [".ts", ".mts", ".cts"].includes(extname(entry.name))) {
+    if (
+      entry.isFile() &&
+      [".ts", ".mts", ".cts"].includes(extname(entry.name))
+    ) {
       files.push(path);
     }
   }
@@ -131,7 +190,8 @@ async function sourceFiles(directory) {
 
 function imports(source) {
   const found = [];
-  const pattern = /(?:import|export)\s+(?:type\s+)?(?:[^"']*?\s+from\s+)?["']([^"']+)["']|import\s*\(\s*["']([^"']+)["']\s*\)|require\s*\(\s*["']([^"']+)["']\s*\)/gu;
+  const pattern =
+    /(?:import|export)\s+(?:type\s+)?(?:[^"']*?\s+from\s+)?["']([^"']+)["']|import\s*\(\s*["']([^"']+)["']\s*\)|require\s*\(\s*["']([^"']+)["']\s*\)/gu;
   for (const match of source.matchAll(pattern)) {
     found.push(match[1] ?? match[2] ?? match[3]);
   }
@@ -144,7 +204,8 @@ function workspaceName(specifier) {
 }
 
 function dependencyName(specifier) {
-  if (specifier.startsWith("@")) return specifier.split("/").slice(0, 2).join("/");
+  if (specifier.startsWith("@"))
+    return specifier.split("/").slice(0, 2).join("/");
   return specifier.split("/")[0];
 }
 
@@ -163,7 +224,9 @@ function violation(kind, path, specifier) {
 function builtinAllowedAtPath(policy, packageRoot, path, builtin) {
   const subpaths = policy.allowedBuiltinSubpaths?.get(builtin);
   if (subpaths === undefined) return false;
-  return [...subpaths].some((subpath) => isInside(join(packageRoot, subpath), path));
+  return [...subpaths].some((subpath) =>
+    isInside(join(packageRoot, subpath), path),
+  );
 }
 
 function violationsForSource({
@@ -215,8 +278,13 @@ function violationsForSource({
     if (target !== undefined) {
       if (target !== packageName && !policy.workspace.has(target)) {
         found.push(violation("forbidden-workspace-import", path, specifier));
-      } else if (policy.forbiddenWorkspaceSubpaths?.has(target) && specifier !== `@swarm/${target}`) {
-        found.push(violation("forbidden-concrete-driver-import", path, specifier));
+      } else if (
+        policy.forbiddenWorkspaceSubpaths?.has(target) &&
+        specifier !== `@swarm/${target}`
+      ) {
+        found.push(
+          violation("forbidden-concrete-driver-import", path, specifier),
+        );
       } else if (target !== packageName && !declared.has(`@swarm/${target}`)) {
         found.push(violation("undeclared-workspace-import", path, specifier));
       }
@@ -232,9 +300,53 @@ function violationsForSource({
   return found;
 }
 
+function manifestViolations(packageName, packageRoot, metadata) {
+  const policy = policies.get(packageName);
+  if (policy?.closedManifest !== true) return [];
+  const metadataPath = join(packageRoot, "package.json");
+  const found = [];
+  for (const section of [
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+    "bundledDependencies",
+    "bundleDependencies",
+  ]) {
+    const value = metadata[section];
+    if (
+      value !== undefined &&
+      (Array.isArray(value) ? value.length > 0 : Object.keys(value).length > 0)
+    ) {
+      found.push(
+        violation("forbidden-manifest-section", metadataPath, section),
+      );
+    }
+  }
+  for (const [dependency, version] of Object.entries(
+    metadata.dependencies ?? {},
+  )) {
+    const target = workspaceName(dependency);
+    if (target === undefined || !policy.workspace.has(target)) {
+      found.push(
+        violation("unauthorized-manifest-dependency", metadataPath, dependency),
+      );
+    } else if (version !== "workspace:*") {
+      found.push(
+        violation(
+          "invalid-workspace-version",
+          metadataPath,
+          `${dependency}@${version}`,
+        ),
+      );
+    }
+  }
+  return found;
+}
+
 async function readVectors(url) {
   const parsed = JSON.parse(await readFile(url, "utf8"));
-  if (!Array.isArray(parsed)) throw new Error(`${url.pathname} must contain an array`);
+  if (!Array.isArray(parsed))
+    throw new Error(`${url.pathname} must contain an array`);
   return parsed;
 }
 
@@ -245,13 +357,74 @@ function evaluateVector(vector) {
     ? join(root.pathname, "apps", vector.app)
     : join(root.pathname, "packages", vector.package);
   const path = join(packageRoot, "src", vector.path ?? `${vector.name}.ts`);
-  return violationsForSource({
+  if (isApp && !policies.has(packageName)) {
+    return [violation("unknown-app", path, vector.app)];
+  }
+  const sourceViolations = violationsForSource({
     packageName,
     packageRoot,
     path,
     source: vector.source,
     dependencies: vector.packageJson ?? {},
   });
+  return [
+    ...manifestViolations(packageName, packageRoot, vector.packageJson ?? {}),
+    ...sourceViolations,
+  ];
+}
+
+function generatedPolicyNegativeVectors() {
+  const workspaceTargets = [
+    ...[...policies.keys()].filter((name) => !name.startsWith("app:")),
+    ...[...policies.keys()]
+      .filter((name) => name.startsWith("app:"))
+      .map((name) => `app-${name.slice("app:".length)}`),
+  ].sort();
+  const vectors = [];
+  for (const [policyName, policy] of [...policies.entries()].sort(
+    ([left], [right]) => left.localeCompare(right),
+  )) {
+    const app = policyName.startsWith("app:")
+      ? policyName.slice("app:".length)
+      : undefined;
+    const ownImportName = app === undefined ? policyName : `app-${app}`;
+    const target = app === undefined ? { package: policyName } : { app };
+    for (const workspaceTarget of workspaceTargets) {
+      if (
+        workspaceTarget === ownImportName ||
+        policy.workspace.has(workspaceTarget)
+      )
+        continue;
+      vectors.push({
+        name: `generated-${policyName}-forbids-${workspaceTarget}`,
+        ...target,
+        source: `import "@swarm/${workspaceTarget}";`,
+        expectedKind: "forbidden-workspace-import",
+      });
+    }
+    for (const builtin of [...policy.forbiddenBuiltins].sort()) {
+      for (const prefix of ["", "node:"]) {
+        vectors.push({
+          name: `generated-${policyName}-forbids-${prefix === "" ? "bare" : "node"}-${builtin}`,
+          ...target,
+          source: `import "${prefix}${builtin}";`,
+          expectedKind: "forbidden-builtin",
+        });
+      }
+    }
+    for (const [builtin, subpaths] of policy.allowedBuiltinSubpaths ?? []) {
+      for (const subpath of [...subpaths].sort()) {
+        vectors.push({
+          name: `generated-${policyName}-${builtin}-escapes-${subpath.replaceAll("/", "-")}`,
+          ...target,
+          path: `${subpath.replace(/^src\//u, "")}-escape/forbidden.ts`,
+          source: `import "node:${builtin}";`,
+          expectedKind: "forbidden-builtin",
+        });
+      }
+    }
+  }
+  return vectors;
 }
 
 async function scanApps() {
@@ -271,7 +444,9 @@ async function scanApps() {
     const appRoot = join(appsRoot.pathname, entry.name);
     const policyName = `app:${entry.name}`;
     if (!policies.has(policyName)) {
-      found.push(violation("unknown-app", join(appRoot, "package.json"), entry.name));
+      found.push(
+        violation("unknown-app", join(appRoot, "package.json"), entry.name),
+      );
       continue;
     }
     const metadataPath = join(appRoot, "package.json");
@@ -283,28 +458,36 @@ async function scanApps() {
       continue;
     }
     if (metadata.name !== `@swarm/app-${entry.name}`) {
-      found.push(violation("app-name-mismatch", metadataPath, String(metadata.name)));
+      found.push(
+        violation("app-name-mismatch", metadataPath, String(metadata.name)),
+      );
     }
+    found.push(...manifestViolations(policyName, appRoot, metadata));
     const sourceRoot = join(appRoot, "src");
     let files;
     try {
       files = await sourceFiles(sourceRoot);
     } catch {
-      found.push(violation("missing-app-source", sourceRoot, entry.name));
+      if (policies.get(policyName)?.allowMissingSource !== true) {
+        found.push(violation("missing-app-source", sourceRoot, entry.name));
+      }
       continue;
     }
     fileCount += files.length;
     for (const path of files) {
-      found.push(...violationsForSource({
-        packageName: policyName,
-        packageRoot: appRoot,
-        path,
-        source: await readFile(path, "utf8"),
-        dependencies: metadata,
-      }));
+      found.push(
+        ...violationsForSource({
+          packageName: policyName,
+          packageRoot: appRoot,
+          path,
+          source: await readFile(path, "utf8"),
+          dependencies: metadata,
+        }),
+      );
     }
   }
-  if (found.length > 0) throw new Error(found.map(({ message }) => message).join("\n"));
+  if (found.length > 0)
+    throw new Error(found.map(({ message }) => message).join("\n"));
   return { appCount, fileCount };
 }
 
@@ -323,7 +506,10 @@ async function proveSeededNegatives() {
     );
   }
 
-  const vectors = await readVectors(negativeVectors);
+  const vectors = [
+    ...(await readVectors(negativeVectors)),
+    ...generatedPolicyNegativeVectors(),
+  ];
   for (const vector of vectors) {
     const kinds = evaluateVector(vector).map(({ kind }) => kind);
     if (kinds.length !== 1 || kinds[0] !== vector.expectedKind) {
@@ -343,7 +529,9 @@ async function provePositiveVectors() {
   for (const vector of vectors) {
     const found = evaluateVector(vector);
     if (found.length > 0) {
-      throw new Error(`${vector.name} unexpectedly failed: ${found.map(({ message }) => message).join("; ")}`);
+      throw new Error(
+        `${vector.name} unexpectedly failed: ${found.map(({ message }) => message).join("; ")}`,
+      );
     }
   }
 
@@ -353,7 +541,8 @@ async function provePositiveVectors() {
     path: positiveFixture.pathname,
     source: await readFile(positiveFixture, "utf8"),
   });
-  if (legacy.length > 0) throw new Error(legacy.map(({ message }) => message).join("\n"));
+  if (legacy.length > 0)
+    throw new Error(legacy.map(({ message }) => message).join("\n"));
 }
 
 async function scanPackages() {
@@ -369,7 +558,13 @@ async function scanPackages() {
     const packageRoot = join(packagesRoot.pathname, packageName);
     const policy = policies.get(packageName);
     if (policy === undefined) {
-      found.push(violation("unknown-package", join(packageRoot, "package.json"), packageName));
+      found.push(
+        violation(
+          "unknown-package",
+          join(packageRoot, "package.json"),
+          packageName,
+        ),
+      );
       continue;
     }
 
@@ -378,19 +573,28 @@ async function scanPackages() {
     try {
       metadata = JSON.parse(await readFile(metadataPath, "utf8"));
     } catch {
-      found.push(violation("invalid-package-metadata", metadataPath, packageName));
+      found.push(
+        violation("invalid-package-metadata", metadataPath, packageName),
+      );
       continue;
     }
     if (metadata.name !== `@swarm/${packageName}`) {
-      found.push(violation("package-name-mismatch", metadataPath, String(metadata.name)));
+      found.push(
+        violation("package-name-mismatch", metadataPath, String(metadata.name)),
+      );
     }
+    found.push(...manifestViolations(packageName, packageRoot, metadata));
 
     const sourceRoot = join(packageRoot, "src");
     let files;
     try {
       files = await sourceFiles(sourceRoot);
     } catch {
-      found.push(violation("missing-package-source", sourceRoot, packageName));
+      if (policy.allowMissingSource !== true) {
+        found.push(
+          violation("missing-package-source", sourceRoot, packageName),
+        );
+      }
       continue;
     }
 
@@ -408,8 +612,11 @@ async function scanPackages() {
     }
   }
 
-  if (found.length > 0) throw new Error(found.map(({ message }) => message).join("\n"));
-  process.stdout.write(`package boundaries clean (${packageCount} packages, ${fileCount} source files)\n`);
+  if (found.length > 0)
+    throw new Error(found.map(({ message }) => message).join("\n"));
+  process.stdout.write(
+    `package boundaries clean (${packageCount} packages, ${fileCount} source files)\n`,
+  );
 }
 
 if (process.argv.includes("--seeded-negative")) {
@@ -418,5 +625,7 @@ if (process.argv.includes("--seeded-negative")) {
   await provePositiveVectors();
   await scanPackages();
   const apps = await scanApps();
-  process.stdout.write(`app boundaries clean (${apps.appCount} apps, ${apps.fileCount} source files)\n`);
+  process.stdout.write(
+    `app boundaries clean (${apps.appCount} apps, ${apps.fileCount} source files)\n`,
+  );
 }

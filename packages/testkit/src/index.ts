@@ -41,3 +41,5 @@ export type {
   RecordBodyReadInput,
   RecordMetadataOnlyInput,
 } from "./recorder.js";
+
+export * from "./task-v3.js";
