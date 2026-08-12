@@ -1,0 +1,1561 @@
+{
+  "schemaVersion": 1,
+  "artifactKind": "wave3_gate3_scenario_plan",
+  "status": "eighth_review_candidate",
+  "baseCommit": "59c7d42495aac97855fc2a248bb72cd2dd70c8dd",
+  "baseTree": "2d53b380ea77eeae81200762f77ce92d792abf5d",
+  "planDigest": "378f27b8e2669dd59643325764b47960e620e72e110d628e21f3926e05bd3b88",
+  "wave2ContractFile": "wave2-daemon-kernel-drivers-spec-v0.2.md",
+  "wave2ContractDigest": "f83faa9978c23698897e700e586d0803fc317a802fbfcddb6355ec0d33965057",
+  "gate2PlanDigest": "17e1b60b660d95161ef8762e042dfcc611b63aa5895c58c22a471f761085e4f1",
+  "contractFile": "wave3-claim-dag-artifact-review-spec-v0.8.md",
+  "clock": "deterministic_server_clock_with_fake_local_clock",
+  "limits": {
+    "leaseDurationMs": 30000,
+    "renewalLeadMs": 10000,
+    "maxProposalChildren": 8,
+    "maxGraphNodes": 32,
+    "maxGraphEdges": 64,
+    "maxGraphDepth": 4,
+    "maxOpenLeaves": 8,
+    "maxDependenciesPerTask": 8,
+    "maxReviewSeats": 4,
+    "maxCapabilityKeys": 16,
+    "maxPathClaims": 32,
+    "maxTitleUtf8Bytes": 240,
+    "titleSourceReuseMinUtf8Bytes": 32
+  },
+  "oraclePolicy": {
+    "canonicalJson": true,
+    "unknownKeysRejected": true,
+    "everyNegativeAssertsUnchangedSiblings": true,
+    "everyScenarioHasTargetedMutation": true,
+    "fakeAndPlanDeriveExpectedErrorsIndependently": true,
+    "realProviderCallsRequired": false,
+    "existingWave0Wave1Wave2GatesRequired": true,
+    "deferredScenarioDisposition": "unchanged_fail_closed"
+  },
+  "scenarios": [
+    {
+      "id": "g3_1_atomic_claim_contention",
+      "fixture": {
+        "taskId": "tsk_00000000000000000000000001",
+        "contenderCounts": [2, 3, 5],
+        "taskStatus": "todo",
+        "dependencyState": "ready",
+        "serverClock": "2026-08-11T16:00:00.000Z"
+      },
+      "expectedFacts": ["claim_won", "task_status_changed"],
+      "assertions": [
+        "exactly_one_claim_winner_for_two_three_and_five_contenders",
+        "winner_and_losers_share_one_locked_task_revision",
+        "winner_status_and_claim_insert_commit_atomically",
+        "losers_receive_conflict_without_claim_or_status_effect",
+        "lease_epoch_is_previous_max_plus_one",
+        "claim_command_exact_replay_aliases_after_status_advances"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "claim_without_task_lock",
+          "defect": "read_then_insert_claim_outside_locked_transaction",
+          "verifierMustObserve": "more_than_one_claim_winner",
+          "unchanged": ["task_graph_revision", "artifact_rows", "review_rows"]
+        },
+        {
+          "id": "claim_status_split_commit",
+          "defect": "commit_claim_before_in_progress_status",
+          "expectError": "TASK_CLAIM_ATOMICITY_VIOLATION",
+          "unchanged": ["task_status", "open_claim_count", "task_row_version"]
+        },
+        {
+          "id": "loser_mutates_status",
+          "defect": "loser_advances_task_row_version",
+          "expectError": "TASK_CLAIM_CONFLICT",
+          "unchanged": ["winner_claim", "task_status", "task_row_version"]
+        },
+        {
+          "id": "reuse_lease_epoch",
+          "defect": "allocate_epoch_from_open_claim_count",
+          "expectError": "TASK_LEASE_EPOCH_REUSED",
+          "unchanged": ["prior_claim_history", "new_claim_row", "task_status"]
+        },
+        {
+          "id": "claim_command_payload_divergence",
+          "defect": "reuse_claim_command_id_with_changed_task_agent_or_expected_revision",
+          "expectError": "IDEMPOTENCY_CONFLICT",
+          "unchanged": ["stored_claim_result", "current_claim", "task_status", "task_row_version"]
+        }
+      ]
+    },
+    {
+      "id": "g3_2_lease_renewal_and_expiry",
+      "fixture": {
+        "leaseEpoch": 4,
+        "leaseRevision": 2,
+        "acquiredAt": "2026-08-11T16:00:00.000Z",
+        "expiresAt": "2026-08-11T16:00:30.000Z",
+      "earlyLocalWakeAt": "2026-08-11T16:00:19.999Z",
+      "renewAt": "2026-08-11T16:00:20.000Z",
+      "retryNotBefore": "2026-08-11T16:00:20.000Z",
+      "earlyCommandId": "cmd_44444444444444444444444444",
+      "retryCommandId": "cmd_55555555555555555555555555",
+      "earlyServerObservedAt": "2026-08-11T16:00:19.999Z",
+      "earlyStoredReceipt": {
+        "commandId": "cmd_44444444444444444444444444",
+        "canonicalRequestDigest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+        "kind": "rejected",
+        "code": "TASK_LEASE_RENEWAL_TOO_EARLY",
+        "retryNotBefore": "2026-08-11T16:00:20.000Z",
+        "observedLeaseRevision": 2
+      },
+      "retryDispatchAt": "2026-08-11T16:00:20.000Z",
+      "retryRequestDigest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "retryResult": {
+        "commandId": "cmd_55555555555555555555555555",
+        "kind": "renewed",
+        "previousLeaseRevision": 2,
+        "currentLeaseRevision": 3,
+        "expiresAt": "2026-08-11T16:00:50.000Z"
+      },
+      "renewedExpiresAt": "2026-08-11T16:00:50.000Z",
+        "nativeTurnDurationMs": 75000,
+        "daemonRenewalDispatchPolicy": "at_or_after_window_entry_fresh_command_retry_after_too_early"
+      },
+      "expectedFacts": ["claim_won", "lease_renewed", "native_turn_running"],
+      "assertions": [
+        "renewal_uses_exact_full_lease_and_expected_revision",
+        "renewal_keeps_epoch_and_fence_token_but_advances_revision",
+        "renewed_expiry_is_strictly_later_and_server_clock_authoritative",
+        "long_native_turn_renews_without_reclaim_churn",
+        "expired_lease_cannot_renew_or_publish",
+        "server_expiry_closes_exact_claim_and_reservations_then_reopens_task_for_epoch_plus_one_reclaim",
+        "standalone_release_atomically_closes_current_claim_reservations_and_returns_task_to_todo",
+        "released_or_expired_task_reclaims_with_next_history_inclusive_epoch",
+      "daemon_never_dispatches_renewal_before_window_and_retries_fresh_command_after_too_early",
+      "too_early_command_replays_stored_rejection_while_fresh_retry_waits_for_retry_not_before"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "renew_with_stale_revision",
+          "defect": "omit_expected_lease_revision_cas",
+          "expectError": "TASK_LEASE_RENEWAL_CONFLICT",
+          "unchanged": ["lease_epoch", "fence_token", "expires_at"]
+        },
+        {
+          "id": "renew_changes_epoch",
+          "defect": "treat_renewal_as_reclaim",
+          "verifierMustObserve": "renewal_churn_during_live_turn",
+          "unchanged": ["claim_id", "lease_id", "owner_agent_id"]
+        },
+        {
+          "id": "client_clock_controls_expiry",
+          "defect": "accept_agent_supplied_current_time",
+          "expectError": "TASK_LEASE_CLOCK_AUTHORITY_VIOLATION",
+          "unchanged": ["server_clock", "lease_revision", "expires_at"]
+        },
+        {
+          "id": "expired_lease_renews",
+          "defect": "renew_after_server_clock_reaches_expiry",
+          "expectError": "TASK_LEASE_EXPIRED",
+          "unchanged": ["lease_row", "task_status", "artifact_rows"]
+        },
+        {
+          "id": "early_renewal_mutates",
+          "defect": "renew_before_server_clock_enters_renewal_window",
+          "expectError": "TASK_LEASE_RENEWAL_TOO_EARLY",
+          "unchanged": ["lease_revision", "expires_at", "task_row_version"]
+        },
+        {
+          "id": "expiry_leaves_task_in_progress",
+          "defect": "close_expired_claim_without_status_and_reservation_transition",
+          "expectError": "TASK_LEASE_EXPIRY_ATOMICITY_VIOLATION",
+          "unchanged": ["claim_row", "path_reservations", "task_status", "task_row_version"]
+        },
+        {
+          "id": "release_leaves_task_in_progress",
+          "defect": "close_voluntarily_released_claim_without_reservation_and_todo_transition",
+          "expectError": "TASK_LEASE_RELEASE_ATOMICITY_VIOLATION",
+          "unchanged": ["claim_row", "path_reservations", "task_status", "task_row_version"]
+        },
+        {
+          "id": "expired_owner_releases_after_replacement",
+          "defect": "apply_old_release_to_new_epoch_owner_after_atomic_expiry_reclaim",
+          "expectError": "TASK_LEASE_EXPIRED",
+          "unchanged": ["replacement_claim", "replacement_reservations", "task_status", "task_row_version"]
+        },
+      {
+        "id": "daemon_dispatches_before_window_without_retry",
+          "defect": "dispatch_on_early_local_wake_then_drop_too_early_rejection_without_fresh_command_boundary_retry",
+          "verifierMustObserve": "daemon_renewal_dispatch_or_retry_policy_violated",
+          "unchanged": [
+            "native_turn_identity",
+            "normal_reply_count",
+            "coordination_effect_count",
+          "provider_execution_count"
+        ]
+      },
+      {
+        "id": "retry_reuses_too_early_command",
+        "defect": "reuse_early_command_id_after_boundary_instead_of_allocating_fresh_retry_command",
+        "verifierMustObserve": "stored_too_early_rejection_replayed_and_lease_remains_unrenewed",
+        "unchanged": [
+          "early_command_receipt",
+          "lease_revision",
+          "expires_at",
+          "normal_reply_count",
+          "coordination_effect_count"
+        ]
+      },
+      {
+        "id": "retry_before_retry_not_before",
+        "defect": "dispatch_fresh_retry_command_one_millisecond_before_server_retry_boundary",
+        "expectError": "TASK_LEASE_RENEWAL_TOO_EARLY",
+        "unchanged": [
+          "early_command_receipt",
+          "lease_revision",
+          "expires_at",
+          "task_row_version"
+        ]
+      }
+      ]
+    },
+    {
+      "id": "g3_3_guarded_mutations_and_owner_loss",
+      "fixture": {
+        "taskStatus": "in_progress",
+        "leaseEpoch": 7,
+        "leaseRevision": 3,
+        "mutationKinds": ["status", "artifact", "review_request", "terminal_reason"],
+        "replacementEpoch": 8
+      },
+      "expectedFacts": ["lease_lost", "runtime_interrupt_requested"],
+      "assertions": [
+        "every_task_artifact_and_review_request_mutation_checks_full_current_lease",
+        "stale_owner_has_zero_shared_mutation",
+        "owner_loss_requests_local_interrupt_before_any_later_effect",
+        "late_native_result_is_observation_only_after_owner_loss",
+        "new_epoch_owner_is_not_affected_by_stale_cleanup"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "status_checks_epoch_only",
+          "defect": "omit_claim_lease_token_attempt_revision_members",
+          "expectError": "TASK_MUTATION_FENCE_REQUIRED",
+          "unchanged": ["task_status", "task_row_version", "current_claim"]
+        },
+        {
+          "id": "artifact_after_owner_loss",
+          "defect": "publish_completed_native_result_under_expired_lease",
+          "expectError": "TASK_LEASE_STALE",
+          "unchanged": ["artifact_rows", "task_status", "review_barrier"]
+        },
+        {
+          "id": "status_after_reclaim",
+          "defect": "old_owner_marks_done_after_epoch_eight_claim",
+          "expectError": "TASK_LEASE_STALE",
+          "unchanged": ["epoch_eight_claim", "task_status", "task_row_version"]
+        },
+        {
+          "id": "stale_cleanup_releases_new_owner",
+          "defect": "release_by_task_id_without_exact_lease",
+          "expectError": "TASK_LEASE_STALE",
+          "unchanged": ["epoch_eight_claim", "new_owner_runtime", "task_status"]
+        }
+      ]
+    },
+    {
+      "id": "g3_4_startup_reconciliation",
+      "fixture": {
+        "cases": ["matching_current", "shared_expired", "shared_replaced", "local_only", "shared_only"],
+        "fullCrashRecoveryDeferred": true
+      },
+      "expectedFacts": ["reconciliation_started", "reconciliation_decision"],
+      "assertions": [
+        "matching_current_execution_renews_before_resume",
+        "expired_or_replaced_execution_stops_and_suppresses_publication",
+        "local_only_execution_is_stopped_without_shared_mutation",
+        "shared_only_claim_is_relinquished_or_left_for_server_expiry_without_fabricated_process",
+        "shared_only_relinquish_closes_exact_claim_and_reservation_before_todo_reclaim",
+        "wave3_reconciliation_does_not_claim_full_wave4_crash_recovery"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "resume_before_current_lease_read",
+          "defect": "start_native_resume_from_local_journal_only",
+          "expectError": "TASK_RECONCILIATION_PREDECESSOR_REQUIRED",
+          "unchanged": ["native_resume_count", "lease_row", "task_status"]
+        },
+        {
+          "id": "matching_ids_wrong_expiry",
+          "defect": "ignore_exact_expires_at_and_revision",
+          "expectError": "TASK_LEASE_STALE",
+          "unchanged": ["runtime_state", "lease_row", "artifact_rows"]
+        },
+        {
+          "id": "shared_only_fabricates_runtime",
+          "defect": "treat_claim_row_as_process_evidence",
+          "expectError": "TASK_RUNTIME_EVIDENCE_REQUIRED",
+          "unchanged": ["process_effects", "launch_state", "claim_row"]
+        },
+        {
+          "id": "reconciliation_relinquish_strands_claim",
+          "defect": "close_shared_only_claim_without_exact_reservation_and_todo_transition",
+          "expectError": "TASK_LEASE_RELEASE_ATOMICITY_VIOLATION",
+          "unchanged": ["claim_row", "path_reservations", "task_status", "task_row_version"]
+        }
+      ]
+    },
+    {
+      "id": "g3_5_atomic_graph_proposal",
+      "fixture": {
+        "rootTaskId": "tsk_00000000000000000000000001",
+        "childKeys": ["research", "build", "review"],
+        "expectedGraphRevision": 5,
+        "sourceTurnHasCommittedReply": true,
+        "oneLogicalCoordinationEffect": true,
+        "sameCommandTransportReplayAllowed": true
+      },
+      "expectedFacts": ["reply_committed", "task_graph_created", "task_status_changed"],
+      "assertions": [
+        "one_logical_coordination_effect_atomically_creates_children_edges_and_one_graph_revision",
+        "proposal_replay_aliases_exact_stored_result",
+        "changed_payload_under_same_command_conflicts",
+        "source_message_turn_producer_and_current_lease_join_before_graph_write",
+        "parent_transitions_to_waiting_in_same_transaction",
+        "one_reply_permits_one_logical_coordination_effect_with_same_command_replay_only"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "children_commit_without_edges",
+          "defect": "split_child_and_edge_transactions",
+          "expectError": "TASK_GRAPH_ATOMICITY_VIOLATION",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision"]
+        },
+        {
+          "id": "graph_before_reply",
+          "defect": "apply_graph_coordination_without_committed_normal_reply",
+          "expectError": "MODEL_VISIBLE_PREDECESSOR_REQUIRED",
+          "unchanged": ["task_rows", "edge_rows", "parent_status"]
+        },
+        {
+          "id": "stale_graph_revision",
+          "defect": "omit_expected_graph_revision_cas",
+          "expectError": "TASK_GRAPH_REVISION_STALE",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision"]
+        },
+        {
+          "id": "replay_divergent_children",
+          "defect": "reuse_command_id_with_changed_child_title",
+          "expectError": "IDEMPOTENCY_CONFLICT",
+          "unchanged": ["stored_result", "task_rows", "graph_revision"]
+        },
+        {
+          "id": "second_command_same_reply",
+          "defect": "use_distinct_command_id_for_second_graph_effect_from_one_reply",
+          "expectError": "TASK_COORDINATION_ALREADY_COMMITTED",
+          "unchanged": ["stored_result", "task_rows", "edge_rows", "graph_revision"]
+        }
+      ]
+    },
+    {
+      "id": "g3_6_cycles_dependencies_and_ready_leaves",
+      "fixture": {
+        "tasks": ["root", "research", "build", "review"],
+        "contains": [["root", "research"], ["root", "build"], ["root", "review"]],
+        "dependsOn": [["build", "research"], ["review", "build"]],
+        "realPgEndpointAncestorInterleaving": {
+          "repositoryId": "rpo_eeeeeeeeeeeeeeeeeeeeeeeeee",
+          "rootTaskId": "tsk_00000000000000000000000020",
+          "proposalEndpoint": "review",
+          "proposalEndpointTaskId": "tsk_00000000000000000000000024",
+          "concurrentAncestor": "root",
+          "concurrentAncestorTaskId": "tsk_00000000000000000000000020",
+          "initialGraphRevision": 40,
+          "initialTaskRows": [
+            {
+              "taskId": "tsk_00000000000000000000000020",
+              "status": "waiting",
+              "taskRowVersion": 12
+            },
+            {
+              "taskId": "tsk_00000000000000000000000024",
+              "status": "todo",
+              "taskRowVersion": 5
+            }
+          ],
+          "lockOrder": "repository_then_root_then_canonical_endpoints_ancestors_then_graph_revision_then_claims_reservations",
+          "latches": [
+            "proposal_locked_snapshot_before_write",
+            "transition_attempted_and_waiting",
+            "proposal_committed",
+            "transition_recomputed",
+            "transition_locked_snapshot_before_write",
+            "proposal_attempted_and_waiting",
+            "transition_committed",
+            "proposal_revalidated"
+          ],
+          "forcedSchedules": [
+            {
+              "name": "proposal_wins",
+              "holdAt": "proposal_locked_snapshot_before_write",
+              "mustObserveBeforeRelease": "transition_attempted_and_waiting",
+              "then": ["proposal_committed", "transition_recomputed"]
+            },
+            {
+              "name": "transition_wins",
+              "holdAt": "transition_locked_snapshot_before_write",
+              "mustObserveBeforeRelease": "proposal_attempted_and_waiting",
+              "then": ["transition_committed", "proposal_revalidated"]
+            }
+          ],
+          "allowedOutcomes": [
+            "proposal_commit_revision_41_then_transition_locked_recompute_commit_revision_42",
+            "transition_commit_revision_41_then_proposal_revalidated_reject_revision_41_or_commit_revision_42"
+          ]
+        },
+        "claimVsPropagationInterleaving": {
+          "repositoryId": "rpo_eeeeeeeeeeeeeeeeeeeeeeeeee",
+          "rootTaskId": "tsk_00000000000000000000000023",
+          "claimTaskId": "tsk_00000000000000000000000025",
+          "propagationRootCauseTaskId": "tsk_00000000000000000000000021",
+          "latches": [
+            "claim_repository_locked_before_root",
+            "propagation_repository_wait_observed",
+            "first_transaction_committed",
+            "second_transaction_revalidated"
+          ],
+          "mutantHooks": [
+            "propagation_root_locked_before_repository",
+            "claim_repository_locked_while_waiting_for_root"
+          ],
+          "requiredConformingOutcome": "one_commit_then_one_revalidate_without_40P01_or_timeout",
+          "requiredMutantOutcome": "postgres_40P01_or_bounded_lock_timeout"
+        },
+        "transitiveBlockedChain": {
+          "repositoryId": "rpo_eeeeeeeeeeeeeeeeeeeeeeeeee",
+          "rootTaskId": "tsk_00000000000000000000000023",
+          "graphRevisionBefore": 31,
+          "graphRevisionAfter": 32,
+          "blockCommandId": "cmd_66666666666666666666666666",
+          "rootCauseReason": "execution_failed",
+          "storedTopology": {
+            "contains": [
+              {
+                "parentTaskId": "tsk_00000000000000000000000023",
+                "childTaskId": "tsk_00000000000000000000000022"
+              },
+              {
+                "parentTaskId": "tsk_00000000000000000000000022",
+                "childTaskId": "tsk_00000000000000000000000021"
+              }
+            ],
+            "dependsOn": [
+              {
+                "prerequisiteTaskId": "tsk_00000000000000000000000021",
+                "dependentTaskId": "tsk_00000000000000000000000022"
+              }
+            ],
+            "derivedLifecycleWaitEdges": [
+              {
+                "fromTaskId": "tsk_00000000000000000000000021",
+                "toTaskId": "tsk_00000000000000000000000022",
+                "kind": "prerequisite_to_dependent"
+              },
+              {
+                "fromTaskId": "tsk_00000000000000000000000021",
+                "toTaskId": "tsk_00000000000000000000000022",
+                "kind": "child_to_waiting_parent"
+              },
+              {
+                "fromTaskId": "tsk_00000000000000000000000022",
+                "toTaskId": "tsk_00000000000000000000000023",
+                "kind": "child_to_waiting_parent"
+              }
+            ]
+          },
+          "closureDerivation": "derive_from_locked_stored_topology_not_roles_or_predeclared_affected_array",
+          "expectedAffectedTaskIds": [
+            "tsk_00000000000000000000000021",
+            "tsk_00000000000000000000000022",
+            "tsk_00000000000000000000000023"
+          ],
+          "metamorphicOracleHarness": {
+            "executionBoundary": "isolated_oracle_module_receives_only_canonical_oracle_input_bytes_and_cannot_import_or_close_over_plan_or_parent_fixture",
+            "oracleInputExactKeys": [
+              "rootCauseTaskId",
+              "storedTopology",
+              "poisonedView"
+            ],
+            "poisonedViewExactKeys": [
+              "kind",
+              "taskIds"
+            ],
+            "forbiddenOracleInputKeys": [
+              "before",
+              "after",
+              "parentFixture",
+              "expectedAffectedTaskIds",
+              "verifierExpectation"
+            ],
+            "verifierOwnedExpectation": {
+              "expectedAffectedTaskIds": [
+                "tsk_00000000000000000000000021",
+                "tsk_00000000000000000000000022",
+                "tsk_00000000000000000000000023"
+              ],
+              "passedToOracle": false
+            },
+            "invocations": [
+              {
+                "id": "baseline_topology_only",
+                "oracleInput": {
+                  "rootCauseTaskId": "tsk_00000000000000000000000021",
+                  "storedTopology": {
+                    "contains": [
+                      {
+                        "parentTaskId": "tsk_00000000000000000000000023",
+                        "childTaskId": "tsk_00000000000000000000000022"
+                      },
+                      {
+                        "parentTaskId": "tsk_00000000000000000000000022",
+                        "childTaskId": "tsk_00000000000000000000000021"
+                      }
+                    ],
+                    "dependsOn": [
+                      {
+                        "prerequisiteTaskId": "tsk_00000000000000000000000021",
+                        "dependentTaskId": "tsk_00000000000000000000000022"
+                      }
+                    ]
+                  },
+                  "poisonedView": {
+                    "kind": "none",
+                    "taskIds": []
+                  }
+                }
+              },
+              {
+                "id": "poison_role_selection",
+                "oracleInput": {
+                  "rootCauseTaskId": "tsk_00000000000000000000000021",
+                  "storedTopology": {
+                    "contains": [
+                      {
+                        "parentTaskId": "tsk_00000000000000000000000023",
+                        "childTaskId": "tsk_00000000000000000000000022"
+                      },
+                      {
+                        "parentTaskId": "tsk_00000000000000000000000022",
+                        "childTaskId": "tsk_00000000000000000000000021"
+                      }
+                    ],
+                    "dependsOn": [
+                      {
+                        "prerequisiteTaskId": "tsk_00000000000000000000000021",
+                        "dependentTaskId": "tsk_00000000000000000000000022"
+                      }
+                    ]
+                  },
+                  "poisonedView": {
+                    "kind": "role_selection",
+                    "taskIds": [
+                      "tsk_00000000000000000000000021",
+                      "tsk_00000000000000000000000022",
+                      "tsk_00000000000000000000000024"
+                    ]
+                  }
+                }
+              },
+              {
+                "id": "poison_row_enumeration",
+                "oracleInput": {
+                  "rootCauseTaskId": "tsk_00000000000000000000000021",
+                  "storedTopology": {
+                    "contains": [
+                      {
+                        "parentTaskId": "tsk_00000000000000000000000023",
+                        "childTaskId": "tsk_00000000000000000000000022"
+                      },
+                      {
+                        "parentTaskId": "tsk_00000000000000000000000022",
+                        "childTaskId": "tsk_00000000000000000000000021"
+                      }
+                    ],
+                    "dependsOn": [
+                      {
+                        "prerequisiteTaskId": "tsk_00000000000000000000000021",
+                        "dependentTaskId": "tsk_00000000000000000000000022"
+                      }
+                    ]
+                  },
+                  "poisonedView": {
+                    "kind": "row_enumeration",
+                    "taskIds": [
+                      "tsk_00000000000000000000000021",
+                      "tsk_00000000000000000000000023"
+                    ]
+                  }
+                }
+              },
+              {
+                "id": "poison_predeclared_affected_ids",
+                "oracleInput": {
+                  "rootCauseTaskId": "tsk_00000000000000000000000021",
+                  "storedTopology": {
+                    "contains": [
+                      {
+                        "parentTaskId": "tsk_00000000000000000000000023",
+                        "childTaskId": "tsk_00000000000000000000000022"
+                      },
+                      {
+                        "parentTaskId": "tsk_00000000000000000000000022",
+                        "childTaskId": "tsk_00000000000000000000000021"
+                      }
+                    ],
+                    "dependsOn": [
+                      {
+                        "prerequisiteTaskId": "tsk_00000000000000000000000021",
+                        "dependentTaskId": "tsk_00000000000000000000000022"
+                      }
+                    ]
+                  },
+                  "poisonedView": {
+                    "kind": "predeclared_affected_ids",
+                    "taskIds": [
+                      "tsk_00000000000000000000000021",
+                      "tsk_00000000000000000000000022"
+                    ]
+                  }
+                }
+              }
+            ],
+            "expectedWrongAffectedTaskIdsByForbiddenOracle": {
+              "roleSelection": [
+                "tsk_00000000000000000000000021",
+                "tsk_00000000000000000000000022",
+                "tsk_00000000000000000000000024"
+              ],
+              "rowEnumeration": [
+                "tsk_00000000000000000000000021",
+                "tsk_00000000000000000000000023"
+              ],
+              "predeclaredAffectedIds": [
+                "tsk_00000000000000000000000021",
+                "tsk_00000000000000000000000022"
+              ]
+            },
+            "requiredObservation": "isolated_oracle_derives_21_22_23_from_identical_topology_for_all_invocations_while_each_poisoned_view_mutant_returns_its_distinct_wrong_set_and_parent_or_expected_fallback_is_rejected_before_execution"
+          },
+          "before": [
+            {
+              "role": "prerequisite",
+              "taskId": "tsk_00000000000000000000000021",
+              "status": "in_progress",
+              "taskRowVersion": 7,
+              "claimId": "clm_77777777777777777777777777",
+              "leaseId": "lse_88888888888888888888888888",
+              "leaseEpoch": 3,
+              "leaseRevision": 2,
+              "fenceToken": "fnc_99999999999999999999999999",
+              "reservationIds": ["rsv_aaaaaaaaaaaaaaaaaaaaaaaaaa"]
+            },
+            {
+              "role": "dependent_waiting_parent",
+              "taskId": "tsk_00000000000000000000000022",
+              "status": "waiting",
+              "taskRowVersion": 4,
+              "claimId": null,
+              "leaseId": null,
+              "reservationIds": []
+            },
+            {
+              "role": "waiting_ancestor",
+              "taskId": "tsk_00000000000000000000000023",
+              "status": "waiting",
+              "taskRowVersion": 11,
+              "claimId": null,
+              "leaseId": null,
+              "reservationIds": []
+            }
+          ],
+          "after": [
+            {
+              "role": "prerequisite",
+              "taskId": "tsk_00000000000000000000000021",
+              "status": "blocked",
+              "taskRowVersion": 8,
+              "closedClaimId": "clm_77777777777777777777777777",
+              "closedLeaseId": "lse_88888888888888888888888888",
+              "leaseCloseReason": "graph_blocked",
+              "closedReservationIds": ["rsv_aaaaaaaaaaaaaaaaaaaaaaaaaa"]
+            },
+            {
+              "role": "dependent_waiting_parent",
+              "taskId": "tsk_00000000000000000000000022",
+              "status": "blocked",
+              "taskRowVersion": 5,
+              "closedClaimId": null,
+              "closedLeaseId": null,
+              "leaseCloseReason": null,
+              "closedReservationIds": []
+            },
+            {
+              "role": "waiting_ancestor",
+              "taskId": "tsk_00000000000000000000000023",
+              "status": "blocked",
+              "taskRowVersion": 12,
+              "closedClaimId": null,
+              "closedLeaseId": null,
+              "leaseCloseReason": null,
+              "closedReservationIds": []
+            }
+          ]
+        }
+      },
+      "expectedFacts": [
+        "task_graph_created",
+        "claim_eligibility_computed",
+        "real_pg_interleavings_reached_every_latch",
+        "blocked_closure_derived_from_exact_stored_topology",
+        "typed_transitive_block_closure_committed"
+      ],
+      "assertions": [
+        "contains_and_dependency_edges_are_distinct_and_combined_lifecycle_wait_graph_is_acyclic",
+        "only_leaf_with_all_dependencies_done_is_claimable",
+        "dependency_completion_atomically_recomputes_ready_set",
+        "blocked_dependency_fail_closes_dependents",
+        "cross_root_or_cross_server_edges_are_rejected",
+        "concurrent_endpoint_or_ancestor_mutation_serializes_before_cycle_and_readiness_commit",
+        "blocked_prerequisite_transitively_blocks_dependents_and_waiting_ancestors_atomically",
+        "blocked_propagation_derives_complete_affected_closure_from_exact_stored_topology",
+        "blocked_propagation_records_exact_graph_blocked_lease_reason_and_typed_before_after_rows",
+        "repository_first_global_lock_order_forces_both_serial_orders_and_prevents_claim_propagation_deadlock"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "direct_cycle",
+          "defect": "add_dependency_research_to_review",
+          "expectError": "TASK_GRAPH_CYCLE",
+          "unchanged": ["edge_rows", "graph_revision", "ready_set"]
+        },
+        {
+          "id": "transitive_cycle",
+          "defect": "check_only_direct_reverse_edge",
+          "expectError": "TASK_GRAPH_CYCLE",
+          "unchanged": ["edge_rows", "graph_revision", "ready_set"]
+        },
+        {
+          "id": "claim_before_dependency_done",
+          "defect": "treat_in_review_dependency_as_terminal_success",
+          "expectError": "TASK_DEPENDENCY_NOT_TERMINAL",
+          "unchanged": ["open_claims", "task_status", "ready_set"]
+        },
+        {
+          "id": "claim_non_leaf_parent",
+          "defect": "ignore_nonterminal_child",
+          "expectError": "TASK_NOT_READY",
+          "unchanged": ["parent_status", "child_statuses", "open_claims"]
+        },
+        {
+          "id": "cross_root_dependency",
+          "defect": "link_task_from_another_graph_root",
+          "expectError": "TASK_GRAPH_SCOPE_VIOLATION",
+          "unchanged": ["both_graphs", "edge_rows", "graph_revisions"]
+        },
+        {
+          "id": "child_depends_on_waiting_ancestor",
+          "defect": "validate_contains_and_dependency_cycles_separately",
+          "expectError": "TASK_GRAPH_CYCLE",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "proposer_status"]
+        },
+        {
+          "id": "concurrent_endpoint_or_ancestor_change_after_cycle_check",
+          "defect": "check_prospective_union_then_write_without_the_complete_repository_root_endpoint_revision_lock_chain",
+          "verifierMustObserve": "nonserializable_cycle_or_stale_ready_set",
+          "unchanged": ["winning_graph_transition", "unrelated_task_rows", "artifact_rows"]
+        },
+        {
+          "id": "pg_interleaving_not_forced",
+          "defect": "run_the_concurrency_control_without_reaching_every_named_barrier_or_wait_observation",
+          "verifierMustObserve": "required_interleaving_barrier_not_reached",
+          "unchanged": ["blocked_fixture_task_rows_before", "blocked_fixture_claim_before", "blocked_fixture_reservations_before", "graph_revision_31"]
+        },
+        {
+          "id": "claim_vs_propagation_inverse_lock_order",
+          "defect": "propagation_locks_root_then_waits_for_repository_while_claim_holds_repository_and_waits_for_root",
+          "verifierMustObserve": "postgres_40P01_or_bounded_lock_timeout",
+          "unchanged": ["blocked_fixture_task_rows_before", "blocked_fixture_claim_before", "blocked_fixture_reservations_before", "graph_revision_31"]
+        },
+        {
+          "id": "one_hop_block_propagation",
+          "defect": "block_only_direct_dependent_and_leave_waiting_ancestor_or_open_claim_outside_atomic_closure",
+          "expectError": "TASK_GRAPH_PROPAGATION_ATOMICITY_VIOLATION",
+          "unchanged": ["blocked_fixture_task_rows_before", "blocked_fixture_claim_before", "blocked_fixture_reservations_before", "graph_revision_31"]
+        },
+        {
+          "id": "blocked_closure_oracle_uses_predeclared_roles",
+          "defect": "derive_expected_affected_set_from_poisoned_role_membership_instead_of_locked_stored_edges",
+          "verifierMustObserve": "blocked_closure_not_derived_from_locked_topology",
+          "unchanged": ["blocked_fixture_task_rows_before", "blocked_fixture_claim_before", "blocked_fixture_reservations_before", "graph_revision_31"]
+        },
+        {
+          "id": "blocked_closure_oracle_enumerates_poisoned_rows",
+          "defect": "derive_expected_affected_set_from_metamorphic_before_after_row_membership_instead_of_locked_stored_edges",
+          "verifierMustObserve": "blocked_closure_not_derived_from_locked_topology",
+          "unchanged": ["blocked_fixture_task_rows_before", "blocked_fixture_claim_before", "blocked_fixture_reservations_before", "graph_revision_31"]
+        },
+        {
+          "id": "blocked_closure_oracle_uses_predeclared_affected_ids",
+          "defect": "derive_expected_affected_set_from_poisoned_predeclared_affected_ids_instead_of_locked_stored_edges",
+          "verifierMustObserve": "blocked_closure_not_derived_from_locked_topology",
+          "unchanged": ["blocked_fixture_task_rows_before", "blocked_fixture_claim_before", "blocked_fixture_reservations_before", "graph_revision_31"]
+        },
+        {
+          "id": "blocked_closure_oracle_reads_parent_fixture",
+          "defect": "pass_or_close_over_parent_before_after_or_expected_arrays_instead_of_the_strict_oracle_input_projection",
+          "verifierMustObserve": "oracle_input_projection_violation",
+          "unchanged": ["blocked_fixture_task_rows_before", "blocked_fixture_claim_before", "blocked_fixture_reservations_before", "graph_revision_31"]
+        },
+        {
+          "id": "blocked_closure_oracle_reads_expected_affected_ids",
+          "defect": "pass_or_read_verifier_owned_expected_affected_ids_as_oracle_input_instead_of_deriving_from_topology",
+          "verifierMustObserve": "oracle_input_projection_violation",
+          "unchanged": ["blocked_fixture_task_rows_before", "blocked_fixture_claim_before", "blocked_fixture_reservations_before", "graph_revision_31"]
+        },
+        {
+          "id": "blocked_propagation_uses_false_lease_close_reason",
+          "defect": "close_the_exact_blocked_claim_with_server_expired_or_no_typed_reason",
+          "expectError": "TASK_GRAPH_PROPAGATION_ATOMICITY_VIOLATION",
+          "unchanged": ["blocked_fixture_task_rows_before", "blocked_fixture_claim_before", "blocked_fixture_reservations_before", "graph_revision_31"]
+        }
+      ]
+    },
+    {
+      "id": "g3_7_capability_and_bounds",
+      "fixture": {
+        "requiredCapabilities": ["code_write", "node24", "postgres16"],
+        "agentCapabilities": ["code_write", "node24", "postgres16", "review"],
+        "limitsSource": "server_policy_digest",
+        "titleClassifierPolicyDigest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "shortSourceBody": "synthetic sample text",
+        "wrappedShortTitle": "Task: synthetic sample text",
+        "sourceBodyClass": "synthetic_fixture_only"
+      },
+      "expectedFacts": ["task_graph_validated", "claim_eligibility_computed"],
+      "assertions": [
+        "proposal_and_claim_validate_capabilities_from_current_server_registry",
+        "all_graph_limits_apply_before_any_insert",
+        "limit_policy_digest_is_stored_with_graph_revision",
+        "titles_and_capability_keys_are_canonical_bounded_values",
+        "delegated_title_privacy_gate_runs_before_graph_insert_without_body_egress",
+        "whole_short_source_body_is_rejected_even_when_wrapped",
+        "graph_persists_exact_title_and_current_classifier_policy_digests",
+        "normal_conversation_requires_no_global_planner"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "proposer_asserts_agent_capability",
+          "defect": "trust_capabilities_embedded_in_proposal",
+          "expectError": "TASK_CAPABILITY_MISMATCH",
+          "unchanged": ["task_rows", "agent_registry", "graph_revision"]
+        },
+        {
+          "id": "node_limit_after_insert",
+          "defect": "insert_first_then_count_nodes",
+          "expectError": "TASK_GRAPH_LIMIT_EXCEEDED",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision"]
+        },
+        {
+          "id": "depth_limit_ignored",
+          "defect": "validate_only_direct_child_count",
+          "expectError": "TASK_GRAPH_LIMIT_EXCEEDED",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision"]
+        },
+        {
+          "id": "each_frozen_limit_plus_one_accepted",
+          "defect": "table_drive_every_children_nodes_edges_depth_open_leaves_dependencies_seats_capabilities_paths_and_title_limit_at_max_plus_one",
+          "expectError": "TASK_GRAPH_LIMIT_EXCEEDED",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "policy_digest"]
+        },
+        {
+          "id": "noncanonical_title",
+          "defect": "accept_empty_overlong_or_control_character_title",
+          "expectError": "TASK_GRAPH_INPUT_INVALID",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision"]
+        },
+        {
+          "id": "title_equals_source_body",
+          "defect": "use_full_canonical_source_body_as_child_title",
+          "expectError": "TASK_TITLE_BODY_REUSE",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "path_reservations"]
+        },
+        {
+          "id": "title_contains_source_body_slice",
+          "defect": "copy_contiguous_thirty_two_utf8_byte_source_slice_into_child_title",
+          "expectError": "TASK_TITLE_BODY_REUSE",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "path_reservations"]
+        },
+        {
+          "id": "wrapped_short_whole_body",
+          "defect": "wrap_complete_nonempty_source_body_shorter_than_thirty_two_utf8_bytes_in_child_title",
+          "expectError": "TASK_TITLE_BODY_REUSE",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "path_reservations"]
+        },
+        {
+          "id": "safe_title_result_poison_title_substitution",
+          "defect": "validate_safe_title_then_insert_different_unvalidated_title_under_same_graph_proposal",
+          "expectError": "TASK_TITLE_POLICY_STALE",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "path_reservations"]
+        },
+        {
+          "id": "stale_classifier_policy",
+          "defect": "reuse_title_validation_result_after_current_classifier_policy_digest_changes",
+          "expectError": "TASK_TITLE_POLICY_STALE",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "current_title_classifier_policy_digest"]
+        },
+        {
+          "id": "credential_shaped_title",
+          "defect": "insert_reusable_credential_shape_into_child_title",
+          "expectError": "TASK_TITLE_SECURITY_POISON",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "path_reservations"]
+        },
+        {
+          "id": "private_path_title",
+          "defect": "insert_private_absolute_home_tmp_worktree_socket_or_credential_path_into_child_title",
+          "expectError": "TASK_TITLE_SECURITY_POISON",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "path_reservations"]
+        },
+        {
+          "id": "provider_or_provenance_title",
+          "defect": "insert_raw_provider_payload_or_private_review_lineage_into_child_title",
+          "expectError": "TASK_TITLE_SECURITY_POISON",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "path_reservations"]
+        },
+        {
+          "id": "noncanonical_capability_key",
+          "defect": "accept_empty_duplicate_or_nonregistry_capability_key",
+          "expectError": "TASK_CAPABILITY_MISMATCH",
+          "unchanged": ["task_rows", "agent_registry", "graph_revision"]
+        },
+        {
+          "id": "stale_limit_policy_digest",
+          "defect": "validate_against_previous_server_policy_revision",
+          "expectError": "TASK_GRAPH_REVISION_STALE",
+          "unchanged": ["task_rows", "edge_rows", "graph_revision", "current_policy_digest"]
+        },
+        {
+          "id": "planner_intercepts_question",
+          "defect": "create_graph_for_pure_question_before_normal_reply",
+          "verifierMustObserve": "coordination_effect_for_pure_question",
+          "unchanged": ["normal_reply", "task_rows", "graph_revision"]
+        }
+      ]
+    },
+    {
+      "id": "g3_8_workspace_and_path_ownership",
+      "fixture": {
+        "baseCommit": "59c7d42495aac97855fc2a248bb72cd2dd70c8dd",
+        "workspaceGeneration": 3,
+        "childPathClaims": [
+          {"kind": "subtree", "path": "packages/protocol"},
+          {"kind": "subtree", "path": "packages/storage"}
+        ],
+        "integrationOwnerPathClaims": [
+          {"kind": "file", "path": "pnpm-lock.yaml"},
+          {"kind": "file", "path": "pnpm-workspace.yaml"}
+        ],
+        "executionMode": "isolated_worktree",
+        "crossRootContenderCounts": [2, 3]
+      },
+      "expectedFacts": ["workspace_contract_frozen", "path_claim_reserved"],
+      "assertions": [
+        "each_task_binds_exact_base_workspace_generation_and_allowed_paths",
+        "path_claims_are_normalized_relative_and_non_overlapping",
+        "repository_scoped_serialization_gives_one_cross_root_overlap_winner",
+        "shared_file_collision_rejected_or_owned_by_one_integration_task",
+        "child_worktrees_cannot_mutate_integration_owner_paths",
+        "workspace_contract_digest_changes_on_any_policy_member"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "overlapping_child_paths",
+          "defect": "reserve_packages_storage_for_two_open_children",
+          "expectError": "WORKSPACE_PATH_CONFLICT",
+          "unchanged": ["existing_reservation", "task_statuses", "workspace_contracts"]
+        },
+        {
+          "id": "cross_root_absent_reservation_phantom",
+          "defect": "lock_only_existing_reservation_rows_under_different_graph_roots",
+          "expectError": "WORKSPACE_PATH_CONFLICT",
+          "unchanged": ["winning_reservation", "loser_task_status", "repository_revision"]
+        },
+        {
+          "id": "absolute_private_path",
+          "defect": "table_drive_absolute_drive_qualified_backslash_dot_dotdot_symlink_escape_and_normalization_alias_path_claims",
+          "expectError": "WORKSPACE_CONTRACT_MISMATCH",
+          "unchanged": ["path_claim_rows", "task_contract", "workspace_generation"]
+        },
+        {
+          "id": "wrong_base_commit",
+          "defect": "start_worktree_from_moving_branch_head",
+          "expectError": "WORKSPACE_CONTRACT_MISMATCH",
+          "unchanged": ["task_base_commit", "artifact_rows", "integration_owner"]
+        },
+        {
+          "id": "child_edits_root_lock",
+          "defect": "permit_child_commit_outside_path_claim",
+          "expectError": "ARTIFACT_SCOPE_VIOLATION",
+          "unchanged": ["artifact_rows", "path_claim_rows", "integration_owner_artifact"]
+        }
+      ]
+    },
+    {
+      "id": "g3_9_immutable_artifact_publication",
+      "fixture": {
+        "artifactKinds": ["git_commit", "digest_blob"],
+        "stagedRoles": ["artifact", "scope_manifest", "acceptance_receipt"],
+        "materialResolution": "server_owned_content_addressed",
+        "contributorSources": ["claim_owner", "accepted_upstream_artifact"],
+        "sourceBarrierRevision": 7,
+        "targetContributorLedgerRevision": 1,
+        "acceptedSourceSet": ["art_00000000000000000000000001"],
+        "materializationPolicy": "after_source_barrier_and_contributor_ledger_commit",
+        "taskStatus": "in_progress",
+        "leaseCurrent": true,
+        "contractDigestBound": true
+      },
+      "expectedFacts": ["artifact_validated", "artifact_published", "task_status_changed"],
+      "assertions": [
+        "artifact_contract_template_is_selected_by_current_server_policy_not_builder",
+        "artifact_contract_template_materializes_non_circular_exact_task_workspace_preimage",
+        "artifact_bytes_commit_tree_parent_scope_and_contract_bind_before_publication",
+        "published_artifact_material_remains_resolvable_after_private_worktree_disappears",
+        "publication_and_task_in_review_transition_are_atomic",
+        "exact_replay_aliases_one_immutable_artifact",
+        "same_attempt_divergence_conflicts_without_replacing_artifact",
+        "builder_and_contributors_derive_from_server_attempt_facts",
+        "contributor_ledger_is_server_written_and_transitively_expands_accepted_upstream_artifacts",
+        "accepted_artifact_consumption_locks_source_barrier_material_and_target_ledger_before_byte_grant",
+        "accepted_artifact_consumption_transitively_expands_contributors_and_source_set_atomically",
+        "consumption_replay_aliases_one_grant_and_ledger_revision",
+        "artifact_metadata_contains_no_body_credential_or_private_path"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "builder_selects_weaker_artifact_template",
+          "defect": "accept_client_selected_template_not_authorized_by_current_lane_and_artifact_policy",
+          "expectError": "ARTIFACT_CONTRACT_MISMATCH",
+          "unchanged": ["task_contract", "artifact_rows", "task_status", "review_barrier"]
+        },
+        {
+          "id": "digest_does_not_match_bytes",
+          "defect": "trust_submitted_artifact_digest",
+          "expectError": "ARTIFACT_DIGEST_MISMATCH",
+          "unchanged": ["artifact_rows", "task_status", "review_barrier"]
+        },
+        {
+          "id": "artifact_depends_on_builder_worktree",
+          "defect": "persist_private_path_or_moving_ref_instead_of_server_owned_content_addressed_material",
+          "expectError": "ARTIFACT_MATERIAL_UNAVAILABLE",
+          "unchanged": ["artifact_rows", "task_status", "review_barrier", "material_store"]
+        },
+        {
+          "id": "materialized_artifact_contract_mismatch",
+          "defect": "change_template_task_root_workspace_base_path_kind_receipt_seat_plan_or_policy_member_after_task_mint",
+          "expectError": "ARTIFACT_CONTRACT_MISMATCH",
+          "unchanged": ["artifact_contract", "artifact_rows", "task_status"]
+        },
+        {
+          "id": "missing_staged_source_object",
+          "defect": "submit_digest_without_server_owned_staged_bytes",
+          "expectError": "ARTIFACT_MATERIAL_UNAVAILABLE",
+          "unchanged": ["artifact_rows", "task_status", "review_barrier"]
+        },
+        {
+          "id": "wrong_blob_bytes",
+          "defect": "resolve_blob_bytes_that_do_not_match_staged_or_claimed_digest",
+          "expectError": "ARTIFACT_DIGEST_MISMATCH",
+          "unchanged": ["artifact_rows", "task_status", "review_barrier"]
+        },
+        {
+          "id": "wrong_scope_manifest_bytes",
+          "defect": "trust_scope_manifest_digest_without_resolving_and_comparing_changed_paths",
+          "expectError": "ARTIFACT_SCOPE_VIOLATION",
+          "unchanged": ["artifact_rows", "task_status", "path_claim_rows"]
+        },
+        {
+          "id": "wrong_acceptance_receipt_bytes",
+          "defect": "trust_receipt_digest_without_resolving_and_validating_receipt_policy",
+          "expectError": "ARTIFACT_DIGEST_MISMATCH",
+          "unchanged": ["artifact_rows", "task_status", "review_barrier"]
+        },
+        {
+          "id": "staged_material_role_substitution",
+          "defect": "use_artifact_blob_as_scope_manifest_or_acceptance_receipt_object",
+          "expectError": "ARTIFACT_DIGEST_MISMATCH",
+          "unchanged": ["artifact_rows", "task_status", "review_barrier", "material_store"]
+        },
+        {
+          "id": "commit_parent_wrong",
+          "defect": "accept_commit_outside_task_base_contract",
+          "expectError": "ARTIFACT_SCOPE_VIOLATION",
+          "unchanged": ["artifact_rows", "task_status", "path_claim_rows"]
+        },
+        {
+          "id": "publish_then_status_crash",
+          "defect": "split_artifact_insert_and_in_review_transition",
+          "expectError": "ARTIFACT_PUBLICATION_ATOMICITY_VIOLATION",
+          "unchanged": ["artifact_rows", "task_status", "task_row_version"]
+        },
+        {
+          "id": "replace_frozen_artifact",
+          "defect": "update_digest_for_existing_task_attempt",
+          "expectError": "ARTIFACT_IMMUTABLE_CONFLICT",
+          "unchanged": ["stored_artifact", "review_rows", "task_status"]
+        },
+        {
+          "id": "private_path_in_artifact_metadata",
+          "defect": "persist_worktree_absolute_path",
+          "verifierMustObserve": "private_path_leak",
+          "unchanged": ["artifact_digest", "commit_sha", "scope_manifest_digest"]
+        },
+        {
+          "id": "artifact_identity_member_divergence",
+          "defect": "table_drive_tree_ordered_parent_base_scope_contract_plan_and_receipt_digest_divergence",
+          "expectError": "ARTIFACT_DIGEST_MISMATCH",
+          "unchanged": ["artifact_rows", "task_status", "review_barrier"]
+        },
+        {
+          "id": "submitter_hides_contributor",
+          "defect": "trust_builder_supplied_contributor_set_instead_of_server_attempt_facts",
+          "verifierMustObserve": "artifact_contributor_identity_mismatch",
+          "unchanged": ["artifact_rows", "task_status", "review_barrier"]
+        },
+        {
+          "id": "consume_undeclared_source_artifact",
+          "defect": "grant_material_for_source_not_declared_as_target_dependency",
+          "expectError": "ARTIFACT_SOURCE_NOT_ACCEPTED",
+          "unchanged": ["target_contributor_ledger", "materialization_grants", "target_attempt", "integration_candidate"]
+        },
+        {
+          "id": "consume_blocked_source_barrier",
+          "defect": "grant_material_for_source_with_current_block_or_unsatisfied_barrier",
+          "expectError": "ARTIFACT_SOURCE_NOT_ACCEPTED",
+          "unchanged": ["target_contributor_ledger", "materialization_grants", "target_attempt", "integration_candidate"]
+        },
+        {
+          "id": "consume_stale_source_barrier_revision",
+          "defect": "use_previously_satisfied_source_barrier_revision_after_current_source_changes",
+          "expectError": "ARTIFACT_SOURCE_NOT_ACCEPTED",
+          "unchanged": ["source_barrier", "target_contributor_ledger", "materialization_grants", "integration_candidate"]
+        },
+        {
+          "id": "concurrent_consumption_uses_stale_ledger_revision",
+          "defect": "insert_second_source_or_contributor_set_without_expected_target_ledger_revision_cas",
+          "expectError": "ARTIFACT_CONTRIBUTOR_LEDGER_STALE",
+          "unchanged": ["winning_consumption", "target_contributor_ledger", "materialization_grants", "target_attempt"]
+        },
+        {
+          "id": "material_grant_precedes_contributor_commit",
+          "defect": "expose_source_bytes_before_accepted_source_and_transitive_contributors_commit",
+          "expectError": "ARTIFACT_CONSUMPTION_ATOMICITY_VIOLATION",
+          "unchanged": ["target_contributor_ledger", "materialization_grants", "target_attempt", "integration_candidate"]
+        },
+        {
+          "id": "consume_omits_transitive_source_contributor",
+          "defect": "record_source_artifact_but_omit_one_authoritative_transitive_contributor",
+          "expectError": "ARTIFACT_CONSUMPTION_ATOMICITY_VIOLATION",
+          "unchanged": ["target_contributor_ledger", "materialization_grants", "target_attempt", "integration_candidate"]
+        },
+        {
+          "id": "consumption_command_payload_divergence",
+          "defect": "reuse_consumption_command_id_with_changed_source_barrier_digest_or_target_ledger_revision",
+          "expectError": "IDEMPOTENCY_CONFLICT",
+          "unchanged": ["stored_consumption_result", "target_contributor_ledger", "materialization_grants", "integration_candidate"]
+        }
+      ]
+    },
+    {
+      "id": "g3_10_exact_artifact_review_barrier",
+      "fixture": {
+        "requiredSeats": ["semantic", "integration"],
+        "artifactDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "contractDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "scenarioVersion": 8,
+        "builderAgentId": "agt_00000000000000000000000001",
+        "initialAssignmentRevision": null,
+        "replacementAssignmentRevision": 2,
+        "oldReviewAttempt": 1,
+        "replacementReviewAttempt": 2,
+        "barrierBlockedLease": {
+          "reviewTaskId": "tsk_00000000000000000000000031",
+          "assignmentId": "ras_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "claimId": "clm_cccccccccccccccccccccccccc",
+          "leaseId": "lse_dddddddddddddddddddddddddd",
+          "leaseEpoch": 2,
+          "leaseRevision": 1,
+          "statusBefore": "in_progress",
+          "statusAfter": "blocked",
+          "assignmentClosedReason": "barrier_blocked",
+          "leaseCloseReason": "review_barrier_blocked"
+        }
+      },
+      "expectedFacts": ["review_requested", "review_verdict", "review_barrier_satisfied"],
+      "assertions": [
+        "builder_cannot_claim_or_submit_any_required_reviewer_seat",
+        "distinct_required_seats_use_distinct_reviewer_agents",
+        "publication_mints_one_stable_unassigned_review_task_per_required_seat",
+        "assignment_and_reassignment_are_revisioned_atomic_and_unique",
+        "reviewer_receives_only_exact_frozen_artifact_contract_and_scenario",
+        "review_verdict_attempt_equals_current_reviewer_lease_attempt",
+        "replacement_reviewer_new_attempt_can_submit_only_the_exact_current_verdict",
+        "each_required_seat_has_one_current_terminal_verdict",
+        "terminal_verdict_closes_assignment_and_prevents_reassignment",
+        "all_required_go_verdicts_same_artifact_unlock_barrier",
+        "one_block_or_missing_seat_keeps_barrier_closed",
+        "one_block_revokes_nonterminal_sibling_review_tasks_and_late_verdicts",
+        "barrier_block_closes_sibling_review_lease_with_exact_review_barrier_blocked_reason"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "builder_self_review",
+          "defect": "assign_builder_to_semantic_seat",
+          "expectError": "REVIEW_SELF_ASSIGNMENT_FORBIDDEN",
+          "unchanged": ["review_assignments", "review_rows", "barrier_state"]
+        },
+        {
+          "id": "same_reviewer_two_seats",
+          "defect": "assign_one_non_builder_agent_to_semantic_and_integration_seats",
+          "expectError": "REVIEW_INDEPENDENCE_VIOLATION",
+          "unchanged": ["review_assignments", "review_rows", "barrier_state"]
+        },
+        {
+          "id": "concurrent_assignment_same_seat",
+          "defect": "allow_two_initial_assignments_from_the_same_null_assignment_revision",
+          "expectError": "REVIEW_ASSIGNMENT_STALE",
+          "unchanged": ["winning_assignment", "review_task", "review_lease", "barrier_revision"]
+        },
+        {
+          "id": "reassignment_leaves_old_lease_live",
+          "defect": "bind_replacement_reviewer_without_closing_old_assignment_and_exact_lease",
+          "expectError": "REVIEW_ASSIGNMENT_STALE",
+          "unchanged": ["old_assignment", "old_review_lease", "review_task_status", "new_assignment"]
+        },
+        {
+          "id": "old_reviewer_verdict_after_reassignment",
+          "defect": "accept_verdict_from_revoked_reviewer_lease_after_reassignment",
+          "expectError": "TASK_LEASE_STALE",
+          "unchanged": ["current_assignment", "current_review_lease", "review_rows", "barrier_state"]
+        },
+        {
+          "id": "review_attempt_mismatch",
+          "defect": "accept_verdict_whose_review_attempt_differs_from_current_lease_attempt",
+          "expectError": "REVIEW_ASSIGNMENT_STALE",
+          "unchanged": ["current_assignment", "current_review_lease", "review_rows", "barrier_state"]
+        },
+        {
+          "id": "assignment_command_changed_seat_replay",
+          "defect": "reuse_assignment_command_id_for_another_seat_or_reviewer",
+          "expectError": "IDEMPOTENCY_CONFLICT",
+          "unchanged": ["stored_assignment_result", "review_assignments", "review_tasks", "barrier_revision"]
+        },
+        {
+          "id": "recorded_contributor_reviews",
+          "defect": "assign_non_builder_recorded_contributor_to_required_seat",
+          "expectError": "REVIEW_SELF_ASSIGNMENT_FORBIDDEN",
+          "unchanged": ["review_assignments", "review_rows", "barrier_state"]
+        },
+        {
+          "id": "review_task_requests_writable_workspace",
+          "defect": "materialize_review_assignment_with_isolated_write_mode_or_nonempty_path_claims",
+          "expectError": "WORKSPACE_CONTRACT_MISMATCH",
+          "unchanged": ["review_assignment", "review_task_status", "path_reservations"]
+        },
+        {
+          "id": "builder_omits_required_seat",
+          "defect": "accept_builder_supplied_weaker_required_seat_set",
+          "expectError": "REVIEW_BARRIER_NOT_SATISFIED",
+          "unchanged": ["required_seats", "review_tasks", "barrier_state"]
+        },
+        {
+          "id": "review_unfrozen_branch",
+          "defect": "resolve_artifact_from_moving_ref_after_assignment",
+          "expectError": "REVIEW_ARTIFACT_STALE",
+          "unchanged": ["artifact_digest", "review_rows", "barrier_state"]
+        },
+        {
+          "id": "stale_contract_verdict",
+          "defect": "accept_verdict_bound_to_previous_contract_digest",
+          "expectError": "REVIEW_CONTRACT_STALE",
+          "unchanged": ["current_contract_digest", "review_rows", "barrier_state"]
+        },
+        {
+          "id": "stale_scenario_verdict",
+          "defect": "accept_previous_scenario_version",
+          "expectError": "REVIEW_SCENARIO_STALE",
+          "unchanged": ["scenario_version", "review_rows", "barrier_state"]
+        },
+        {
+          "id": "stale_gate3_plan_verdict",
+          "defect": "accept_previous_gate3_plan_digest",
+          "expectError": "REVIEW_SCENARIO_STALE",
+          "unchanged": ["gate3_plan_digest", "review_rows", "barrier_state"]
+        },
+        {
+          "id": "one_go_unlocks_two_seats",
+          "defect": "count_verdicts_without_distinct_seat_key",
+          "expectError": "REVIEW_BARRIER_NOT_SATISFIED",
+          "unchanged": ["review_rows", "required_seats", "task_status"]
+        },
+        {
+          "id": "block_leaves_sibling_reviewer_live",
+          "defect": "close_barrier_without_revoking_nonterminal_sibling_assignment_and_lease",
+          "expectError": "REVIEW_BARRIER_ATOMICITY_VIOLATION",
+          "unchanged": ["barrier_state", "artifact_task_status", "sibling_review_task", "sibling_lease"]
+        },
+        {
+          "id": "review_barrier_uses_false_lease_close_reason",
+          "defect": "close_sibling_review_lease_with_server_expired_or_no_typed_reason",
+          "expectError": "REVIEW_BARRIER_ATOMICITY_VIOLATION",
+          "unchanged": ["barrier_state_before", "artifact_task_status_before", "sibling_review_task_before", "sibling_review_lease_before"]
+        },
+        {
+          "id": "reassign_terminal_go_seat",
+          "defect": "reassign_current_assignment_after_terminal_go_closed_review_task",
+          "expectError": "REVIEW_ASSIGNMENT_TERMINAL",
+          "unchanged": ["terminal_verdict", "closed_assignment", "review_task", "barrier_state", "artifact_task_status"]
+        },
+        {
+          "id": "reassign_terminal_block_seat",
+          "defect": "reassign_current_assignment_after_terminal_block_closed_barrier",
+          "expectError": "REVIEW_ASSIGNMENT_TERMINAL",
+          "unchanged": ["terminal_verdict", "closed_assignment", "review_task", "barrier_state", "artifact_task_status"]
+        }
+      ]
+    },
+    {
+      "id": "g3_11_reviewed_integration",
+      "fixture": {
+        "childCommits": ["1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"],
+        "childBarriers": "satisfied",
+        "integrationModes": ["fast_forward", "new_commit"]
+      },
+      "expectedFacts": ["review_barrier_satisfied", "integration_candidate_frozen"],
+      "assertions": [
+        "integration_owner_alone_may_consume_reviewed_child_artifacts",
+        "fast_forward_requires_exact_reviewed_commit_chain_without_rewrite",
+        "new_integration_sha_reenters_full_review_barrier",
+        "blocked_or_stale_child_never_enters_integration_candidate",
+        "integration_candidate_uses_authoritative_consumed_source_set_and_current_ledger_revision",
+        "protected_publication_stays_outside_task_execution_transaction"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "rewrite_reviewed_child",
+          "defect": "cherry_pick_or_squash_without_new_review",
+          "expectError": "INTEGRATION_REVIEW_REQUIRED",
+          "unchanged": ["reviewed_child_commits", "integration_barrier", "protected_ref"]
+        },
+        {
+          "id": "consume_blocked_child",
+          "defect": "treat_any_terminal_verdict_as_go",
+          "expectError": "REVIEW_BLOCKED",
+          "unchanged": ["integration_candidate", "task_statuses", "protected_ref"]
+        },
+        {
+          "id": "stale_child_artifact",
+          "defect": "integrate_new_task_artifact_with_old_verdict",
+          "expectError": "REVIEW_ARTIFACT_STALE",
+          "unchanged": ["integration_candidate", "review_rows", "protected_ref"]
+        },
+        {
+          "id": "integration_candidate_omits_consumed_source",
+          "defect": "freeze_candidate_from_local_bytes_without_accounting_for_every_authoritative_accepted_source_id",
+          "expectError": "ARTIFACT_CONSUMPTION_ATOMICITY_VIOLATION",
+          "unchanged": ["accepted_source_set", "target_contributor_ledger", "integration_candidate", "protected_ref"]
+        },
+        {
+          "id": "task_engine_updates_protected_ref",
+          "defect": "publish_integration_directly_from_execution_transaction",
+          "expectError": "PROTECTED_PUBLICATION_BOUNDARY_VIOLATION",
+          "unchanged": ["protected_ref", "task_status", "artifact_rows"]
+        }
+      ]
+    },
+    {
+      "id": "g3_12_wave_carry_and_deferred_truth",
+      "fixture": {
+        "wave0Wave1Wave2Gates": "green",
+        "wave3BoundaryPolicies": [
+          {
+            "root": "packages/task-engine",
+            "policyKey": "task-engine",
+            "packageName": "@swarm/task-engine",
+            "workspaceImports": ["protocol"],
+            "externalPackageSpecifiers": [],
+            "builtinPolicy": "all_high_authority_forbidden"
+          },
+          {
+            "root": "packages/artifacts",
+            "policyKey": "artifacts",
+            "packageName": "@swarm/artifacts",
+            "workspaceImports": ["protocol", "security"],
+            "externalPackageSpecifiers": [],
+            "builtinPolicy": "child_process_only_src_git_fs_process_only_src_git_or_src_store_cluster_net_worker_threads_forbidden"
+          },
+          {
+            "root": "apps/server",
+            "policyKey": "app:server",
+            "packageName": "@swarm/app-server",
+            "workspaceImports": ["protocol", "storage", "security", "artifacts", "task-engine"],
+            "externalPackageSpecifiers": [],
+            "builtinPolicy": "cluster_and_worker_threads_forbidden"
+          }
+        ],
+        "requiredBoundaryNegativeKinds": [
+          "forbidden_workspace_import",
+          "forbidden_builtin",
+          "allowed_builtin_subpath_escape",
+          "undeclared_workspace_import",
+          "undeclared_external_import",
+          "unauthorized_declared_external_import",
+          "absolute_import",
+          "relative_package_escape",
+          "forbidden_concrete_driver_import",
+          "unknown_package_or_app",
+          "integration_owner_root_file_violation"
+        ],
+        "sharedSeamExactFiles": [
+          "packages/protocol/src/task-v3.ts",
+          "packages/protocol/src/index.ts",
+          "packages/protocol/test/task-v3.test.ts",
+          "packages/storage/src/contracts.ts",
+          "packages/storage/src/errors.ts",
+          "packages/storage/src/index.ts",
+          "packages/storage/src/migrations.ts",
+          "packages/storage/src/postgres/task-v3.ts",
+          "packages/storage/test/contracts.test.ts",
+          "packages/storage/test/task-v3.pgtest.ts",
+          "packages/testkit/src/task-v3.ts",
+          "packages/testkit/src/index.ts",
+          "packages/testkit/test/task-v3.test.ts"
+        ],
+        "integrationOwnerExactFiles": [
+          "package.json",
+          "pnpm-workspace.yaml",
+          "pnpm-lock.yaml",
+          ".github/workflows/repository-gates.yml",
+          "scripts/check-package-boundaries.mjs",
+          "contracts/package-boundaries/positive.json",
+          "contracts/package-boundaries/negative.seed.json",
+          "packages/task-engine/package.json",
+          "packages/task-engine/tsconfig.json",
+          "packages/task-engine/tsconfig.build.json",
+          "packages/task-engine/tsconfig.test.json",
+          "packages/artifacts/package.json",
+          "packages/artifacts/tsconfig.json",
+          "packages/artifacts/tsconfig.build.json",
+          "packages/artifacts/tsconfig.test.json",
+          "apps/server/package.json",
+          "apps/server/tsconfig.json",
+          "apps/server/tsconfig.build.json",
+          "apps/server/tsconfig.test.json"
+        ],
+        "wave1DeferredRows": {
+          "thread_owner_status": "wave3_candidate",
+          "task_lifecycle": "wave3_candidate",
+          "task_status_freshness_hold": "wave3_candidate",
+          "reply_trailer": "wave3_candidate",
+          "lane_role_fidelity": "wave3_candidate",
+          "coordination_slo": "wave5_deferred",
+          "channel_navigation": "wave5_deferred"
+        },
+        "seedM2": "wave3_candidate"
+      },
+      "expectedFacts": ["carry_gate", "scenario_disposition", "native_reply_then_coordination"],
+      "assertions": [
+        "all_wave0_wave1_and_wave2_gates_remain_green",
+        "pure_question_still_has_one_normal_reply_and_zero_task_effect",
+        "task_graph_coordination_still_has_committed_reply_predecessor_and_one_logical_effect",
+        "five_wave3_deferred_rows_bind_only_to_real_task_artifact_and_freshness_facts",
+        "coordination_slo_and_channel_navigation_remain_wave5_fail_closed",
+        "seed_m2_binds_exact_execute_owner_artifact_path_and_digest",
+        "exact_new_package_import_builtin_and_owner_boundaries_pass_with_complete_seeded_negatives",
+        "new_package_manifests_match_exact_workspace_dependencies_and_empty_external_allow_sets",
+        "all_wave3_forbidden_facts_absent_from_product_fixture_log_and_receipt"
+      ],
+      "forbiddenFacts": [
+        "raw_message_body_in_task_claim",
+        "raw_reply_in_artifact_metadata",
+        "raw_credential_in_workspace_contract",
+        "private_absolute_path_in_receipt",
+        "provider_reexecution_for_review",
+        "wave4_crash_recovery_claim",
+        "wave5_slo_claim",
+        "online_control_ui_claim"
+      ],
+      "negativeSeeds": [
+        {
+          "id": "wave2_gate_regression",
+          "defect": "disable_one_required_wave2_negative",
+          "verifierMustObserve": "carry_gate_failed",
+          "unchanged": ["gate3_results", "deferred_dispositions"]
+        },
+        {
+          "id": "pure_question_creates_task",
+          "defect": "planner_intercepts_ordinary_question",
+          "verifierMustObserve": "coordination_effect_for_pure_question",
+          "unchanged": ["normal_reply", "delivery_visibility", "task_graph_revision"]
+        },
+        {
+          "id": "coordination_before_reply",
+          "defect": "create_children_before_reply_commit",
+          "expectError": "MODEL_VISIBLE_PREDECESSOR_REQUIRED",
+          "unchanged": ["task_rows", "graph_revision", "reply_count"]
+        },
+        {
+          "id": "promote_wave5_deferred_row",
+          "defect": "mark_coordination_slo_implemented_without_trace_contract",
+          "expectError": "DISHONEST_WAVE3_DISPOSITION",
+          "unchanged": ["scenario_rows", "gate3_results", "wave5_contract"]
+        },
+        {
+          "id": "promote_wave3_candidate_without_machine_fact",
+          "defect": "mark_one_of_five_wave3_rows_implemented_from_prose_or_task_status_only",
+          "expectError": "DISHONEST_WAVE3_DISPOSITION",
+          "unchanged": ["scenario_rows", "gate3_results", "task_artifact_facts"]
+        },
+        {
+          "id": "m2_path_without_digest",
+          "defect": "accept_prose_artifact_reference",
+          "expectError": "ARTIFACT_DIGEST_MISMATCH",
+          "unchanged": ["artifact_rows", "m2_disposition", "task_status"]
+        },
+        {
+          "id": "wave3_package_boundary_escape",
+          "defect": "table_drive_each_forbidden_workspace_edge_builtin_subpath_escape_undeclared_import_unauthorized_manifest_plus_code_external_import_absolute_import_relative_escape_concrete_driver_import_unknown_package_and_root_owner_violation",
+          "verifierMustObserve": "package_boundary_violation",
+          "unchanged": ["package_policy", "product_sources", "root_manifests", "publication_state"]
+        },
+        {
+          "id": "manifest_authorizes_unfrozen_external_import",
+          "defect": "add_external_manifest_dependency_and_matching_code_import_outside_frozen_empty_allow_set",
+          "verifierMustObserve": "package_boundary_violation",
+          "unchanged": ["package_policy", "product_sources", "root_manifests", "publication_state"]
+        },
+        {
+          "id": "wave3_package_boundary_seed_removed",
+          "defect": "remove_one_required_positive_or_seeded_negative_boundary_vector",
+          "verifierMustObserve": "package_boundary_inventory_incomplete",
+          "unchanged": ["package_policy", "product_sources", "root_manifests", "publication_state"]
+        },
+        {
+          "id": "forbidden_fact_poison",
+          "defect": "table_drive_each_forbidden_fact_into_product_fixture_log_and_receipt",
+          "verifierMustObserve": "wave3_privacy_or_truth_poison",
+          "unchanged": ["task_status", "artifact_digest", "review_barrier"]
+        }
+      ]
+    }
+  ]
+}
