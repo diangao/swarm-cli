@@ -121,3 +121,4 @@ export type {
   TerminalReason,
 } from "./types.js";
 export { fail, type ProtocolErrorCode } from "./errors.js";
+export * from "./task-v3.js";

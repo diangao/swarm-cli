@@ -84,6 +84,30 @@ const POSTGRES_NATIVE_INGRESS_CONTROLS = [
   "WHERE boundary = 'model_visible'",
 ] as const;
 
+const POSTGRES_WAVE3_CONTROLS = [
+  "CREATE TABLE IF NOT EXISTS workspace_repositories",
+  "CREATE TABLE IF NOT EXISTS task_v3_graphs",
+  "CREATE TABLE IF NOT EXISTS task_v3_state",
+  "UNIQUE (root_task_id, task_id)",
+  "CREATE TABLE IF NOT EXISTS task_v3_edges",
+  "scenario_version integer NOT NULL CHECK (scenario_version >= 1)",
+  "FOREIGN KEY (root_task_id, prerequisite_task_id)",
+  "FOREIGN KEY (root_task_id, dependent_task_id)",
+  "CREATE TABLE IF NOT EXISTS workspace_contracts_v3",
+  "CREATE TABLE IF NOT EXISTS workspace_reservations_v3",
+  "CREATE UNIQUE INDEX IF NOT EXISTS task_claims_v3_one_open",
+  "lease_revision bigint NOT NULL CHECK (lease_revision >= 1)",
+  "CREATE TABLE IF NOT EXISTS task_v3_command_receipts",
+  "CREATE TABLE IF NOT EXISTS task_v3_coordinations",
+  "CREATE TABLE IF NOT EXISTS staged_artifact_materials_v3",
+  "UNIQUE (task_id, attempt)",
+  "CREATE TABLE IF NOT EXISTS task_attempt_contributors_v3",
+  "CREATE TABLE IF NOT EXISTS artifact_consumptions_v3",
+  "CREATE TABLE IF NOT EXISTS review_barriers_v3",
+  "CREATE UNIQUE INDEX IF NOT EXISTS review_assignments_v3_current_seat",
+  "CREATE UNIQUE INDEX IF NOT EXISTS review_assignments_v3_current_reviewer",
+] as const;
+
 function requireControls(sql: string, controls: readonly string[], dialect: string): void {
   for (const control of controls) {
     if (!sql.includes(control)) storageFail("INVALID_MIGRATION", { dialect, control });
@@ -112,4 +136,8 @@ export function assertSqliteMigrationContract(sql: string, version = "0001"): vo
 
 export function assertPostgresNativeIngressMigrationContract(sql: string): void {
   requireControls(sql, POSTGRES_NATIVE_INGRESS_CONTROLS, "postgres-native-ingress");
+}
+
+export function assertPostgresWave3MigrationContract(sql: string): void {
+  requireControls(sql, POSTGRES_WAVE3_CONTROLS, "postgres-wave3");
 }

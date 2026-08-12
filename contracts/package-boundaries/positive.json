@@ -87,5 +87,37 @@
     "app": "daemon",
     "source": "import type { DeliveryAck } from \"@swarm/protocol\"; import { SharedStore } from \"@swarm/storage\"; import { DaemonCore } from \"@swarm/daemon-core\"; import { ScriptedDriver } from \"@swarm/drivers\";",
     "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*", "@swarm/storage": "workspace:*", "@swarm/daemon-core": "workspace:*", "@swarm/drivers": "workspace:*" } }
+  },
+  {
+    "name": "task-engine-protocol-only",
+    "package": "task-engine",
+    "source": "import type { TaskLeaseV3 } from \"@swarm/protocol\";",
+    "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*" } }
+  },
+  {
+    "name": "artifacts-approved-ports",
+    "package": "artifacts",
+    "source": "import type { ArtifactDescriptorV3 } from \"@swarm/protocol\"; import { conditionIds } from \"@swarm/security\";",
+    "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*", "@swarm/security": "workspace:*" } }
+  },
+  {
+    "name": "artifacts-git-process-boundary",
+    "path": "git/bundle.ts",
+    "package": "artifacts",
+    "source": "import { spawn } from \"node:child_process\"; export const run = spawn;",
+    "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*", "@swarm/security": "workspace:*" } }
+  },
+  {
+    "name": "artifacts-store-filesystem-boundary",
+    "path": "store/material.ts",
+    "package": "artifacts",
+    "source": "import { open } from \"node:fs/promises\"; export const read = open;",
+    "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*", "@swarm/security": "workspace:*" } }
+  },
+  {
+    "name": "server-app-composition",
+    "app": "server",
+    "source": "import type { TaskLeaseV3 } from \"@swarm/protocol\"; import { TaskLeaseV3Repository } from \"@swarm/storage\"; import { conditionIds } from \"@swarm/security\"; import type { AcceptedArtifactMaterialPortV3 } from \"@swarm/artifacts\"; import type { TaskEngine } from \"@swarm/task-engine\";",
+    "packageJson": { "dependencies": { "@swarm/protocol": "workspace:*", "@swarm/storage": "workspace:*", "@swarm/security": "workspace:*", "@swarm/artifacts": "workspace:*", "@swarm/task-engine": "workspace:*" } }
   }
 ]

@@ -6,8 +6,10 @@ import {
   StorageError,
   assertPostgresMigrationContract,
   assertPostgresNativeIngressMigrationContract,
+  assertPostgresWave3MigrationContract,
   assertSqliteMigrationContract,
   sqlLiteral,
+  WAVE3_POSTGRES_MIGRATION,
 } from "../src/index.js";
 import { connectionEnvironment } from "../src/postgres/psql.js";
 
@@ -89,6 +91,25 @@ test("frozen SQLite invariant controls are present", () => {
 
 test("frozen PostgreSQL native-ingress controls are present", () => {
   assert.doesNotThrow(() => assertPostgresNativeIngressMigrationContract(postgresNativeIngress));
+});
+
+test("frozen PostgreSQL Wave 3 controls are present and mutation-sensitive", () => {
+  assert.doesNotThrow(() => assertPostgresWave3MigrationContract(WAVE3_POSTGRES_MIGRATION));
+  for (const seed of [
+    "CREATE TABLE IF NOT EXISTS workspace_repositories",
+    "scenario_version integer NOT NULL CHECK (scenario_version >= 1)",
+    "UNIQUE (root_task_id, task_id)",
+    "FOREIGN KEY (root_task_id, prerequisite_task_id)",
+    "FOREIGN KEY (root_task_id, dependent_task_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS task_claims_v3_one_open",
+    "CREATE TABLE IF NOT EXISTS task_v3_coordinations",
+    "CREATE UNIQUE INDEX IF NOT EXISTS review_assignments_v3_current_reviewer",
+  ]) {
+    assert.throws(
+      () => assertPostgresWave3MigrationContract(WAVE3_POSTGRES_MIGRATION.replaceAll(seed, "SEEDED_DEFECT")),
+      (error: unknown) => error instanceof StorageError && error.code === "INVALID_MIGRATION",
+    );
+  }
 });
 
 test("seeded native-ingress controls fail when removed one at a time", () => {

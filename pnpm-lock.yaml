@@ -33,6 +33,33 @@ importers:
         specifier: workspace:*
         version: link:../../packages/storage
 
+  apps/server:
+    dependencies:
+      '@swarm/artifacts':
+        specifier: workspace:*
+        version: link:../../packages/artifacts
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@swarm/security':
+        specifier: workspace:*
+        version: link:../../packages/security
+      '@swarm/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
+      '@swarm/task-engine':
+        specifier: workspace:*
+        version: link:../../packages/task-engine
+
+  packages/artifacts:
+    dependencies:
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@swarm/security':
+        specifier: workspace:*
+        version: link:../security
+
   packages/daemon-core:
     dependencies:
       '@swarm/drivers':
@@ -65,6 +92,12 @@ importers:
   packages/security: {}
 
   packages/storage:
+    dependencies:
+      '@swarm/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+
+  packages/task-engine:
     dependencies:
       '@swarm/protocol':
         specifier: workspace:*

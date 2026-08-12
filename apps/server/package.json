@@ -1,0 +1,17 @@
+{
+  "name": "@swarm/app-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": { "types": "./src/index.ts", "default": "./dist/index.js" }
+  },
+  "dependencies": {
+    "@swarm/protocol": "workspace:*",
+    "@swarm/storage": "workspace:*",
+    "@swarm/security": "workspace:*",
+    "@swarm/artifacts": "workspace:*",
+    "@swarm/task-engine": "workspace:*"
+  }
+}

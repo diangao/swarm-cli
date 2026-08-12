@@ -115,5 +115,83 @@
     "app": "daemon",
     "source": "import { SharedStore } from \"@swarm/storage\";",
     "expectedKind": "undeclared-workspace-import"
+  },
+  {
+    "name": "task-engine-storage-import",
+    "package": "task-engine",
+    "source": "import { SharedStore } from \"@swarm/storage\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "task-engine-process-import",
+    "package": "task-engine",
+    "source": "import process from \"node:process\";",
+    "expectedKind": "forbidden-builtin"
+  },
+  {
+    "name": "artifacts-storage-import",
+    "package": "artifacts",
+    "source": "import { SharedStore } from \"@swarm/storage\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "artifacts-child-process-outside-git",
+    "package": "artifacts",
+    "path": "publish.ts",
+    "source": "import { spawn } from \"node:child_process\";",
+    "expectedKind": "forbidden-builtin"
+  },
+  {
+    "name": "artifacts-fs-outside-store-or-git",
+    "package": "artifacts",
+    "path": "publish.ts",
+    "source": "import { open } from \"node:fs/promises\";",
+    "expectedKind": "forbidden-builtin"
+  },
+  {
+    "name": "artifacts-net-always-forbidden",
+    "package": "artifacts",
+    "path": "git/network.ts",
+    "source": "import { connect } from \"node:net\";",
+    "expectedKind": "forbidden-builtin"
+  },
+  {
+    "name": "server-app-daemon-core-import",
+    "app": "server",
+    "source": "import { DaemonCore } from \"@swarm/daemon-core\";",
+    "expectedKind": "forbidden-workspace-import"
+  },
+  {
+    "name": "server-app-worker-threads",
+    "app": "server",
+    "source": "import { Worker } from \"node:worker_threads\";",
+    "expectedKind": "forbidden-builtin"
+  },
+  {
+    "name": "task-engine-unauthorized-manifest-external",
+    "package": "task-engine",
+    "source": "import postgres from \"pg\"; export const driver = postgres;",
+    "packageJson": { "dependencies": { "pg": "1.0.0" } },
+    "expectedKind": "unauthorized-manifest-dependency"
+  },
+  {
+    "name": "artifacts-forbidden-dev-dependency",
+    "package": "artifacts",
+    "source": "export const ok = true;",
+    "packageJson": { "devDependencies": { "typescript": "5.9.3" } },
+    "expectedKind": "forbidden-manifest-section"
+  },
+  {
+    "name": "server-invalid-workspace-version",
+    "app": "server",
+    "source": "export const ok = true;",
+    "packageJson": { "dependencies": { "@swarm/protocol": "^0.1.0" } },
+    "expectedKind": "invalid-workspace-version"
+  },
+  {
+    "name": "unknown-application",
+    "app": "unknown",
+    "source": "export const value = 1;",
+    "expectedKind": "unknown-app"
   }
 ]
